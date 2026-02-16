@@ -7,7 +7,6 @@ parses the COCOS standard.
 
 import numpy as np
 import os
-import matplotlib.pyplot as plt
 import xarray as xr
 from scipy.interpolate import interp1d, InterpolatedUnivariateSpline, RectBivariateSpline
 from findiff import FinDiff

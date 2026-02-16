@@ -10,6 +10,7 @@ from typing import Tuple, Callable, Optional
 from scipy.interpolate import RegularGridInterpolator
 from .field_lines import integrate_pol_field_line
 from .jacobians import compute_boozer_jacobian
+from .jacobian_builders import boozer_consistency_residual, make_jacobian_context
 
 
 def compute_magnetic_coordinates(
@@ -24,7 +25,8 @@ def compute_magnetic_coordinates(
     ltheta: int = 256,
     phiclockwise: bool = True,
     jacobian_func: Optional[Callable] = None,
-    R_at_psi: Optional[np.ndarray] = None
+    R_at_psi: Optional[np.ndarray] = None,
+    coordinate_system: str = "boozer",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute magnetic coordinates using a generic Jacobian function.
@@ -52,11 +54,14 @@ def compute_magnetic_coordinates(
     phiclockwise : bool, optional
         Whether toroidal angle increases clockwise. Default is True
     jacobian_func : Callable, optional
-        Function to compute Jacobian: jacobian_func(I, F, q, B) -> J
+        Function to compute Jacobian: jacobian_func(context) -> J
         If None, uses Boozer Jacobian
     R_at_psi : np.ndarray, optional
         Radial positions corresponding to psigrid at midplane.
         If None, will be computed from psigrid
+    coordinate_system : str, optional
+        Name of coordinate system, used for Jacobian context construction.
+        Default is 'boozer'
 
     Returns
     -------
@@ -131,53 +136,75 @@ def compute_magnetic_coordinates(
         
         # Evaluate flux surface over theta grid
         thetaval = np.fmod(np.arctan2(zline - zaxis, Rline - raxis), 2*np.pi)
-        R = np.interp(thetageom, thetaval, Rline, period=2*np.pi)
-        z = np.interp(thetageom, thetaval, zline, period=2*np.pi)
+        R_full = np.interp(thetageom, thetaval, Rline, period=2*np.pi)
+        z_full = np.interp(thetageom, thetaval, zline, period=2*np.pi)
         br_interp = np.interp(thetageom, thetaval, brline, period=2*np.pi)[:-1]
         bz_interp = np.interp(thetageom, thetaval, bzline, period=2*np.pi)[:-1]
         bphi_interp = np.interp(thetageom, thetaval, bphiline, period=2*np.pi)[:-1]
 
+        dR = np.diff(R_full)
+        dZ = np.diff(z_full)
+        R = R_full[:-1]
+        z = z_full[:-1]
+        dlp = np.sqrt(dR**2 + dZ**2)
+
         bnorm = np.sqrt(br_interp**2 + bz_interp**2 + bphi_interp**2)
         bpol = np.sqrt(br_interp**2 + bz_interp**2)
-        ds = (np.diff(R) * br_interp + np.diff(z) * bz_interp) / bpol
-        dlbpol = (np.diff(R) * br_interp + np.diff(z) * bz_interp)
-        R = R[:-1]
-        z = z[:-1]
+        bpol_safe = np.where(bpol > 1.0e-14, bpol, 1.0e-14)
+        ds = (dR * br_interp + dZ * bz_interp) / bpol_safe
+        dlbpol = dR * br_interp + dZ * bz_interp
 
         # Compute profiles
         Iprof[ii] = np.sum(dlbpol) / (2*np.pi)
         Fprof[ii] = R[0] * bphi_interp[0]
-        qprof[ii] = np.sum(ds * Fprof[ii] / (R**2 * bpol)) / (2*np.pi)
+        qprof[ii] = np.sum(ds * Fprof[ii] / (R**2 * bpol_safe)) / (2*np.pi)
 
-        # Compute Jacobian using the provided function
-        # For each flux surface, we have scalar profiles (I, F, q)
-        # and a 1D B array along theta. The Jacobian function should
-        # handle this by broadcasting the scalars.
-        I_scalar = np.array([Iprof[ii]])
-        F_scalar = np.array([Fprof[ii]])
-        q_scalar = np.array([qprof[ii]])
-        B_1d = bnorm  # Already 1D along theta
-        
-        # Call Jacobian function - it should broadcast scalars to match B
-        jac = jacobian_func(I_scalar, F_scalar, q_scalar, B_1d)
-        
-        # Jacobian should be 1D matching bnorm length
+        jac_context = make_jacobian_context(
+            coordinate_system=coordinate_system,
+            R=R,
+            B=bnorm,
+            Bpol=bpol_safe,
+            dlp=dlp,
+            I=Iprof[ii],
+            F=Fprof[ii],
+            q=qprof[ii],
+        )
+        jac = np.asarray(jacobian_func(jac_context), dtype=np.float64)
+
         if jac.ndim > 1:
             jac = jac.flatten()
-        # Ensure correct length
+
         if len(jac) != len(bnorm):
-            # If shape mismatch, try to fix it
             if jac.size == bnorm.size:
                 jac = jac.reshape(bnorm.shape)
             else:
-                # Fallback: use scalar value
-                jac_val = jac[0] if jac.size > 0 else 1.0
-                jac = np.full_like(bnorm, jac_val)
-        
-        jacobian[ii, :] = np.interp(thgeogrid, thetageom[:-1], jac, period=2*np.pi)
+                raise ValueError(
+                    "Jacobian shape mismatch for coordinate system "
+                    f"'{coordinate_system}': got {jac.shape}, expected {bnorm.shape}"
+                )
+
+        if not np.all(np.isfinite(jac)):
+            raise ValueError(
+                f"Jacobian contains non-finite values for coordinate system '{coordinate_system}'"
+            )
+
+        if coordinate_system.lower() == "boozer":
+            residual = boozer_consistency_residual(jac_context, jac)
+            h_ref = abs(jac_context["I"] + jac_context["q"] * jac_context["F"])
+            tol = 1.0e-8 * max(1.0, h_ref)
+            if residual > tol:
+                raise ValueError(
+                    f"Boozer Jacobian consistency check failed: residual={residual:.3e}"
+                )
+
+        jac_safe = jac.copy()
+        small = np.abs(jac_safe) < 1.0e-14
+        jac_safe[small] = np.where(jac_safe[small] < 0.0, -1.0e-14, 1.0e-14)
+
+        jacobian[ii, :] = np.interp(thgeogrid, thetageom[:-1], jac_safe, period=2*np.pi)
         
         # Compute magnetic poloidal angle
-        btheta = np.append(0, np.cumsum(ds / (jac * bpol)))
+        btheta = np.append(0, np.cumsum(ds / (jac_safe * bpol_safe)))
         
         # Normalize to remove numerical error
         a = 2*np.pi / btheta[-1]
@@ -185,7 +212,7 @@ def compute_magnetic_coordinates(
         thtable[ii, :] = np.interp(thgeogrid, thetageom, btheta, period=2*np.pi)
 
         # Compute magnetic toroidal coordinate
-        nu = (-Fprof[ii] * np.append(0, np.cumsum(ds / (R**2 * bpol))) +
+        nu = (-Fprof[ii] * np.append(0, np.cumsum(ds / (R**2 * bpol_safe))) +
               qprof[ii] * btheta)
         nutable[ii, :] = np.interp(thgeogrid, thetageom, nu, period=2*np.pi)
         

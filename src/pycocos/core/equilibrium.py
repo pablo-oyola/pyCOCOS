@@ -6,8 +6,6 @@ related to tokamaks.
 import numpy as np
 import xarray as xr
 import os
-import matplotlib.pyplot as plt
-import netCDF4 as nc
 from typing import Union, Optional, Tuple, Dict, Any
 from findiff import FinDiff
 from skimage import measure
@@ -18,6 +16,20 @@ from scipy.constants import mu_0
 from ..coordinates.registry import get_jacobian_function
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
+
+
+def _require_matplotlib_pyplot():
+    """
+    Import matplotlib pyplot lazily for plotting helpers.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required for equilibrium plotting helpers. "
+            "Install pyCOCOS with plotting extras: pip install 'pyCOCOS[plot]'."
+        ) from exc
+    return plt
 
 # ----------------------------------------------------------------------------
 # AUXILIAR FUNCTIONS TO COMPUTE MAGNETIC FIELD PROPERTIES.
@@ -1225,6 +1237,7 @@ class equilibrium:
         ax : matplotlib.axes.Axes
         line : matplotlib Line2D
         """
+        plt = _require_matplotlib_pyplot()
         x = var[list(var.coords.keys())[0]]
         
         if line is not None:
@@ -1282,6 +1295,7 @@ class equilibrium:
         ax : matplotlib.axes.Axes
         image : matplotlib Image
         """
+        plt = _require_matplotlib_pyplot()
         x = var[list(var.coords.keys())[0]]
         y = var[list(var.coords.keys())[1]]
         
@@ -1528,7 +1542,8 @@ class equilibrium:
             ltheta=ltheta,
             phiclockwise=self.phiclockwise,
             jacobian_func=jacobian_func,
-            R_at_psi=frr0
+            R_at_psi=frr0,
+            coordinate_system=coordinate_system,
         )
 
         qprof, Fprof, Iprof, thtable, nutable, jac, Rtransform, ztransform = out
@@ -2012,7 +2027,6 @@ class equilibrium:
         ffprime_rz_intrp = RectBivariateSpline(self.Rgrid.values, self.zgrid.values,
                                                ffprime_rz)
         
-        cmap = plt.cm.jet(np.linspace(0, 1, len(rhopol_integral)))
         for ii, irhop in enumerate(rhopol_integral):
             R, z = self.rhopol2rz(irhop)
             R = R[0]
@@ -2028,7 +2042,7 @@ class equilibrium:
 
             thetaval = np.arctan2(z - float(self.geometry.z_axis.values), 
                                   R - float(self.geometry.R_axis.values))
-            # plt.plot(thetaval, tmp, color=cmap[ii])
+            # plt.plot(thetaval, tmp)
             pprime[ii] = np.nanmean(tmp)
             ffprime_check[ii] = np.nanmean(ffprime_rz_intrp(R, z, grid=False))
 

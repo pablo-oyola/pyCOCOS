@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 
 from pycocos.coordinates import compute_coordinates as compute_coordinates_mod
+from pycocos.coordinates.registry import get_jacobian_function
 
 
 def _fake_integrate_pol_field_line(
@@ -25,7 +27,8 @@ def _fake_integrate_pol_field_line(
     return rline, zline, brline, bzline, bphiline, len(theta)
 
 
-def test_compute_magnetic_coordinates_boozer_path(monkeypatch):
+@pytest.mark.parametrize("coordinate_system", ["boozer", "pest", "equal_arc", "hamada"])
+def test_compute_magnetic_coordinates_coordinate_system_path(monkeypatch, coordinate_system):
     monkeypatch.setattr(
         compute_coordinates_mod,
         "integrate_pol_field_line",
@@ -50,6 +53,8 @@ def test_compute_magnetic_coordinates_boozer_path(monkeypatch):
         psigrid=psigrid,
         ltheta=64,
         phiclockwise=True,
+        jacobian_func=get_jacobian_function(coordinate_system),
+        coordinate_system=coordinate_system,
     )
 
     qprof, Fprof, Iprof, thtable, nutable, jacobian, Rtransform, ztransform = out

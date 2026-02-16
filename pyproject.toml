@@ -17,11 +17,9 @@ dependencies = [
   "scipy",
   "xarray",
   "numba",
-  "freeqdsk",
+  "freeqdsk<0.4.0",
   "findiff",
   "scikit-image",
-  "h5py",
-  "netCDF4",
   "matplotlib",
 ]
 
@@ -35,4 +33,8 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Prevent known numba/llvmlite segfault triggered by pytest-pyvista plugin.
+addopts = "-p no:pyvista"
 

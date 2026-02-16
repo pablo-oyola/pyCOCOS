@@ -4,9 +4,7 @@ eases the access and control of the magnetic coordinates.
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
 import xarray as xr
-import h5py
 import os
 from typing import Union, Optional, Tuple, Dict, Any
 from scipy.interpolate import RectBivariateSpline
@@ -15,6 +13,20 @@ from copy import copy
 
 import logging
 logger = logging.getLogger('magneticcoords')
+
+
+def _require_matplotlib_pyplot():
+    """
+    Import matplotlib pyplot lazily for plotting helpers.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required for magnetic coordinate plotting. "
+            "Install pyCOCOS with plotting extras: pip install 'pyCOCOS[plot]'."
+        ) from exc
+    return plt
 
 class magnetic_coordinates:
     """
@@ -717,6 +729,7 @@ class magnetic_coordinates:
         >>> ax, im, cbar = mag.plot('psi')  # Plot psi coordinate
         >>> ax, im, cbar = mag.plot('theta')  # Plot theta coordinate
         """
+        plt = _require_matplotlib_pyplot()
         if coord_name is None:
             # List available plottable coordinates
             print("Plottable coordinates:")

@@ -7,7 +7,8 @@ from pycocos import EQDSK
 # Load equilibrium
 eq = EQDSK("equilibrium.geqdsk")
 
-# Compute Boozer coordinates
+# Compute Boozer coordinates (J = (I + qF) / B^2).
+# Other available systems: "pest", "equal_arc", "hamada".
 mag_coords = eq.compute_coordinates(coordinate_system="boozer", lpsi=201, ltheta=256)
 
 # Transform from cylindrical to magnetic coordinates
