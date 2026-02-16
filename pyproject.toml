@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyCOCOS"
+version = "0.1.0"
+description = "Standalone tokamak equilibrium and magnetic-coordinate tooling extracted from pynova."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [
+  { name = "superNOVA contributors" }
+]
+dependencies = [
+  "numpy",
+  "scipy",
+  "xarray",
+  "numba",
+  "freeqdsk",
+  "findiff",
+  "scikit-image",
+  "h5py",
+  "netCDF4",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
