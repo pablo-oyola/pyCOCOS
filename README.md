@@ -23,6 +23,19 @@ pip install -e ".[docs]"
 sphinx-build -b html docs/source docs/_build/html
 ```
 
+GUI launcher:
+
+```bash
+pycocos-gui
+```
+
+The GUI supports:
+
+- loading an EQDSK equilibrium file
+- plotting selectable 1D and 2D variables
+- computing magnetic coordinates for one or more coordinate systems
+- overlaying computed magnetic-coordinate grids on top of a 2D plot
+
 ## CI/CD (GitHub Actions)
 
 - `CI` workflow (`.github/workflows/ci.yml`)

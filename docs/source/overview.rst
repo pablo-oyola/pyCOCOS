@@ -18,6 +18,23 @@ Package Layout
 - ``pycocos.io``: EQDSK I/O and COCOS utilities
 - ``pycocos.coordinates``: field-line tracing, Jacobian builders, coordinate solvers
 - ``pycocos.utils``: low-level Numba interpolation helpers
+- ``pycocos.gui``: simple desktop GUI for loading and plotting equilibria
+
+GUI Usage
+---------
+
+Launch the GUI after installing the package:
+
+.. code-block:: bash
+
+   pycocos-gui
+
+The GUI supports:
+
+- loading an EQDSK equilibrium file
+- plotting selectable 1D and 2D variables
+- computing magnetic coordinates from selected systems
+- overlaying magnetic-coordinate grids on top of 2D plots
 
 Build Documentation
 -------------------
