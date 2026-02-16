@@ -23,6 +23,19 @@ pip install -e ".[docs]"
 sphinx-build -b html docs/source docs/_build/html
 ```
 
+## CI/CD (GitHub Actions)
+
+- `CI` workflow (`.github/workflows/ci.yml`)
+  - Runs test matrix on Python 3.10/3.11/3.12
+  - Verifies docs build with `sphinx-build -W`
+- `Deploy Docs` workflow (`.github/workflows/docs-deploy.yml`)
+  - Builds Sphinx docs on pushes to `main`/`master`
+  - Publishes docs to GitHub Pages
+
+To enable documentation publishing, set in GitHub repository settings:
+
+- `Settings -> Pages -> Source`: **GitHub Actions**
+
 ## Quick Start
 
 ```python
