@@ -84,7 +84,7 @@ def _normalize_jacobian_for_two_pi_span(context: Mapping[str, Any], jacobian: np
     Normalize Jacobian so implied poloidal-angle span is 2*pi.
 
     Follows Eq. 8.99/8.100 logic through:
-      dtheta = R / (|J| |grad(psi)|) dlp
+      ``dtheta = R / (|J| |grad(psi)|) dlp``
     """
     grad_psi = compute_grad_psi_abs(context["R"], context["Bpol"])
     span = compute_theta_span(context["R"], jacobian, grad_psi, context["dlp"])
@@ -109,7 +109,7 @@ def build_boozer_jacobian_from_context(context: Mapping[str, Any]) -> np.ndarray
 def boozer_consistency_residual(context: Mapping[str, Any], jacobian: np.ndarray) -> float:
     """
     Diagnostic residual for Boozer relation:
-        residual = max_theta |J*B^2 - (I + qF)|
+        ``residual = max_theta |J*B^2 - (I + qF)|``
     """
     h_val = float(context["I"]) + float(context["q"]) * float(context["F"])
     b2 = np.asarray(context["B"], dtype=np.float64) ** 2
@@ -125,7 +125,8 @@ def build_power_family_jacobian_from_context(
     k_power: int,
 ) -> np.ndarray:
     """
-    Build + normalize Jacobian from family J = R^i / |grad(psi)|^j / B^k.
+    Build + normalize Jacobian from family
+    ``J = R^i / |grad(psi)|^j / B^k``.
     """
     ensure_numba_runtime_ready()
     grad_psi = compute_grad_psi_abs(context["R"], context["Bpol"])

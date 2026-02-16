@@ -15,8 +15,8 @@ EPS = 1.0e-14
 @nb.njit(nogil=True)
 def compute_grad_psi_abs(R: np.ndarray, bpol: np.ndarray) -> np.ndarray:
     """
-    Compute |grad(psi)| using axisymmetric identity:
-        |grad(psi)| = R * Bpol
+    Compute ``|grad(psi)|`` using axisymmetric identity:
+        ``|grad(psi)| = R * Bpol``
     """
     out = np.empty(R.size, dtype=np.float64)
     for i in range(R.size):
@@ -53,7 +53,7 @@ def build_power_law_jacobian(
 ) -> np.ndarray:
     """
     Build Jacobian from power-law family:
-        J = prefactor * R^i / |grad(psi)|^j / B^k
+        ``J = prefactor * R^i / |grad(psi)|^j / B^k``
     """
     out = np.empty(B.size, dtype=np.float64)
     for idx in range(B.size):
@@ -86,7 +86,7 @@ def compute_theta_span(
 ) -> float:
     """
     Compute unnormalized poloidal-angle span implied by Jacobian:
-        span = integral ( R / (|J| * |grad(psi)|) ) dlp
+        ``span = integral ( R / (|J| * |grad(psi)|) ) dlp``
     """
     span = 0.0
     for i in range(jacobian.size):

@@ -16,10 +16,11 @@ magnetic coordinate workflows extracted from `pynova`.
 pip install -e .
 ```
 
-Optional plotting extras:
+Documentation build extras:
 
 ```bash
-pip install -e ".[plot]"
+pip install -e ".[docs]"
+sphinx-build -b html docs/source docs/_build/html
 ```
 
 ## Quick Start
