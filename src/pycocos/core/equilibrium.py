@@ -349,27 +349,27 @@ class equilibrium:
             R = R[0]
             z = z[0]
 
-        self.boundary = xr.Dataset()
-        self.boundary['R'] = xr.DataArray(R, dims=('idx',),
-                                            attrs={'name': 'R',
-                                                    'desc': 'LCFS Radii',
-                                                    'short_name': 'R',
-                                                    'units': 'm'})
-        self.boundary['z'] = xr.DataArray(z, dims=('idx',),
-                                            attrs={'name': 'z',
-                                                    'desc': 'LCFS Heights',
-                                                    'short_name': 'z',
-                                                    'units': 'm'})
+        self._boundary = xr.Dataset()
+        self._boundary['R'] = xr.DataArray(R, dims=('idx',),
+                                           attrs={'name': 'R',
+                                                  'desc': 'LCFS Radii',
+                                                  'short_name': 'R',
+                                                  'units': 'm'})
+        self._boundary['z'] = xr.DataArray(z, dims=('idx',),
+                                           attrs={'name': 'z',
+                                                  'desc': 'LCFS Heights',
+                                                  'short_name': 'z',
+                                                  'units': 'm'})
 
         # Checking consistency of the flux at the LCFS.
-        psiedge_intrp = self.fluxdata.psipol.interp(R=self.boundary.R[0],
-                                                    z=self.boundary.z[0], method='cubic')
+        psiedge_intrp = self.fluxdata.psipol.interp(R=self._boundary.R[0],
+                                                    z=self._boundary.z[0], method='cubic')
         if(np.abs(psiedge_intrp - psi_edge) > 1.0e-4):
             raise ValueError('The specified separatrix flux is not consistent with the equilibrium.')
 
-        self.boundary.attrs['psi_bdy'] = psi_edge
-        self.boundary.attrs['psi_ax'] = psi_ax
-        self.boundary.attrs['psimax'] = psimax
+        self._boundary.attrs['psi_bdy'] = psi_edge
+        self._boundary.attrs['psi_ax'] = psi_ax
+        self._boundary.attrs['psimax'] = psimax
 
         # Getting the radius of the separatrix at the geometrical midplane.
         nr_fine = int( (self.Rgrid[-1] - Raxis) / 1.0e-3)
@@ -501,8 +501,8 @@ class equilibrium:
             'z_axis': xr.DataArray(zaxis_val, attrs={'name': 'z_axis', 'units': 'm',
                                                      'desc': 'Vertical position of magnetic axis',
                                                      'short_name': '$z_{axis}$'}),
-            'R_boundary': self.boundary.R,
-            'z_boundary': self.boundary.z,
+            'R_boundary': self._boundary.R,
+            'z_boundary': self._boundary.z,
         })
         self._geometry.attrs.update({
             'psi_ax': psi_ax_val,
@@ -600,10 +600,7 @@ class equilibrium:
     @property
     def boundary(self) -> xr.Dataset:
         """Plasma boundary (LCFS) coordinates."""
-        return xr.Dataset({
-            'R': self.geometry.R_boundary,
-            'z': self.geometry.z_boundary,
-        })
+        return self._boundary
     
     @property
     def axis(self) -> xr.Dataset:
@@ -1195,7 +1192,7 @@ class equilibrium:
             return (var, var.ndim == 2)
         if name in self.profiles.data_vars:
             var = self.profiles[name]
-            return (var, var.ndim == 1)
+            return (var, var.ndim == 2)
         
         # Try prefixed names (field.Br, flux.psi, profiles.q)
         if '.' in name:
@@ -1208,7 +1205,7 @@ class equilibrium:
                 return (var, var.ndim == 2)
             if prefix == 'profiles' and var_name in self.profiles.data_vars:
                 var = self.profiles[var_name]
-                return (var, var.ndim == 1)
+                return (var, var.ndim == 2)
         
         return None
     
@@ -1298,28 +1295,20 @@ class equilibrium:
         plt = _require_matplotlib_pyplot()
         x = var[list(var.coords.keys())[0]]
         y = var[list(var.coords.keys())[1]]
+        plot_data = np.asarray(var.values).T
+        extent = [x.min().values, x.max().values, y.min().values, y.max().values]
         
         if image is not None:
             # Update existing image
-            image.set_array(var.values.T)
-            image.set_extent([x.min().values, x.max().values,
-                            y.min().values, y.max().values])
+            image.set_data(plot_data)
+            image.set_extent(extent)
             ax_was_none = False
         else:
             ax_was_none = ax is None
             if ax_was_none:
                 fig, ax = plt.subplots(1)
-            
-            # Use xarray's plot if available
-            try:
-                image = var.plot(ax=ax, **kwargs)
-                if isinstance(image, list):
-                    image = image[0]
-            except:
-                extent = [x.min().values, x.max().values,
-                         y.min().values, y.max().values]
-                image = ax.imshow(var.values.T, origin='lower',
-                                 extent=extent, **kwargs)
+
+            image = ax.imshow(plot_data, origin='lower', extent=extent, **kwargs)
             
             # Overlay boundary and axis
             if put_labels:
@@ -1443,7 +1432,9 @@ class equilibrium:
     def compute_coordinates(self, coordinate_system: str='boozer',
                            lpsi: int=201, ltheta: int=256,
                            dr_hr: float=1.0e-3, dz_hz: float=1.0e-3,
-                           padding: float=0.05, ntht_pad: int=5):
+                           padding: float=0.05, ntht_pad: int=5,
+                           rhopol_min: Optional[float]=None,
+                           rhopol_max: Optional[float]=None):
         """
         Compute magnetic coordinates for the specified coordinate system.
 
@@ -1468,6 +1459,14 @@ class equilibrium:
             Padding for the coordinate grid. Default is 0.05
         ntht_pad : int, optional
             Number of padding points for theta. Default is 5
+        rhopol_min : float, optional
+            Minimum normalized poloidal radius to include, in [0, 1].
+            If provided (with or without ``rhopol_max``), this overrides
+            symmetric ``padding`` behavior.
+        rhopol_max : float, optional
+            Maximum normalized poloidal radius to include, in [0, 1].
+            If provided (with or without ``rhopol_min``), this overrides
+            symmetric ``padding`` behavior.
 
         Returns
         -------
@@ -1497,13 +1496,26 @@ class equilibrium:
         bphi_fine = self.field.Bphi.interp(R=R_fine, z=z_fine, method='cubic').values
 
         # Generate psi grid (using geometry attributes)
-        psi0 = np.amin([self.geometry.attrs.get('psi_ax', self._psi_ax_init),
-                        self.geometry.attrs.get('psi_bdy', self._psi_edge_init)])
-        psi1 = np.amax([self.geometry.attrs.get('psi_ax', self._psi_ax_init),
-                        self.geometry.attrs.get('psi_bdy', self._psi_edge_init)])
-        dpsi = psi1 - psi0
-        psi0 += padding * dpsi
-        psi1 -= padding * dpsi
+        psi_axis = float(self.geometry.attrs.get('psi_ax', self._psi_ax_init))
+        psi_edge = float(self.geometry.attrs.get('psi_bdy', self._psi_edge_init))
+        if rhopol_min is not None or rhopol_max is not None:
+            rho_min = padding if rhopol_min is None else float(rhopol_min)
+            rho_max = 1.0 - padding if rhopol_max is None else float(rhopol_max)
+            if not (0.0 <= rho_min < rho_max <= 1.0):
+                raise ValueError("rhopol_min/rhopol_max must satisfy 0 <= min < max <= 1.")
+            eps = 1.0e-8
+            rho_min = max(rho_min, eps)
+            rho_max = min(rho_max, 1.0 - eps)
+            if rho_max <= rho_min:
+                raise ValueError("rhopol_min/rhopol_max window is too narrow after edge protection.")
+            psi0 = psi_axis + rho_min**2 * (psi_edge - psi_axis)
+            psi1 = psi_axis + rho_max**2 * (psi_edge - psi_axis)
+        else:
+            psi0 = np.amin([psi_axis, psi_edge])
+            psi1 = np.amax([psi_axis, psi_edge])
+            dpsi = psi1 - psi0
+            psi0 += padding * dpsi
+            psi1 -= padding * dpsi
         psigrid = np.linspace(psi0, psi1, lpsi)
 
         # Transform psigrid to radial positions at midplane (using geometry)
@@ -1637,8 +1649,11 @@ class equilibrium:
         rightside = thtable_padded[:, :ntht_pad] + 2*np.pi
         thtable_padded = np.concatenate((leftside, thtable_padded, rightside), axis=1)
 
-        thtable_da = xr.DataArray(thtable_padded, coords=(psigrid, thetagrid),
-                                 dims=('Psi', 'Theta'))
+        thtable_da = xr.DataArray(
+            thtable_padded,
+            coords={'psi0': psigrid, 'thetageom': thetagrid},
+            dims=('psi0', 'thetageom'),
+        )
 
         # Build interpolator and project to R-z plane
         thtintrp = RectBivariateSpline(psigrid, thetagrid, thtable_padded)
@@ -1650,8 +1665,11 @@ class equilibrium:
         leftside = nutable[:, -ntht_pad:]
         rightside = nutable[:, :ntht_pad]
         nutable_padded = np.concatenate((leftside, nutable, rightside), axis=1)
-        nutable_da = xr.DataArray(nutable_padded, coords=(psigrid, thetagrid),
-                                    dims=('Psi', 'Theta'))
+        nutable_da = xr.DataArray(
+            nutable_padded,
+            coords={'psi0': psigrid, 'thetageom': thetagrid},
+            dims=('psi0', 'thetageom'),
+        )
 
         nutintrp = RectBivariateSpline(psigrid, thetagrid, nutable_padded)
         nutable_Rz = nutintrp(psirz, thetageom, grid=False)

@@ -105,6 +105,8 @@ class EquilibriumGuiApp:
 
         self.eq = None
         self._computed_coords = {}
+        self._computed_coord_settings = {}
+        self._computed_coord_settings = {}
         self._active_colorbar = None
         self._current_plot_is_2d = False
 
@@ -114,6 +116,9 @@ class EquilibriumGuiApp:
         self.lpsi_var = self.tk.StringVar(value="201")
         self.ltheta_var = self.tk.StringVar(value="256")
         self.nsurf_var = self.tk.StringVar(value="10")
+        self.rhopol_min_var = self.tk.StringVar(value="0.05")
+        self.rhopol_max_var = self.tk.StringVar(value="0.98")
+        self.coord_color_var = self.tk.StringVar(value="tab:orange")
         self.status_var = self.tk.StringVar(value="Load an EQDSK file to begin.")
 
         self._build_layout()
@@ -201,14 +206,14 @@ class EquilibriumGuiApp:
         frame = self.ttk.LabelFrame(parent, text="Magnetic Coordinates", padding=8)
         frame.pack(fill=self.tk.BOTH, expand=True, pady=(0, 8))
 
-        self.ttk.Label(frame, text="Coordinate systems (multi-select):").pack(anchor=self.tk.W)
+        self.ttk.Label(frame, text="Coordinate system:").pack(anchor=self.tk.W)
 
         list_frame = self.ttk.Frame(frame)
         list_frame.pack(fill=self.tk.X, pady=(2, 8))
 
         self.coord_listbox = self.tk.Listbox(
             list_frame,
-            selectmode=self.tk.EXTENDED,
+            selectmode=self.tk.SINGLE,
             height=6,
             exportselection=False,
         )
@@ -235,10 +240,26 @@ class EquilibriumGuiApp:
         self.ttk.Entry(form, textvariable=self.nsurf_var, width=8).grid(
             row=1, column=1, padx=(6, 12), pady=(6, 0)
         )
+        self.ttk.Label(form, text="color").grid(row=1, column=2, sticky=self.tk.W, pady=(6, 0))
+        self.ttk.Entry(form, textvariable=self.coord_color_var, width=12).grid(
+            row=1, column=3, padx=(6, 0), pady=(6, 0), sticky=self.tk.W
+        )
+        self.ttk.Button(form, text="Pick", command=self.on_pick_overlay_color).grid(
+            row=1, column=4, padx=(6, 0), pady=(6, 0), sticky=self.tk.W
+        )
+
+        self.ttk.Label(form, text="rhopol min").grid(row=2, column=0, sticky=self.tk.W, pady=(6, 0))
+        self.ttk.Entry(form, textvariable=self.rhopol_min_var, width=8).grid(
+            row=2, column=1, padx=(6, 12), pady=(6, 0)
+        )
+        self.ttk.Label(form, text="rhopol max").grid(row=2, column=2, sticky=self.tk.W, pady=(6, 0))
+        self.ttk.Entry(form, textvariable=self.rhopol_max_var, width=8).grid(
+            row=2, column=3, padx=(6, 0), pady=(6, 0), sticky=self.tk.W
+        )
 
         btn_row = self.ttk.Frame(frame)
         btn_row.pack(fill=self.tk.X)
-        self.ttk.Button(btn_row, text="Compute Selected", command=self.on_compute_coordinates).pack(
+        self.ttk.Button(btn_row, text="Compute", command=self.on_compute_coordinates).pack(
             side=self.tk.LEFT, padx=(0, 6)
         )
         self.ttk.Button(btn_row, text="Overlay on 2D", command=self.on_overlay_coordinates).pack(
@@ -259,8 +280,11 @@ class EquilibriumGuiApp:
         self.status_var.set(text)
         self.root.update_idletasks()
 
-    def _get_selected_coordinate_systems(self) -> List[str]:
-        return [self.coord_listbox.get(i) for i in self.coord_listbox.curselection()]
+    def _get_selected_coordinate_system(self) -> Optional[str]:
+        selected = self.coord_listbox.curselection()
+        if not selected:
+            return None
+        return str(self.coord_listbox.get(selected[0]))
 
     def _get_int_value(self, var, field_name: str) -> int:
         try:
@@ -271,6 +295,97 @@ class EquilibriumGuiApp:
             raise ValueError(f"'{field_name}' must be positive.")
         return value
 
+    def _get_float_value(self, var, field_name: str) -> float:
+        try:
+            value = float(var.get())
+        except ValueError as exc:
+            raise ValueError(f"'{field_name}' must be a float.") from exc
+        return value
+
+    def _get_rhopol_window(self) -> Tuple[float, float]:
+        rho_min = self._get_float_value(self.rhopol_min_var, "rhopol min")
+        rho_max = self._get_float_value(self.rhopol_max_var, "rhopol max")
+
+        if not (0.0 <= rho_min < rho_max <= 1.0):
+            raise ValueError("'rhopol min/max' must satisfy 0 <= min < max <= 1.")
+
+        eps = 1.0e-6
+        rho_min = max(rho_min, eps)
+        rho_max = min(rho_max, 1.0 - eps)
+        if rho_max <= rho_min:
+            raise ValueError("'rhopol min/max' window is too narrow after edge protection.")
+        return rho_min, rho_max
+
+    def _resolve_overlay_color(self) -> str:
+        color = self.coord_color_var.get().strip()
+        if not color:
+            color = "tab:orange"
+        try:
+            from matplotlib.colors import to_rgba
+
+            to_rgba(color)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid color '{color}'. Use a matplotlib color name, hex, or RGB tuple."
+            ) from exc
+        return color
+
+    def on_pick_overlay_color(self) -> None:
+        try:
+            from tkinter import colorchooser
+        except Exception as exc:
+            self.messagebox.showerror("Color picker unavailable", str(exc))
+            return
+
+        initial_color = self.coord_color_var.get().strip() or "#ff7f0e"
+        _, picked_hex = colorchooser.askcolor(color=initial_color, parent=self.root)
+        if picked_hex:
+            self.coord_color_var.set(picked_hex)
+
+    def _coord_settings_match(
+        self,
+        coord_name: str,
+        lpsi: int,
+        ltheta: int,
+        rhopol_min: float,
+        rhopol_max: float,
+    ) -> bool:
+        cached = self._computed_coord_settings.get(coord_name)
+        if cached is None:
+            return False
+        lpsi_prev, ltheta_prev, rho_min_prev, rho_max_prev = cached
+        return (
+            lpsi_prev == lpsi
+            and ltheta_prev == ltheta
+            and abs(rho_min_prev - rhopol_min) < 1.0e-12
+            and abs(rho_max_prev - rhopol_max) < 1.0e-12
+        )
+
+    def _compute_coordinate_system(
+        self,
+        coord_name: str,
+        lpsi: int,
+        ltheta: int,
+        rhopol_min: float,
+        rhopol_max: float,
+    ):
+        self._set_status(
+            f"Computing {coord_name} coordinates "
+            f"(rhopol: {rhopol_min:.3f}-{rhopol_max:.3f})..."
+        )
+        t0 = time.perf_counter()
+        coords = self.eq.compute_coordinates(
+            coordinate_system=coord_name,
+            lpsi=lpsi,
+            ltheta=ltheta,
+            rhopol_min=rhopol_min,
+            rhopol_max=rhopol_max,
+        )
+        dt = time.perf_counter() - t0
+        self._computed_coords[coord_name] = coords
+        self._computed_coord_settings[coord_name] = (lpsi, ltheta, rhopol_min, rhopol_max)
+        return coords, dt
+
     def _remove_colorbar(self) -> None:
         if self._active_colorbar is not None:
             try:
@@ -278,6 +393,110 @@ class EquilibriumGuiApp:
             except Exception:
                 pass
             self._active_colorbar = None
+
+    def _set_or_update_colorbar(self, artist, var: xr.DataArray) -> None:
+        """
+        Reuse a single colorbar for 2D updates to avoid repeatedly shrinking axes.
+        """
+        z_label = var.attrs.get("short_name", var.name or "value")
+        z_units = var.attrs.get("units", "")
+        label = f"{z_label} [{z_units}]" if z_units else z_label
+
+        if hasattr(artist, "colorbar") and artist.colorbar is not None:
+            self._active_colorbar = artist.colorbar
+        elif self._active_colorbar is None:
+            self._active_colorbar = self.figure.colorbar(artist, ax=self.ax)
+        else:
+            self._active_colorbar.update_normal(artist)
+
+        if self._active_colorbar is not None:
+            self._active_colorbar.set_label(label)
+
+    def _get_colormap(self, name: str = "tab10"):
+        """
+        Return a matplotlib colormap in a version-compatible way.
+        """
+        try:
+            from matplotlib import colormaps
+
+            return colormaps.get_cmap(name)
+        except Exception:
+            try:
+                import matplotlib.cm as cm
+
+                return cm.get_cmap(name)
+            except Exception as exc:
+                raise RuntimeError("matplotlib colormap API is unavailable.") from exc
+
+    def _set_plot_aspect(self, is_2d: bool) -> None:
+        """
+        Keep 1D plots in automatic aspect while preserving equal aspect for 2D.
+        """
+        if is_2d:
+            self.ax.set_aspect("equal")
+        else:
+            self.ax.set_aspect("auto")
+
+    def _overlay_domain_mask(self, r_line: np.ndarray, z_line: np.ndarray) -> np.ndarray:
+        """
+        Build a robust mask for overlay lines, preferring in-domain points.
+        Falls back to finite-only if domain filtering removes all points.
+        """
+        finite = np.isfinite(r_line) & np.isfinite(z_line)
+        if self.eq is None:
+            return finite
+
+        r_vals = np.asarray(self.eq.Rgrid.values, dtype=float)
+        z_vals = np.asarray(self.eq.zgrid.values, dtype=float)
+        r_min = float(np.nanmin(r_vals))
+        r_max = float(np.nanmax(r_vals))
+        z_min = float(np.nanmin(z_vals))
+        z_max = float(np.nanmax(z_vals))
+        dr = max(r_max - r_min, 1.0e-12)
+        dz = max(z_max - z_min, 1.0e-12)
+
+        # Allow a small margin to keep near-edge curves while rejecting wild outliers.
+        r_margin = 0.10 * dr
+        z_margin = 0.10 * dz
+        in_domain = (
+            (r_line >= (r_min - r_margin))
+            & (r_line <= (r_max + r_margin))
+            & (z_line >= (z_min - z_margin))
+            & (z_line <= (z_max + z_margin))
+        )
+        masked = finite & in_domain
+        if np.count_nonzero(masked) < 2:
+            return finite
+        return masked
+
+    def _get_overlay_grids(self, coords, n_surf: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get (R, z) inverse grids for overlay plotting.
+        Prefer transform_inverse on [0, 2pi] for robust plotting, with fallback
+        to cached tables if inverse interpolation fails.
+        """
+        try:
+            psi_axis = np.asarray(coords.coords.psi0.values, dtype=float)
+            theta_axis = np.asarray(coords.coords.theta_star.values, dtype=float)
+            ntheta = int(max(96, min(360, theta_axis.size)))
+            theta_sample = np.linspace(0.0, 2.0 * np.pi, ntheta)
+            cyl = coords.transform_inverse(psi=psi_axis, thetamag=theta_sample, grid=True)
+            r_inv = np.asarray(cyl.R_inv.values, dtype=float)
+            z_inv = np.asarray(cyl.z_inv.values, dtype=float)
+        except Exception:
+            r_inv = np.asarray(coords.coords.R_inv.values, dtype=float)
+            z_inv = np.asarray(coords.coords.z_inv.values, dtype=float)
+            pad = int(getattr(coords, "nthtpad", 0))
+            if pad > 0 and r_inv.shape[1] > 2 * pad:
+                r_inv = r_inv[:, pad:-pad]
+                z_inv = z_inv[:, pad:-pad]
+
+        if r_inv.ndim != 2 or z_inv.ndim != 2 or r_inv.shape != z_inv.shape:
+            raise ValueError("Invalid inverse-coordinate grid shape for overlay.")
+
+        # Keep full theta grid, but sample psi surfaces for readability.
+        psi_idx = sample_indices(r_inv.shape[0], n_surf)
+        return r_inv[psi_idx, :], z_inv[psi_idx, :]
 
     def _refresh_variable_list(self) -> None:
         if self.eq is None:
@@ -331,6 +550,7 @@ class EquilibriumGuiApp:
         self._refresh_variable_list()
         self.ax.clear()
         self._remove_colorbar()
+        self._set_plot_aspect(is_2d=False)
         self.ax.set_title(f"Loaded: {path.name}")
         self.ax.set_xlabel("R [m]")
         self.ax.set_ylabel("z [m]")
@@ -355,7 +575,8 @@ class EquilibriumGuiApp:
             return
 
         self.ax.clear()
-        self._remove_colorbar()
+        if not is_2d:
+            self._remove_colorbar()
 
         try:
             _, artist = self.eq.plot(name, ax=self.ax, put_labels=True)
@@ -365,13 +586,11 @@ class EquilibriumGuiApp:
 
         if is_2d:
             self._current_plot_is_2d = True
-            if hasattr(artist, "colorbar") and artist.colorbar is not None:
-                self._active_colorbar = artist.colorbar
-            else:
-                self._active_colorbar = self.figure.colorbar(artist, ax=self.ax)
-            self.ax.set_aspect("equal")
+            self._set_or_update_colorbar(artist, var)
+            self._set_plot_aspect(is_2d=True)
         else:
             self._current_plot_is_2d = False
+            self._set_plot_aspect(is_2d=False)
             self.ax.grid(True, alpha=0.35)
 
         # Ensure labels are always visible in the GUI, even when reusing axes.
@@ -400,6 +619,7 @@ class EquilibriumGuiApp:
         self.ax.clear()
         self._remove_colorbar()
         self._current_plot_is_2d = False
+        self._set_plot_aspect(is_2d=False)
         self.ax.set_xlabel("R [m]")
         self.ax.set_ylabel("z [m]")
         self.ax.grid(True, alpha=0.25)
@@ -412,41 +632,38 @@ class EquilibriumGuiApp:
             self.messagebox.showwarning("No equilibrium", "Load an equilibrium first.")
             return
 
-        selected = self._get_selected_coordinate_systems()
-        if not selected:
-            self.messagebox.showwarning("No coordinate system", "Select one or more coordinate systems.")
+        coord_name = self._get_selected_coordinate_system()
+        if not coord_name:
+            self.messagebox.showwarning("No coordinate system", "Select a coordinate system.")
             return
 
         try:
             lpsi = self._get_int_value(self.lpsi_var, "lpsi")
             ltheta = self._get_int_value(self.ltheta_var, "ltheta")
+            rhopol_min, rhopol_max = self._get_rhopol_window()
         except ValueError as exc:
             self.messagebox.showerror("Invalid input", str(exc))
             return
 
-        failures: List[str] = []
-        for coord_name in selected:
-            try:
-                self._set_status(f"Computing {coord_name} coordinates...")
-                t0 = time.perf_counter()
-                coords = self.eq.compute_coordinates(
-                    coordinate_system=coord_name,
-                    lpsi=lpsi,
-                    ltheta=ltheta,
-                )
-                self._computed_coords[coord_name] = coords
-                dt = time.perf_counter() - t0
-                self._set_status(f"Computed {coord_name} coordinates in {dt:.2f}s.")
-            except Exception as exc:
-                failures.append(f"{coord_name}: {exc}")
-
-        if failures:
+        try:
+            _, dt = self._compute_coordinate_system(
+                coord_name=coord_name,
+                lpsi=lpsi,
+                ltheta=ltheta,
+                rhopol_min=rhopol_min,
+                rhopol_max=rhopol_max,
+            )
+        except Exception as exc:
             self.messagebox.showerror(
                 "Coordinate computation failed",
-                "Some coordinate systems failed:\n\n" + "\n".join(failures),
+                f"{coord_name}: {exc}",
             )
-        else:
-            self._set_status(f"Computed coordinates: {', '.join(selected)}")
+            return
+
+        self._set_status(
+            f"Computed {coord_name} in {dt:.2f}s "
+            f"(rhopol: {rhopol_min:.3f}-{rhopol_max:.3f})."
+        )
 
     def on_overlay_coordinates(self) -> None:
         if self.eq is None:
@@ -460,64 +677,126 @@ class EquilibriumGuiApp:
             )
             return
 
-        selected = self._get_selected_coordinate_systems()
-        if not selected:
-            self.messagebox.showwarning("No coordinate system", "Select one or more coordinate systems.")
+        coord_name = self._get_selected_coordinate_system()
+        if not coord_name:
+            self.messagebox.showwarning("No coordinate system", "Select a coordinate system.")
             return
 
         try:
             n_surf = self._get_int_value(self.nsurf_var, "#surfaces")
-        except ValueError as exc:
-            self.messagebox.showerror("Invalid input", str(exc))
-            return
-
-        # Auto-compute any missing systems using current GUI settings.
-        try:
             lpsi = self._get_int_value(self.lpsi_var, "lpsi")
             ltheta = self._get_int_value(self.ltheta_var, "ltheta")
+            rhopol_min, rhopol_max = self._get_rhopol_window()
+            color = self._resolve_overlay_color()
         except ValueError as exc:
             self.messagebox.showerror("Invalid input", str(exc))
             return
 
-        cmap = self.figure.colormaps.get_cmap("tab10")
+        if (
+            coord_name not in self._computed_coords
+            or not self._coord_settings_match(coord_name, lpsi, ltheta, rhopol_min, rhopol_max)
+        ):
+            try:
+                self._compute_coordinate_system(
+                    coord_name=coord_name,
+                    lpsi=lpsi,
+                    ltheta=ltheta,
+                    rhopol_min=rhopol_min,
+                    rhopol_max=rhopol_max,
+                )
+            except Exception as exc:
+                self.messagebox.showerror(
+                    "Overlay failed",
+                    f"Could not compute '{coord_name}' for overlay:\n{exc}",
+                )
+                return
 
-        for i, coord_name in enumerate(selected):
-            if coord_name not in self._computed_coords:
-                try:
-                    self._set_status(f"Computing missing {coord_name} coordinates...")
-                    self._computed_coords[coord_name] = self.eq.compute_coordinates(
-                        coordinate_system=coord_name,
-                        lpsi=lpsi,
-                        ltheta=ltheta,
-                    )
-                except Exception as exc:
-                    self.messagebox.showerror(
-                        "Overlay failed",
-                        f"Could not compute '{coord_name}' for overlay:\n{exc}",
-                    )
-                    return
+        coords = self._computed_coords[coord_name]
+        try:
+            r_inv, z_inv = self._get_overlay_grids(coords, n_surf)  # noqa: SLF001 - internal plotting helper
+        except Exception as exc:
+            self.messagebox.showerror(
+                "Overlay failed",
+                f"Could not build inverse grids for '{coord_name}':\n{exc}",
+            )
+            return
 
-            coords = self._computed_coords[coord_name]
-            r_inv = np.asarray(coords.coords.R_inv.values, dtype=float)
-            z_inv = np.asarray(coords.coords.z_inv.values, dtype=float)
-            if r_inv.ndim != 2 or z_inv.ndim != 2 or r_inv.shape != z_inv.shape:
+        theta_idx = sample_indices(r_inv.shape[1], max(4, min(10, n_surf)))
+        lines_drawn = 0
+        coord_labeled = False
+
+        for idx in range(r_inv.shape[0]):
+            r_line = r_inv[idx, :]
+            z_line = z_inv[idx, :]
+            mask = self._overlay_domain_mask(r_line, z_line)  # noqa: SLF001 - internal plotting helper
+            n_valid = np.count_nonzero(mask)
+            if n_valid < 2:
                 continue
 
-            color = cmap(i % 10)
-            psi_idx = sample_indices(r_inv.shape[0], n_surf)
-            theta_idx = sample_indices(r_inv.shape[1], max(4, min(10, n_surf)))
+            markevery = max(1, n_valid // 24)
+            label = coord_name if not coord_labeled else None
+            self.ax.plot(
+                r_line[mask],
+                z_line[mask],
+                color=color,
+                alpha=0.9,
+                linewidth=0.9,
+                linestyle="-",
+                marker="o",
+                markersize=2.4,
+                markerfacecolor="none",
+                markeredgewidth=0.7,
+                markevery=markevery,
+                label=label,
+            )
+            coord_labeled = True
+            lines_drawn += 1
 
-            for j, idx in enumerate(psi_idx):
-                label = coord_name if j == 0 else None
-                self.ax.plot(r_inv[idx, :], z_inv[idx, :], color=color, alpha=0.85, linewidth=0.8, label=label)
+        # Draw a few orthogonal lines to visualize the grid topology.
+        for idx in theta_idx:
+            r_line = r_inv[:, idx]
+            z_line = z_inv[:, idx]
+            mask = self._overlay_domain_mask(r_line, z_line)  # noqa: SLF001 - internal plotting helper
+            n_valid = np.count_nonzero(mask)
+            if n_valid < 2:
+                continue
+            markevery = max(1, n_valid // 10)
+            self.ax.plot(
+                r_line[mask],
+                z_line[mask],
+                color=color,
+                alpha=0.45,
+                linewidth=0.6,
+                linestyle="-",
+                marker="o",
+                markersize=1.8,
+                markerfacecolor="none",
+                markeredgewidth=0.5,
+                markevery=markevery,
+            )
+            lines_drawn += 1
 
-            # Draw a few orthogonal lines to visualize the grid topology.
-            for idx in theta_idx:
-                self.ax.plot(r_inv[:, idx], z_inv[:, idx], color=color, alpha=0.35, linewidth=0.6)
+        if lines_drawn == 0:
+            self._set_status(
+                "No finite coordinate lines were produced for overlay. "
+                "Try recomputing with different lpsi/ltheta or rhopol window."
+            )
+            self.canvas.draw_idle()
+            return
 
-        self.ax.legend(loc="best", fontsize=8)
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            dedup = {}
+            for handle, label in zip(handles, labels):
+                if label and label not in dedup:
+                    dedup[label] = handle
+            if dedup:
+                self.ax.legend(dedup.values(), dedup.keys(), loc="best", fontsize=8)
         self.canvas.draw_idle()
-        self._set_status("Magnetic-coordinate overlays added.")
+        self._set_status(
+            f"Overlayed {coord_name} ({lines_drawn} lines, color={color}, "
+            f"rhopol={rhopol_min:.3f}-{rhopol_max:.3f})."
+        )
 
 
 def _import_gui_modules():
