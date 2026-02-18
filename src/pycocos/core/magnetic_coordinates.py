@@ -562,6 +562,9 @@ class magnetic_coordinates:
         theta_out = new_coords.theta.values
         nu_out = new_coords.nu.values
 
+        # Points outside the valid magnetic-domain are discarded.
+        valid_mask = np.isfinite(psi_out) & np.isfinite(theta_out) & np.isfinite(nu_out)
+
         # Let's make sure that theta is within the range (0, 2pi)
         # by restricting it to that range.
         theta_out = np.mod(theta_out, 2*np.pi)
@@ -573,6 +576,7 @@ class magnetic_coordinates:
             psi_out = np.tile(psi_out, (phi.size, 1, 1))
             theta_out = np.tile(theta_out, (phi.size, 1, 1))
             nu_out = np.tile(nu_out, (phi.size, 1, 1))
+            valid_mask = np.tile(valid_mask, (phi.size, 1, 1))
             nu_out += phi[:, np.newaxis, np.newaxis]
 
         # We interpolate the field onto the new grid.
@@ -586,6 +590,7 @@ class magnetic_coordinates:
         psi_out = psi_out.ravel()
         theta_out = theta_out.ravel()
         nu_out = nu_out.ravel()
+        valid_mask = valid_mask.ravel()
 
         # Before we continue, we need to purge some dimensions before we
         # make the interpolation in the case there is only a single
@@ -597,8 +602,12 @@ class magnetic_coordinates:
         if nu.size == 1:
             nu_out[:] = nu[0]
         
-        points = np.array((psi_out, theta_out, nu_out)).T
-        field_cyl = intrp(points)
+        field_cyl = np.zeros_like(psi_out) + np.nan
+        if np.any(valid_mask):
+            points = np.array((psi_out[valid_mask],
+                               theta_out[valid_mask],
+                               nu_out[valid_mask])).T
+            field_cyl[valid_mask] = intrp(points)
 
         field_cyl = field_cyl.reshape(psi_out_shape)
 
@@ -607,6 +616,240 @@ class magnetic_coordinates:
                               coords={'R': R, 'z': z, 'phi': phi},
                               attrs=field.attrs.copy())
         
+        return output
+
+    def cyl2mag_scalar(
+        self,
+        field: Union[np.ndarray, xr.DataArray],
+        R: Optional[np.ndarray] = None,
+        z: Optional[np.ndarray] = None,
+        phi: Optional[np.ndarray] = None,
+        return_psi_norm: bool = False,
+        return_rhopol: bool = False
+    ) -> xr.DataArray:
+        """
+        Transform a scalar field from cylindrical coordinates to magnetic.
+
+        Parameters
+        ----------
+        field : np.ndarray or xr.DataArray
+            Field defined in cylindrical coordinates (R, z, phi)
+            If DataArray, must have dims ('R', 'z', 'phi')
+        R : np.ndarray, optional
+            Radial grid for input. Required if field is not a DataArray
+        z : np.ndarray, optional
+            Vertical grid for input. Required if field is not a DataArray
+        phi : np.ndarray, optional
+            Toroidal angle grid for input. Required if field is not a DataArray
+        return_psi_norm : bool, optional
+            If True, return the first coordinate as normalized flux
+            psi_N = (psi - psi_min) / (psi_max - psi_min). Default is False
+        return_rhopol : bool, optional
+            If True, return the first coordinate as rhopol = sqrt(psi_N).
+            Default is False
+
+        Returns
+        -------
+        xr.DataArray
+            Field transformed to magnetic coordinates (psi, theta, nu)
+
+        Raises
+        ------
+        ValueError
+            If field shape doesn't match coordinate grids
+        """
+        if return_psi_norm and return_rhopol:
+            raise ValueError("Only one of return_psi_norm or return_rhopol can be True")
+
+        # Checking that the field is consistent with the
+        # input cylindrical coordinate shape.
+        if isinstance(field, xr.DataArray):
+            dims = field.dims
+            for dim in ('R', 'z'):
+                if dim not in dims:
+                    raise ValueError(f"The field must have a '{dim}' dimension")
+
+            if (R is not None) or (z is not None) or (phi is not None):
+                logger.warning('The input field is a xarray.DataArray. ' +
+                               'Ignoring the input coordinates.')
+
+            R = np.asarray(field.coords['R'].values)
+            z = np.asarray(field.coords['z'].values)
+
+            if 'phi' in dims:
+                phi = np.asarray(field.coords['phi'].values)
+                field_values = field.transpose('R', 'z', 'phi').values
+            else:
+                phi = None
+                field_values = field.transpose('R', 'z').values
+
+            attrs = field.attrs.copy()
+        else:
+            field_values = np.asarray(field)
+            attrs = dict()
+
+            if (R is None) or (z is None):
+                raise ValueError("The field must be a xarray.DataArray or " +
+                                 "the coordinates must be provided")
+
+            R = np.asarray(R)
+            z = np.asarray(z)
+
+            if field_values.ndim not in (2, 3):
+                raise ValueError(
+                    f"The input field must have 2 or 3 dimensions, got {field_values.ndim}"
+                )
+
+            if field_values.shape[:2] != (R.size, z.size):
+                raise ValueError(
+                    f"The field must have shape (R, z, ...) = ({R.size}, {z.size}, ...), "
+                    f"got {field_values.shape}"
+                )
+
+            if field_values.ndim == 3:
+                if phi is None:
+                    if field_values.shape[2] == 1:
+                        phi = np.array([0.0])
+                    else:
+                        raise ValueError(
+                            "The field has a phi dimension but no phi grid was provided"
+                        )
+                else:
+                    phi = np.asarray(phi)
+                    if field_values.shape[2] != phi.size:
+                        raise ValueError(
+                            f"The field phi dimension ({field_values.shape[2]}) does not "
+                            f"match phi grid size ({phi.size})"
+                        )
+            else:
+                if phi is not None:
+                    phi = np.asarray(phi)
+
+        # Build output flux coordinates and the corresponding physical psi grid.
+        psi_min = float(self.coords.psi0.min())
+        psi_max = float(self.coords.psi0.max())
+        psi_span = psi_max - psi_min
+        if psi_span <= 0.0:
+            raise ValueError("Invalid psi0 range: psi_max must be greater than psi_min")
+
+        if return_rhopol:
+            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
+            psi_norm_eval = Psi**2
+            psi_eval = psi_min + psi_norm_eval * psi_span
+            psi_is_norm_eval = True
+        elif return_psi_norm:
+            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
+            psi_norm_eval = Psi
+            psi_eval = psi_min + psi_norm_eval * psi_span
+            psi_is_norm_eval = True
+        else:
+            Psi = np.linspace(psi_min, psi_max, self.coords.psi0.size)
+            psi_eval = Psi
+            psi_is_norm_eval = False
+
+        Theta = np.linspace(0.0, 2.0*np.pi, self.coords.thetageom.size)
+        if phi is not None:
+            Nu = np.asarray(phi)
+        else:
+            Nu = np.array([0.0])
+
+        # Map (psi, theta) -> (R, z) and compute the nu-shift at phi=0.
+        inv = self.transform_inverse(psi=Psi,
+                                     thetamag=Theta,
+                                     grid=True,
+                                     psi_is_norm=psi_is_norm_eval)
+        R_out = inv.R_inv.values
+        z_out = inv.z_inv.values
+
+        psi_out = np.broadcast_to(psi_eval[:, None], R_out.shape)
+        thetageom_out = np.arctan2(z_out - self.zaxis, R_out - self.Raxis)
+        thetageom_out = np.mod(thetageom_out + 2.0*np.pi, 2.0*np.pi)
+
+        intrp_nu = RectBivariateSpline(self.coords.psi0.values,
+                           self.coords.thetageom.values,
+                           self.coords.nu.values,
+                           kx=3, ky=5)
+        nu0 = intrp_nu(psi_out, thetageom_out, grid=False)
+
+        # Prepare interpolation points and interpolate from cylindrical grid.
+        output_shape = (Psi.size, Theta.size, Nu.size)
+        Rout = np.broadcast_to(R_out[:, :, None], output_shape)
+        zout = np.broadcast_to(z_out[:, :, None], output_shape)
+        Rout = np.clip(Rout, R.min(), R.max())
+        zout = np.clip(zout, z.min(), z.max())
+
+        if field_values.ndim == 3:
+            if phi is None:
+                phi_grid = np.array([0.0])
+            else:
+                phi_grid = np.asarray(phi)
+
+            if phi_grid.size > 1:
+                period = phi_grid.max() - phi_grid.min()
+                phi_eval = Nu[None, None, :] - nu0[:, :, None]
+                if period > 0.0:
+                    phi_eval = np.mod(phi_eval - phi_grid.min(), period) + phi_grid.min()
+                else:
+                    phi_eval[:] = phi_grid[0]
+            else:
+                breakpoint()
+                phi_eval = np.full(output_shape, phi_grid[0])
+            phi_eval = np.clip(phi_eval, phi_grid.min(), phi_grid.max())
+
+            intrp = RegularGridInterpolator((R, z, phi_grid),
+                                            field_values,
+                                            method='linear',
+                                            fill_value=0.0,
+                                            bounds_error=False)
+            points = np.column_stack((Rout.ravel(), zout.ravel(), phi_eval.ravel()))
+        else:
+            intrp = RegularGridInterpolator((R, z),
+                                            field_values,
+                                            method='linear',
+                                            fill_value=0.0,
+                                            bounds_error=False)
+            points = np.column_stack((Rout.ravel(), zout.ravel()))
+
+        field_mag = intrp(points).reshape(output_shape)
+
+        # Magnetic-axis regularity: at psi = psi_min (equivalently rhopol = 0),
+        # physical quantities must be constant along theta.
+        axis_mask = np.isclose(psi_eval, psi_min, rtol=0.0,
+                               atol=max(1.0e-12, 1.0e-12 * abs(psi_span)))
+        if np.any(axis_mask):
+            axis_idx = np.where(axis_mask)[0]
+            for idx in axis_idx:
+                axis_profile = np.nanmean(field_mag[idx, :, :], axis=0)
+                field_mag[idx, :, :] = axis_profile[np.newaxis, :]
+
+        output = xr.DataArray(field_mag,
+                              dims=('psi', 'theta', 'nu'),
+                              coords={'psi': Psi, 'theta': Theta, 'nu': Nu},
+                              attrs=attrs)
+
+        # Add coordinate metadata from internal magnetic coordinate tables.
+        output.psi.attrs.update(self.coords.psi0.attrs)
+        if 'theta_star' in self.coords.coords:
+            output.theta.attrs.update(self.coords.theta_star.attrs)
+        else:
+            output.theta.attrs.update(self.coords.theta.attrs)
+        output.nu.attrs.update(self.coords.nu.attrs)
+
+        if return_rhopol:
+            output.psi.attrs = {
+                'name': 'rhopol',
+                'units': '',
+                'desc': 'Sqrt normalized poloidal flux',
+                'short_name': '$\\rho_{pol}$'
+            }
+        elif return_psi_norm:
+            output.psi.attrs = {
+                'name': 'psi_norm',
+                'units': '',
+                'desc': 'Normalized poloidal flux',
+                'short_name': '$\\Psi_N$'
+            }
+
         return output
 
     def to_hdf5_as_xarray(self, fn: str, group_name: str=None):
