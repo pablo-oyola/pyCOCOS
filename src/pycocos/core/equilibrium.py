@@ -1880,42 +1880,6 @@ class equilibrium:
             self._magnetic_coordinates_cache = {}
         return self._magnetic_coordinates_cache
 
-    def make_boozer(self, lpsi: int=201, ltheta: int=256,
-                    dr_hr: float=1.0e-3, dz_hz: float=1.0e-3,
-                    padding: float=0.05, ntht_pad: int=5):
-        """
-        Compute the Boozer transformation to magnetic coordinates.
-
-        This is a convenience wrapper around compute_coordinates(coordinate_system='boozer').
-
-        Source:
-            ASCOT5 - generateboozer.py by Konsta Sarkimaki
-
-        Parameters
-        ----------
-        lpsi : int, optional
-            Number of points along the radial direction. Default is 201
-        ltheta : int, optional
-            Number of points along the poloidal direction. Default is 256
-        dr_hr : float, optional
-            Radial step for the Boozer grid. Default is 1.0e-3
-        dz_hz : float, optional
-            Poloidal step for the Boozer grid. Default is 1.0e-3
-        padding : float, optional
-            Padding for the Boozer grid. Default is 0.05
-        ntht_pad : int, optional
-            Number of padding points for theta. Default is 5
-
-        Returns
-        -------
-        MagneticCoordinates
-            Magnetic coordinates object containing the Boozer transformation
-        """
-        return self.compute_coordinates(coordinate_system='boozer',
-                                        lpsi=lpsi, ltheta=ltheta,
-                                        dr_hr=dr_hr, dz_hz=dz_hz,
-                                        padding=padding, ntht_pad=ntht_pad)
-
     def to_geqdsk(
         self,
         filename: str,
@@ -1975,8 +1939,9 @@ class equilibrium:
 
         # We need now to get the fpol, pressure and current.
         # Getting the magnetic coordinates.
-        if not hasattr(self, 'magnetic_coordinates'):
-            self.make_boozer(lpsi=501) # We need to compute the Boozer transformation.
+        cache = getattr(self, '_magnetic_coordinates_cache', {})
+        if 'boozer' not in cache:
+            self.compute_coordinates(coordinate_system='boozer', lpsi=501) # We need to compute the Boozer transformation.
 
         psi_ax = float(self.geometry.attrs.get('psi_ax'))
         psi_bdy = float(self.geometry.attrs.get('psi_bdy'))
