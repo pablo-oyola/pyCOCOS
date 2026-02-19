@@ -792,7 +792,6 @@ class magnetic_coordinates:
                 else:
                     phi_eval[:] = phi_grid[0]
             else:
-                breakpoint()
                 phi_eval = np.full(output_shape, phi_grid[0])
             phi_eval = np.clip(phi_eval, phi_grid.min(), phi_grid.max())
 
