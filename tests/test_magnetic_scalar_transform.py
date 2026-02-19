@@ -250,3 +250,96 @@ def test_cyl2mag_scalar_axis_is_theta_constant_for_rhopol_zero():
     axis_slice = out.values[0, :, :]
     axis_reference = np.nanmean(axis_slice, axis=0, keepdims=True)
     assert np.allclose(axis_slice, axis_reference, rtol=0.0, atol=1.0e-12)
+
+
+def test_cyl2mag_scalar_batched_ndarray_matches_scalar_calls():
+    mag = _build_synthetic_magnetic_coordinates()
+
+    R = mag.coords.R.values
+    z = mag.coords.z.values
+    phi = np.linspace(0.0, 2.0 * np.pi, 8)
+    RR, ZZ, PP = np.meshgrid(R, z, phi, indexing='ij')
+
+    f0 = RR + 0.3 * ZZ + np.cos(PP)
+    f1 = 0.5 * RR - 0.2 * ZZ + np.sin(PP)
+    field_batch = np.stack((f0, f1), axis=0)
+
+    out_batch = mag.cyl2mag_scalar(field_batch, R=R, z=z, phi=phi)
+
+    out0 = mag.cyl2mag_scalar(f0, R=R, z=z, phi=phi)
+    out1 = mag.cyl2mag_scalar(f1, R=R, z=z, phi=phi)
+
+    assert out_batch.dims == ('field', 'psi', 'theta', 'nu')
+    assert out_batch.shape[0] == 2
+    assert np.allclose(out_batch.isel(field=0).values, out0.values, rtol=0.0, atol=1.0e-12)
+    assert np.allclose(out_batch.isel(field=1).values, out1.values, rtol=0.0, atol=1.0e-12)
+
+
+def test_cyl2mag_scalar_batched_dataarray_extra_dims():
+    mag = _build_synthetic_magnetic_coordinates()
+
+    R = mag.coords.R.values
+    z = mag.coords.z.values
+    phi = np.linspace(0.0, 2.0 * np.pi, 6)
+    RR, ZZ, PP = np.meshgrid(R, z, phi, indexing='ij')
+
+    base = RR + 0.1 * ZZ + np.cos(PP)
+    vals = np.stack((base, 2.0 * base), axis=0)
+    field_da = xr.DataArray(
+        vals,
+        dims=('channel', 'R', 'z', 'phi'),
+        coords={'channel': ['A', 'B'], 'R': R, 'z': z, 'phi': phi},
+        attrs={'name': 'batched_da'},
+    ).transpose('R', 'channel', 'z', 'phi')
+
+    out = mag.cyl2mag_scalar(field_da)
+    out_a = mag.cyl2mag_scalar(field_da.sel(channel='A'))
+    out_b = mag.cyl2mag_scalar(field_da.sel(channel='B'))
+
+    assert out.dims == ('field', 'psi', 'theta', 'nu')
+    assert out.sizes['field'] == 2
+    assert np.allclose(out.isel(field=0).values, out_a.values, rtol=0.0, atol=1.0e-12)
+    assert np.allclose(out.isel(field=1).values, out_b.values, rtol=0.0, atol=1.0e-12)
+
+
+def test_cyl2mag_scalar_dataset_multi_field_output():
+    mag = _build_synthetic_magnetic_coordinates()
+
+    R = mag.coords.R.values
+    z = mag.coords.z.values
+    phi = np.linspace(0.0, 2.0 * np.pi, 8)
+    RR, ZZ, PP = np.meshgrid(R, z, phi, indexing='ij')
+
+    a = xr.DataArray(RR + np.cos(PP), dims=('R', 'z', 'phi'), coords={'R': R, 'z': z, 'phi': phi})
+    b = xr.DataArray(0.2 * ZZ + np.sin(PP), dims=('R', 'z', 'phi'), coords={'R': R, 'z': z, 'phi': phi})
+    ds = xr.Dataset({'a': a, 'b': b})
+
+    out = mag.cyl2mag_scalar(ds)
+
+    assert isinstance(out, xr.Dataset)
+    assert set(out.data_vars) == {'a', 'b'}
+    assert out['a'].dims == ('psi', 'theta', 'nu')
+    assert out['b'].dims == ('psi', 'theta', 'nu')
+    assert np.allclose(out['a'].values, mag.cyl2mag_scalar(a).values, rtol=0.0, atol=1.0e-12)
+    assert np.allclose(out['b'].values, mag.cyl2mag_scalar(b).values, rtol=0.0, atol=1.0e-12)
+
+
+def test_cyl2mag_scalar_dict_multi_field_output():
+    mag = _build_synthetic_magnetic_coordinates()
+
+    R = mag.coords.R.values
+    z = mag.coords.z.values
+    phi = np.linspace(0.0, 2.0 * np.pi, 8)
+    RR, ZZ, PP = np.meshgrid(R, z, phi, indexing='ij')
+
+    a = RR + np.cos(PP)
+    b = 0.2 * ZZ + np.sin(PP)
+
+    out = mag.cyl2mag_scalar({'a': a, 'b': b}, R=R, z=z, phi=phi)
+
+    assert isinstance(out, dict)
+    assert set(out.keys()) == {'a', 'b'}
+    assert out['a'].dims == ('psi', 'theta', 'nu')
+    assert out['b'].dims == ('psi', 'theta', 'nu')
+    assert np.allclose(out['a'].values, mag.cyl2mag_scalar(a, R=R, z=z, phi=phi).values, rtol=0.0, atol=1.0e-12)
+    assert np.allclose(out['b'].values, mag.cyl2mag_scalar(b, R=R, z=z, phi=phi).values, rtol=0.0, atol=1.0e-12)

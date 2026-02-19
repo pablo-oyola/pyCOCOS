@@ -6,7 +6,7 @@ eases the access and control of the magnetic coordinates.
 import numpy as np
 import xarray as xr
 import os
-from typing import Union, Optional, Tuple, Dict, Any
+from typing import Union, Optional, Tuple, Dict, Any, Mapping, List
 from scipy.interpolate import RectBivariateSpline
 from scipy.interpolate import RegularGridInterpolator
 from copy import copy
@@ -618,15 +618,509 @@ class magnetic_coordinates:
         
         return output
 
+    def _cyl2mag_build_flux_grid(
+        self,
+        return_psi_norm: bool,
+        return_rhopol: bool
+    ) -> Dict[str, Any]:
+        """
+        Build output flux coordinates and the physical psi evaluation grid.
+        """
+        psi_min = float(self.coords.psi0.min())
+        psi_max = float(self.coords.psi0.max())
+        psi_span = psi_max - psi_min
+        if psi_span <= 0.0:
+            raise ValueError("Invalid psi0 range: psi_max must be greater than psi_min")
+
+        if return_rhopol:
+            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
+            psi_norm_eval = Psi**2
+            psi_eval = psi_min + psi_norm_eval * psi_span
+            psi_is_norm_eval = True
+        elif return_psi_norm:
+            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
+            psi_norm_eval = Psi
+            psi_eval = psi_min + psi_norm_eval * psi_span
+            psi_is_norm_eval = True
+        else:
+            Psi = np.linspace(psi_min, psi_max, self.coords.psi0.size)
+            psi_eval = Psi
+            psi_is_norm_eval = False
+
+        Theta = np.linspace(0.0, 2.0*np.pi, self.coords.thetageom.size)
+
+        return {
+            'psi_min': psi_min,
+            'psi_span': psi_span,
+            'Psi': Psi,
+            'psi_eval': psi_eval,
+            'Theta': Theta,
+            'psi_is_norm_eval': psi_is_norm_eval,
+        }
+
+    def _cyl2mag_build_sampling_map(
+        self,
+        R: np.ndarray,
+        z: np.ndarray,
+        Nu: np.ndarray,
+        flux_grid: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Build reusable sampling arrays for cylindrical -> magnetic interpolation.
+        """
+        Psi = flux_grid['Psi']
+        Theta = flux_grid['Theta']
+        psi_eval = flux_grid['psi_eval']
+
+        inv = self.transform_inverse(psi=Psi,
+                                     thetamag=Theta,
+                                     grid=True,
+                                     psi_is_norm=flux_grid['psi_is_norm_eval'])
+        R_out = inv.R_inv.values
+        z_out = inv.z_inv.values
+
+        psi_out = np.broadcast_to(psi_eval[:, None], R_out.shape)
+        thetageom_out = np.arctan2(z_out - self.zaxis, R_out - self.Raxis)
+        thetageom_out = np.mod(thetageom_out + 2.0*np.pi, 2.0*np.pi)
+
+        intrp_nu = RectBivariateSpline(self.coords.psi0.values,
+                                       self.coords.thetageom.values,
+                                       self.coords.nu.values,
+                                       kx=3, ky=5)
+        nu0 = intrp_nu(psi_out, thetageom_out, grid=False)
+
+        output_shape = (Psi.size, Theta.size, Nu.size)
+        Rout = np.broadcast_to(R_out[:, :, None], output_shape)
+        zout = np.broadcast_to(z_out[:, :, None], output_shape)
+        Rout = np.clip(Rout, R.min(), R.max())
+        zout = np.clip(zout, z.min(), z.max())
+
+        axis_mask = np.isclose(
+            psi_eval,
+            flux_grid['psi_min'],
+            rtol=0.0,
+            atol=max(1.0e-12, 1.0e-12 * abs(flux_grid['psi_span']))
+        )
+
+        return {
+            'output_shape': output_shape,
+            'Rout': Rout,
+            'zout': zout,
+            'nu0': nu0,
+            'axis_mask': axis_mask,
+        }
+
+    @staticmethod
+    def _cyl2mag_phi_eval(
+        Nu: np.ndarray,
+        nu0: np.ndarray,
+        output_shape: Tuple[int, int, int],
+        phi_grid: np.ndarray
+    ) -> np.ndarray:
+        """
+        Build wrapped cylindrical phi-evaluation points from magnetic nu.
+        """
+        if phi_grid.size > 1:
+            period = phi_grid.max() - phi_grid.min()
+            phi_eval = Nu[None, None, :] - nu0[:, :, None]
+            if period > 0.0:
+                phi_eval = np.mod(phi_eval - phi_grid.min(), period) + phi_grid.min()
+            else:
+                phi_eval[:] = phi_grid[0]
+        else:
+            phi_eval = np.full(output_shape, phi_grid[0])
+
+        phi_eval = np.clip(phi_eval, phi_grid.min(), phi_grid.max())
+        return phi_eval
+
+    @staticmethod
+    def _cyl2mag_interp_batch(
+        field_values: np.ndarray,
+        R: np.ndarray,
+        z: np.ndarray,
+        sampling: Dict[str, Any],
+        phi_grid: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Interpolate one or multiple fields from cylindrical to magnetic grid.
+
+        Parameters
+        ----------
+        field_values : np.ndarray
+            Shape (nfield, nR, nZ) or (nfield, nR, nZ, nPhi)
+        """
+        output_shape = sampling['output_shape']
+
+        if field_values.ndim == 4:
+            if phi_grid is None:
+                phi_grid = np.array([0.0])
+            phi_eval = magnetic_coordinates._cyl2mag_phi_eval(
+                Nu=sampling['Nu'],
+                nu0=sampling['nu0'],
+                output_shape=output_shape,
+                phi_grid=np.asarray(phi_grid)
+            )
+
+            values_rg = np.moveaxis(field_values, 0, -1)
+            intrp = RegularGridInterpolator((R, z, np.asarray(phi_grid)),
+                                            values_rg,
+                                            method='linear',
+                                            fill_value=0.0,
+                                            bounds_error=False)
+            points = np.column_stack((sampling['Rout'].ravel(),
+                                      sampling['zout'].ravel(),
+                                      phi_eval.ravel()))
+        else:
+            values_rg = np.moveaxis(field_values, 0, -1)
+            intrp = RegularGridInterpolator((R, z),
+                                            values_rg,
+                                            method='linear',
+                                            fill_value=0.0,
+                                            bounds_error=False)
+            points = np.column_stack((sampling['Rout'].ravel(),
+                                      sampling['zout'].ravel()))
+
+        values = intrp(points)
+        values = values.reshape(output_shape + (field_values.shape[0],))
+        return np.moveaxis(values, -1, 0)
+
+    @staticmethod
+    def _cyl2mag_regularize_axis(field_mag: np.ndarray,
+                                 axis_mask: np.ndarray) -> np.ndarray:
+        """
+        Enforce theta-constant behavior at the magnetic axis for all fields.
+        """
+        if np.any(axis_mask):
+            axis_idx = np.where(axis_mask)[0]
+            axis_values = np.nanmean(field_mag[:, axis_idx, :, :], axis=2, keepdims=True)
+            field_mag[:, axis_idx, :, :] = axis_values
+        return field_mag
+
+    def _cyl2mag_pack_dataarray(
+        self,
+        field: xr.DataArray
+    ) -> Dict[str, Any]:
+        """
+        Pack a DataArray into a batched ndarray shape (field, R, z[, phi]).
+        """
+        dims = list(field.dims)
+        for dim in ('R', 'z'):
+            if dim not in dims:
+                raise ValueError(f"The field must have a '{dim}' dimension")
+
+        has_phi = 'phi' in dims
+        spatial_dims = ['R', 'z'] + (['phi'] if has_phi else [])
+        extra_dims = [d for d in dims if d not in spatial_dims]
+
+        if has_phi:
+            phi = np.asarray(field.coords['phi'].values)
+        else:
+            phi = None
+
+        R = np.asarray(field.coords['R'].values)
+        z = np.asarray(field.coords['z'].values)
+
+        if len(extra_dims) == 0:
+            arr = field.transpose(*spatial_dims).values
+            packed = arr[np.newaxis, ...]
+            specs = [{
+                'name': None,
+                'extra_dims': [],
+                'extra_sizes': [],
+                'extra_coords': {},
+                'ncomp': 1,
+                'attrs': field.attrs.copy(),
+            }]
+            input_kind = 'scalar_dataarray'
+            field_coord = np.array([0])
+        else:
+            stacked = field.stack(field=extra_dims)
+            stacked = stacked.transpose('field', *spatial_dims)
+            packed = stacked.values
+            specs = [{
+                'name': None,
+                'extra_dims': extra_dims,
+                'extra_sizes': [field.sizes[d] for d in extra_dims],
+                'extra_coords': {d: np.asarray(field.coords[d].values) for d in extra_dims},
+                'ncomp': packed.shape[0],
+                'attrs': field.attrs.copy(),
+            }]
+            input_kind = 'batch_dataarray'
+            field_coord = np.asarray(stacked.coords['field'].values)
+
+        return {
+            'R': R,
+            'z': z,
+            'phi': phi,
+            'packed': packed,
+            'specs': specs,
+            'input_kind': input_kind,
+            'field_coord': field_coord,
+        }
+
+    def _cyl2mag_pack_ndarray(
+        self,
+        field: np.ndarray,
+        R: Optional[np.ndarray],
+        z: Optional[np.ndarray],
+        phi: Optional[np.ndarray]
+    ) -> Dict[str, Any]:
+        """
+        Pack an ndarray into a batched ndarray shape (field, R, z[, phi]).
+        """
+        field_values = np.asarray(field)
+        if (R is None) or (z is None):
+            raise ValueError("The field must be a xarray.DataArray or the coordinates must be provided")
+
+        R = np.asarray(R)
+        z = np.asarray(z)
+        phi_arr = None if phi is None else np.asarray(phi)
+
+        if field_values.ndim == 2:
+            if field_values.shape != (R.size, z.size):
+                raise ValueError(
+                    f"The field must have shape (R, z) = ({R.size}, {z.size}), got {field_values.shape}"
+                )
+            packed = field_values[np.newaxis, ...]
+            input_kind = 'scalar_ndarray'
+            has_phi = False
+        elif field_values.ndim == 3:
+            if field_values.shape[:2] == (R.size, z.size):
+                if phi_arr is None:
+                    if field_values.shape[2] == 1:
+                        phi_arr = np.array([0.0])
+                    else:
+                        raise ValueError(
+                            "The field has a phi dimension but no phi grid was provided"
+                        )
+                elif field_values.shape[2] != phi_arr.size:
+                    raise ValueError(
+                        f"The field phi dimension ({field_values.shape[2]}) does not match phi grid size ({phi_arr.size})"
+                    )
+                packed = field_values[np.newaxis, ...]
+                input_kind = 'scalar_ndarray'
+                has_phi = True
+            elif field_values.shape[1:] == (R.size, z.size):
+                packed = field_values
+                input_kind = 'batch_ndarray'
+                has_phi = False
+            else:
+                raise ValueError(
+                    f"Unsupported 3D field shape {field_values.shape}. Expected (R,z,phi) or (field,R,z)."
+                )
+        elif field_values.ndim == 4:
+            if field_values.shape[1:3] != (R.size, z.size):
+                raise ValueError(
+                    f"For batched 4D input expected shape (field, R, z, phi) with R,z=({R.size},{z.size}), got {field_values.shape}"
+                )
+            if phi_arr is None:
+                if field_values.shape[3] == 1:
+                    phi_arr = np.array([0.0])
+                else:
+                    raise ValueError(
+                        "The batched field has a phi dimension but no phi grid was provided"
+                    )
+            elif field_values.shape[3] != phi_arr.size:
+                raise ValueError(
+                    f"The field phi dimension ({field_values.shape[3]}) does not match phi grid size ({phi_arr.size})"
+                )
+            packed = field_values
+            input_kind = 'batch_ndarray'
+            has_phi = True
+        else:
+            raise ValueError(
+                f"The input field must have 2, 3 or 4 dimensions, got {field_values.ndim}"
+            )
+
+        specs = [{
+            'name': None,
+            'extra_dims': ['field'] if input_kind == 'batch_ndarray' else [],
+            'extra_sizes': [packed.shape[0]] if input_kind == 'batch_ndarray' else [],
+            'extra_coords': {'field': np.arange(packed.shape[0])} if input_kind == 'batch_ndarray' else {},
+            'ncomp': packed.shape[0],
+            'attrs': dict(),
+        }]
+
+        if not has_phi:
+            phi_arr = None
+
+        return {
+            'R': R,
+            'z': z,
+            'phi': phi_arr,
+            'packed': packed,
+            'specs': specs,
+            'input_kind': input_kind,
+            'field_coord': np.arange(packed.shape[0]),
+        }
+
+    def _cyl2mag_pack_multi(
+        self,
+        fields: Union[xr.Dataset, Mapping[str, Any]],
+        R: Optional[np.ndarray],
+        z: Optional[np.ndarray],
+        phi: Optional[np.ndarray]
+    ) -> Dict[str, Any]:
+        """
+        Pack a Dataset/dict of fields into one batched ndarray.
+        """
+        if isinstance(fields, xr.Dataset):
+            items = list(fields.data_vars.items())
+            input_kind = 'dataset'
+        else:
+            items = list(fields.items())
+            input_kind = 'dict'
+
+        if len(items) == 0:
+            raise ValueError("No input fields were provided")
+
+        packed_list: List[np.ndarray] = []
+        specs: List[Dict[str, Any]] = []
+
+        R_ref = None if R is None else np.asarray(R)
+        z_ref = None if z is None else np.asarray(z)
+        phi_ref = None if phi is None else np.asarray(phi)
+
+        for name, value in items:
+            if isinstance(value, xr.DataArray):
+                packed = self._cyl2mag_pack_dataarray(value)
+            else:
+                packed = self._cyl2mag_pack_ndarray(np.asarray(value), R_ref, z_ref, phi_ref)
+
+            if R_ref is None:
+                R_ref = packed['R']
+                z_ref = packed['z']
+                phi_ref = packed['phi']
+
+            if not np.array_equal(R_ref, packed['R']) or not np.array_equal(z_ref, packed['z']):
+                raise ValueError("All fields must be defined on the same R and z grids")
+
+            if (phi_ref is None) != (packed['phi'] is None):
+                raise ValueError("All fields must consistently include or exclude the phi dimension")
+
+            if (phi_ref is not None) and (not np.array_equal(phi_ref, packed['phi'])):
+                raise ValueError("All fields must use the same phi grid")
+
+            for spec in packed['specs']:
+                spec = spec.copy()
+                spec['name'] = name
+                specs.append(spec)
+
+            packed_list.append(packed['packed'])
+
+        packed_values = np.concatenate(packed_list, axis=0)
+        field_coord = np.arange(packed_values.shape[0])
+
+        return {
+            'R': R_ref,
+            'z': z_ref,
+            'phi': phi_ref,
+            'packed': packed_values,
+            'specs': specs,
+            'input_kind': input_kind,
+            'field_coord': field_coord,
+            'keys': [name for name, _ in items],
+        }
+
+    def _cyl2mag_format_output(
+        self,
+        field_mag: np.ndarray,
+        flux_grid: Dict[str, Any],
+        packed: Dict[str, Any],
+        return_psi_norm: bool,
+        return_rhopol: bool
+    ) -> Union[xr.DataArray, xr.Dataset, Dict[str, xr.DataArray]]:
+        """
+        Format transformed batched data according to the input type.
+        """
+        Psi = flux_grid['Psi']
+        Theta = flux_grid['Theta']
+        Nu = packed['phi'] if packed['phi'] is not None else np.array([0.0])
+
+        coords_base = {'psi': Psi, 'theta': Theta, 'nu': Nu}
+
+        def _decorate_coords(out: xr.DataArray) -> xr.DataArray:
+            out.psi.attrs.update(self.coords.psi0.attrs)
+            if 'theta_star' in self.coords.coords:
+                out.theta.attrs.update(self.coords.theta_star.attrs)
+            else:
+                out.theta.attrs.update(self.coords.theta.attrs)
+            out.nu.attrs.update(self.coords.nu.attrs)
+
+            if return_rhopol:
+                out.psi.attrs = {
+                    'name': 'rhopol',
+                    'units': '',
+                    'desc': 'Sqrt normalized poloidal flux',
+                    'short_name': '$\\rho_{pol}$'
+                }
+            elif return_psi_norm:
+                out.psi.attrs = {
+                    'name': 'psi_norm',
+                    'units': '',
+                    'desc': 'Normalized poloidal flux',
+                    'short_name': '$\\Psi_N$'
+                }
+            return out
+
+        if packed['input_kind'] in ('scalar_dataarray', 'scalar_ndarray'):
+            attrs = packed['specs'][0]['attrs']
+            out = xr.DataArray(field_mag[0],
+                               dims=('psi', 'theta', 'nu'),
+                               coords=coords_base,
+                               attrs=attrs)
+            return _decorate_coords(out)
+
+        if packed['input_kind'] in ('batch_dataarray', 'batch_ndarray'):
+            out = xr.DataArray(field_mag,
+                               dims=('field', 'psi', 'theta', 'nu'),
+                               coords={
+                                   'field': packed['field_coord'],
+                                   'psi': Psi,
+                                   'theta': Theta,
+                                   'nu': Nu,
+                               },
+                               attrs=packed['specs'][0]['attrs'])
+            return _decorate_coords(out)
+
+        output = xr.Dataset()
+        idx0 = 0
+        for spec in packed['specs']:
+            ncomp = spec['ncomp']
+            vals = field_mag[idx0:idx0+ncomp]
+            idx0 += ncomp
+
+            if len(spec['extra_dims']) == 0:
+                arr = xr.DataArray(vals[0],
+                                   dims=('psi', 'theta', 'nu'),
+                                   coords=coords_base,
+                                   attrs=spec['attrs'])
+            else:
+                arr_vals = vals.reshape(tuple(spec['extra_sizes']) + (Psi.size, Theta.size, Nu.size))
+                arr_coords = dict(spec['extra_coords'])
+                arr_coords.update(coords_base)
+                arr = xr.DataArray(arr_vals,
+                                   dims=tuple(spec['extra_dims']) + ('psi', 'theta', 'nu'),
+                                   coords=arr_coords,
+                                   attrs=spec['attrs'])
+
+            arr = _decorate_coords(arr)
+            output[spec['name']] = arr
+
+        if packed['input_kind'] == 'dataset':
+            return output
+
+        return {name: output[name] for name in output.data_vars}
+
     def cyl2mag_scalar(
         self,
-        field: Union[np.ndarray, xr.DataArray],
+        field: Union[np.ndarray, xr.DataArray, xr.Dataset, Mapping[str, Any]],
         R: Optional[np.ndarray] = None,
         z: Optional[np.ndarray] = None,
         phi: Optional[np.ndarray] = None,
         return_psi_norm: bool = False,
         return_rhopol: bool = False
-    ) -> xr.DataArray:
+    ) -> Union[xr.DataArray, xr.Dataset, Dict[str, xr.DataArray]]:
         """
         Transform a scalar field from cylindrical coordinates to magnetic.
 
@@ -661,195 +1155,40 @@ class magnetic_coordinates:
         if return_psi_norm and return_rhopol:
             raise ValueError("Only one of return_psi_norm or return_rhopol can be True")
 
-        # Checking that the field is consistent with the
-        # input cylindrical coordinate shape.
         if isinstance(field, xr.DataArray):
-            dims = field.dims
-            for dim in ('R', 'z'):
-                if dim not in dims:
-                    raise ValueError(f"The field must have a '{dim}' dimension")
-
             if (R is not None) or (z is not None) or (phi is not None):
-                logger.warning('The input field is a xarray.DataArray. ' +
-                               'Ignoring the input coordinates.')
-
-            R = np.asarray(field.coords['R'].values)
-            z = np.asarray(field.coords['z'].values)
-
-            if 'phi' in dims:
-                phi = np.asarray(field.coords['phi'].values)
-                field_values = field.transpose('R', 'z', 'phi').values
-            else:
-                phi = None
-                field_values = field.transpose('R', 'z').values
-
-            attrs = field.attrs.copy()
+                logger.warning('The input field is a xarray.DataArray. Ignoring the input coordinates.')
+            packed = self._cyl2mag_pack_dataarray(field)
+        elif isinstance(field, xr.Dataset) or isinstance(field, Mapping):
+            packed = self._cyl2mag_pack_multi(field, R, z, phi)
         else:
-            field_values = np.asarray(field)
-            attrs = dict()
+            packed = self._cyl2mag_pack_ndarray(np.asarray(field), R, z, phi)
 
-            if (R is None) or (z is None):
-                raise ValueError("The field must be a xarray.DataArray or " +
-                                 "the coordinates must be provided")
+        R_eval = packed['R']
+        z_eval = packed['z']
+        Nu = packed['phi'] if packed['phi'] is not None else np.array([0.0])
 
-            R = np.asarray(R)
-            z = np.asarray(z)
+        flux_grid = self._cyl2mag_build_flux_grid(return_psi_norm=return_psi_norm,
+                                                  return_rhopol=return_rhopol)
+        sampling = self._cyl2mag_build_sampling_map(R=R_eval,
+                                                    z=z_eval,
+                                                    Nu=Nu,
+                                                    flux_grid=flux_grid)
+        sampling['Nu'] = Nu
 
-            if field_values.ndim not in (2, 3):
-                raise ValueError(
-                    f"The input field must have 2 or 3 dimensions, got {field_values.ndim}"
-                )
+        field_mag = self._cyl2mag_interp_batch(field_values=packed['packed'],
+                                               R=R_eval,
+                                               z=z_eval,
+                                               sampling=sampling,
+                                               phi_grid=packed['phi'])
+        field_mag = self._cyl2mag_regularize_axis(field_mag,
+                                                  sampling['axis_mask'])
 
-            if field_values.shape[:2] != (R.size, z.size):
-                raise ValueError(
-                    f"The field must have shape (R, z, ...) = ({R.size}, {z.size}, ...), "
-                    f"got {field_values.shape}"
-                )
-
-            if field_values.ndim == 3:
-                if phi is None:
-                    if field_values.shape[2] == 1:
-                        phi = np.array([0.0])
-                    else:
-                        raise ValueError(
-                            "The field has a phi dimension but no phi grid was provided"
-                        )
-                else:
-                    phi = np.asarray(phi)
-                    if field_values.shape[2] != phi.size:
-                        raise ValueError(
-                            f"The field phi dimension ({field_values.shape[2]}) does not "
-                            f"match phi grid size ({phi.size})"
-                        )
-            else:
-                if phi is not None:
-                    phi = np.asarray(phi)
-
-        # Build output flux coordinates and the corresponding physical psi grid.
-        psi_min = float(self.coords.psi0.min())
-        psi_max = float(self.coords.psi0.max())
-        psi_span = psi_max - psi_min
-        if psi_span <= 0.0:
-            raise ValueError("Invalid psi0 range: psi_max must be greater than psi_min")
-
-        if return_rhopol:
-            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
-            psi_norm_eval = Psi**2
-            psi_eval = psi_min + psi_norm_eval * psi_span
-            psi_is_norm_eval = True
-        elif return_psi_norm:
-            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
-            psi_norm_eval = Psi
-            psi_eval = psi_min + psi_norm_eval * psi_span
-            psi_is_norm_eval = True
-        else:
-            Psi = np.linspace(psi_min, psi_max, self.coords.psi0.size)
-            psi_eval = Psi
-            psi_is_norm_eval = False
-
-        Theta = np.linspace(0.0, 2.0*np.pi, self.coords.thetageom.size)
-        if phi is not None:
-            Nu = np.asarray(phi)
-        else:
-            Nu = np.array([0.0])
-
-        # Map (psi, theta) -> (R, z) and compute the nu-shift at phi=0.
-        inv = self.transform_inverse(psi=Psi,
-                                     thetamag=Theta,
-                                     grid=True,
-                                     psi_is_norm=psi_is_norm_eval)
-        R_out = inv.R_inv.values
-        z_out = inv.z_inv.values
-
-        psi_out = np.broadcast_to(psi_eval[:, None], R_out.shape)
-        thetageom_out = np.arctan2(z_out - self.zaxis, R_out - self.Raxis)
-        thetageom_out = np.mod(thetageom_out + 2.0*np.pi, 2.0*np.pi)
-
-        intrp_nu = RectBivariateSpline(self.coords.psi0.values,
-                           self.coords.thetageom.values,
-                           self.coords.nu.values,
-                           kx=3, ky=5)
-        nu0 = intrp_nu(psi_out, thetageom_out, grid=False)
-
-        # Prepare interpolation points and interpolate from cylindrical grid.
-        output_shape = (Psi.size, Theta.size, Nu.size)
-        Rout = np.broadcast_to(R_out[:, :, None], output_shape)
-        zout = np.broadcast_to(z_out[:, :, None], output_shape)
-        Rout = np.clip(Rout, R.min(), R.max())
-        zout = np.clip(zout, z.min(), z.max())
-
-        if field_values.ndim == 3:
-            if phi is None:
-                phi_grid = np.array([0.0])
-            else:
-                phi_grid = np.asarray(phi)
-
-            if phi_grid.size > 1:
-                period = phi_grid.max() - phi_grid.min()
-                phi_eval = Nu[None, None, :] - nu0[:, :, None]
-                if period > 0.0:
-                    phi_eval = np.mod(phi_eval - phi_grid.min(), period) + phi_grid.min()
-                else:
-                    phi_eval[:] = phi_grid[0]
-            else:
-                phi_eval = np.full(output_shape, phi_grid[0])
-            phi_eval = np.clip(phi_eval, phi_grid.min(), phi_grid.max())
-
-            intrp = RegularGridInterpolator((R, z, phi_grid),
-                                            field_values,
-                                            method='linear',
-                                            fill_value=0.0,
-                                            bounds_error=False)
-            points = np.column_stack((Rout.ravel(), zout.ravel(), phi_eval.ravel()))
-        else:
-            intrp = RegularGridInterpolator((R, z),
-                                            field_values,
-                                            method='linear',
-                                            fill_value=0.0,
-                                            bounds_error=False)
-            points = np.column_stack((Rout.ravel(), zout.ravel()))
-
-        field_mag = intrp(points).reshape(output_shape)
-
-        # Magnetic-axis regularity: at psi = psi_min (equivalently rhopol = 0),
-        # physical quantities must be constant along theta.
-        axis_mask = np.isclose(psi_eval, psi_min, rtol=0.0,
-                               atol=max(1.0e-12, 1.0e-12 * abs(psi_span)))
-        if np.any(axis_mask):
-            axis_idx = np.where(axis_mask)[0]
-            for idx in axis_idx:
-                axis_profile = np.nanmean(field_mag[idx, :, :], axis=0)
-                field_mag[idx, :, :] = axis_profile[np.newaxis, :]
-
-        output = xr.DataArray(field_mag,
-                              dims=('psi', 'theta', 'nu'),
-                              coords={'psi': Psi, 'theta': Theta, 'nu': Nu},
-                              attrs=attrs)
-
-        # Add coordinate metadata from internal magnetic coordinate tables.
-        output.psi.attrs.update(self.coords.psi0.attrs)
-        if 'theta_star' in self.coords.coords:
-            output.theta.attrs.update(self.coords.theta_star.attrs)
-        else:
-            output.theta.attrs.update(self.coords.theta.attrs)
-        output.nu.attrs.update(self.coords.nu.attrs)
-
-        if return_rhopol:
-            output.psi.attrs = {
-                'name': 'rhopol',
-                'units': '',
-                'desc': 'Sqrt normalized poloidal flux',
-                'short_name': '$\\rho_{pol}$'
-            }
-        elif return_psi_norm:
-            output.psi.attrs = {
-                'name': 'psi_norm',
-                'units': '',
-                'desc': 'Normalized poloidal flux',
-                'short_name': '$\\Psi_N$'
-            }
-
-        return output
+        return self._cyl2mag_format_output(field_mag=field_mag,
+                                           flux_grid=flux_grid,
+                                           packed=packed,
+                                           return_psi_norm=return_psi_norm,
+                                           return_rhopol=return_rhopol)
 
     def to_hdf5_as_xarray(self, fn: str, group_name: str=None):
         """
