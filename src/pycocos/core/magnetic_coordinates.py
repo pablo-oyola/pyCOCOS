@@ -57,6 +57,10 @@ class magnetic_coordinates:
         Derivative data
     lame_mag : xr.Dataset
         Lamé factors for magnetic coordinates
+    metric_covariant : xr.Dataset
+        Covariant metric coefficients in magnetic coordinates (`g_ij`)
+    metric_contravariant : xr.Dataset
+        Contravariant metric coefficients in magnetic coordinates (`g^ij`)
     Raxis : float
         Radial position of magnetic axis
     zaxis : float
@@ -69,6 +73,14 @@ class magnetic_coordinates:
     >>> coords = mag_coords(R=2.0, z=0.0)  # Transform to magnetic coords
     >>> cyl_coords = mag_coords.transform_inverse(psi=0.5, thetamag=0.0)
     """
+    _METRIC_INDEX_ORDER = ("psi", "theta", "zeta")
+    _METRIC_INDEX_ALIASES = {
+        "psi": "psi",
+        "theta": "theta",
+        "zeta": "zeta",
+        "nu": "zeta",
+    }
+
     def __init__(
         self,
         coords: xr.Dataset,
@@ -107,6 +119,10 @@ class magnetic_coordinates:
         self.lame_mag['h_zeta'] = np.sqrt(self.deriv.dR_dzeta**2 + 
                                           self.deriv.dz_dzeta**2 +
                                           self.deriv.R**2 * self.deriv.dphi_dzeta**2)
+
+        # Pre-compute metric coefficient caches (kept additive to old API).
+        self._metric_missing_terms: List[str] = []
+        self.metric_covariant, self.metric_contravariant = self._build_metric_cache()
         
         # Storing the axis position.
         self.Raxis = Raxis
@@ -114,6 +130,302 @@ class magnetic_coordinates:
 
         # and the padding introduced to the geometrical poloidal angle.
         self.nthtpad = pad
+
+    @staticmethod
+    def _metric_component_name(i: str, j: str, tensor: str) -> str:
+        """
+        Return the internal metric-component variable name.
+        """
+        if tensor == "covariant":
+            return f"g_{i}_{j}"
+        return f"g_contra_{i}_{j}"
+
+    def _normalize_metric_index(self, name: str) -> str:
+        """
+        Validate metric index names and normalize aliases.
+        """
+        key = str(name).strip().lower()
+        if key not in self._METRIC_INDEX_ALIASES:
+            valid = ", ".join(sorted(self._METRIC_INDEX_ALIASES.keys()))
+            raise ValueError(
+                f"Invalid metric index '{name}'. Allowed names are: {valid}"
+            )
+        return self._METRIC_INDEX_ALIASES[key]
+
+    @staticmethod
+    def _normalize_metric_tensor(tensor: str) -> str:
+        """
+        Validate tensor-kind selector for metric access.
+        """
+        key = str(tensor).strip().lower()
+        if key not in ("covariant", "contravariant"):
+            raise ValueError(
+                "Invalid tensor kind. Use 'covariant' or 'contravariant'."
+            )
+        return key
+
+    @staticmethod
+    def _normalize_metric_return_space(return_in: str) -> str:
+        """
+        Validate output coordinate-space selector.
+        """
+        key = str(return_in).strip().lower()
+        if key == "rzphi":
+            return "Rzphi"
+        if key == "magnetic_coordinates":
+            return "magnetic_coordinates"
+        raise ValueError(
+            "Invalid return_in value. Use 'Rzphi' or 'magnetic_coordinates'."
+        )
+
+    def _build_radial_metric_factor(self) -> xr.DataArray:
+        """
+        Return R as a 2D DataArray defined on (R, z).
+        """
+        if "R" in self.deriv:
+            return self.deriv["R"]
+
+        if ("R" in self.coords.coords) and ("z" in self.coords.coords):
+            R1d = np.asarray(self.coords["R"].values)
+            z1d = np.asarray(self.coords["z"].values)
+            RR = np.broadcast_to(R1d[:, None], (R1d.size, z1d.size))
+            return xr.DataArray(RR, dims=("R", "z"), coords={"R": R1d, "z": z1d})
+
+        raise ValueError(
+            "Unable to build metric coefficients: missing 2D radial factor R(R,z)."
+        )
+
+    def _build_metric_cache(self) -> Tuple[xr.Dataset, xr.Dataset]:
+        """
+        Pre-compute covariant and contravariant metric coefficients on (R, z).
+        """
+        required_terms = (
+            "dR_dpsi", "dR_dtheta", "dR_dzeta",
+            "dz_dpsi", "dz_dtheta", "dz_dzeta",
+            "dphi_dpsi", "dphi_dtheta", "dphi_dzeta",
+        )
+        missing = [name for name in required_terms if name not in self.deriv]
+        if missing:
+            self._metric_missing_terms = missing
+            return xr.Dataset(), xr.Dataset()
+
+        Rfac = self._build_radial_metric_factor()
+        dR = {
+            "psi": self.deriv["dR_dpsi"],
+            "theta": self.deriv["dR_dtheta"],
+            "zeta": self.deriv["dR_dzeta"],
+        }
+        dz = {
+            "psi": self.deriv["dz_dpsi"],
+            "theta": self.deriv["dz_dtheta"],
+            "zeta": self.deriv["dz_dzeta"],
+        }
+        dphi = {
+            "psi": self.deriv["dphi_dpsi"],
+            "theta": self.deriv["dphi_dtheta"],
+            "zeta": self.deriv["dphi_dzeta"],
+        }
+
+        metric_covariant = xr.Dataset()
+        for i in self._METRIC_INDEX_ORDER:
+            for j in self._METRIC_INDEX_ORDER:
+                name = self._metric_component_name(i, j, "covariant")
+                gij = (
+                    dR[i] * dR[j]
+                    + dz[i] * dz[j]
+                    + (Rfac * dphi[i]) * (Rfac * dphi[j])
+                )
+                gij.attrs = {
+                    "name": name,
+                    "units": "",
+                    "desc": f"Covariant metric coefficient g_{i}_{j}",
+                    "short_name": f"$g_{{{i}{j}}}$",
+                }
+                metric_covariant[name] = gij
+
+        template = metric_covariant[
+            self._metric_component_name("psi", "psi", "covariant")
+        ]
+        shape2d = template.shape
+        gcov = np.zeros((3, 3) + shape2d, dtype=np.float64)
+        for i_idx, i_name in enumerate(self._METRIC_INDEX_ORDER):
+            for j_idx, j_name in enumerate(self._METRIC_INDEX_ORDER):
+                gname = self._metric_component_name(i_name, j_name, "covariant")
+                gcov[i_idx, j_idx] = metric_covariant[gname].values
+
+        gcov_for_inv = np.moveaxis(gcov, (0, 1), (-2, -1))
+        gcov_flat = gcov_for_inv.reshape(-1, 3, 3)
+        gcontra_flat = np.full_like(gcov_flat, np.nan)
+        for idx, mat in enumerate(gcov_flat):
+            if not np.all(np.isfinite(mat)):
+                continue
+            try:
+                gcontra_flat[idx] = np.linalg.inv(mat)
+            except np.linalg.LinAlgError:
+                gcontra_flat[idx] = np.linalg.pinv(mat, rcond=1.0e-14)
+
+        gcontra = gcontra_flat.reshape(gcov_for_inv.shape)
+        gcontra = np.moveaxis(gcontra, (-2, -1), (0, 1))
+
+        metric_contravariant = xr.Dataset()
+        for i_idx, i_name in enumerate(self._METRIC_INDEX_ORDER):
+            for j_idx, j_name in enumerate(self._METRIC_INDEX_ORDER):
+                name = self._metric_component_name(i_name, j_name, "contravariant")
+                gij = xr.DataArray(
+                    gcontra[i_idx, j_idx],
+                    dims=template.dims,
+                    coords=template.coords,
+                    attrs={
+                        "name": name,
+                        "units": "",
+                        "desc": f"Contravariant metric coefficient g^{i_name}_{j_name}",
+                        "short_name": f"$g^{{{i_name}{j_name}}}$",
+                    },
+                )
+                metric_contravariant[name] = gij
+
+        self._metric_missing_terms = []
+        return metric_covariant, metric_contravariant
+
+    def _project_metric_output(
+        self,
+        field: xr.DataArray,
+        return_in: str,
+        return_psi_norm: bool,
+        return_rhopol: bool
+    ) -> xr.DataArray:
+        """
+        Return metric/Jacobian data in requested coordinate representation.
+        """
+        if return_in == "Rzphi":
+            return field
+        return self.cyl2mag_scalar(
+            field=field,
+            return_psi_norm=return_psi_norm,
+            return_rhopol=return_rhopol,
+        )
+
+    def metric(
+        self,
+        i: str,
+        j: str,
+        tensor: str = "covariant",
+        return_in: str = "Rzphi",
+        return_psi_norm: bool = False,
+        return_rhopol: bool = False
+    ) -> xr.DataArray:
+        """
+        Return a metric coefficient selected by magnetic-coordinate indices.
+
+        Parameters
+        ----------
+        i, j : str
+            Metric indices. Allowed names: ``psi``, ``theta``, ``zeta``.
+            Alias ``nu`` is accepted and mapped to ``zeta``.
+        tensor : str, optional
+            Metric tensor kind: ``covariant`` (``g_ij``) or
+            ``contravariant`` (``g^ij``). Default is ``covariant``.
+        return_in : str, optional
+            Return space selector: ``Rzphi`` or ``magnetic_coordinates``.
+            Default is ``Rzphi``.
+        return_psi_norm : bool, optional
+            Passed to ``cyl2mag_scalar`` when ``return_in='magnetic_coordinates'``.
+            Default is False.
+        return_rhopol : bool, optional
+            Passed to ``cyl2mag_scalar`` when ``return_in='magnetic_coordinates'``.
+            Default is False.
+        """
+        if return_psi_norm and return_rhopol:
+            raise ValueError("Only one of return_psi_norm or return_rhopol can be True")
+
+        i_name = self._normalize_metric_index(i)
+        j_name = self._normalize_metric_index(j)
+        tensor_name = self._normalize_metric_tensor(tensor)
+        return_space = self._normalize_metric_return_space(return_in)
+        index_order = {name: idx for idx, name in enumerate(self._METRIC_INDEX_ORDER)}
+        if index_order[i_name] <= index_order[j_name]:
+            i_lookup, j_lookup = i_name, j_name
+        else:
+            i_lookup, j_lookup = j_name, i_name
+
+        dataset = self.metric_covariant if tensor_name == "covariant" else self.metric_contravariant
+        if len(dataset.data_vars) == 0:
+            if self._metric_missing_terms:
+                missing = ", ".join(self._metric_missing_terms)
+                raise ValueError(
+                    "Metric coefficients are unavailable because required "
+                    f"derivatives are missing: {missing}"
+                )
+            raise ValueError("Metric coefficients are unavailable in this object.")
+
+        name = self._metric_component_name(i_lookup, j_lookup, tensor_name)
+        if name not in dataset:
+            alt_name = self._metric_component_name(j_lookup, i_lookup, tensor_name)
+            if alt_name in dataset:
+                name = alt_name
+            else:
+                raise ValueError(
+                    f"Metric coefficient '{name}' is not available."
+                )
+
+        return self._project_metric_output(
+            field=dataset[name],
+            return_in=return_space,
+            return_psi_norm=return_psi_norm,
+            return_rhopol=return_rhopol,
+        )
+
+    def jacobian(
+        self,
+        return_in: str = "Rzphi",
+        inverse: bool = False,
+        return_psi_norm: bool = False,
+        return_rhopol: bool = False
+    ) -> xr.DataArray:
+        """
+        Return the coordinate-transformation Jacobian.
+
+        Parameters
+        ----------
+        return_in : str, optional
+            Return space selector: ``Rzphi`` or ``magnetic_coordinates``.
+            Default is ``Rzphi``.
+        inverse : bool, optional
+            If True, return inverse Jacobian ``1/J``. Default is False.
+        return_psi_norm : bool, optional
+            Passed to ``cyl2mag_scalar`` when ``return_in='magnetic_coordinates'``.
+            Default is False.
+        return_rhopol : bool, optional
+            Passed to ``cyl2mag_scalar`` when ``return_in='magnetic_coordinates'``.
+            Default is False.
+        """
+        if return_psi_norm and return_rhopol:
+            raise ValueError("Only one of return_psi_norm or return_rhopol can be True")
+
+        return_space = self._normalize_metric_return_space(return_in)
+        if "jacobian" not in self.deriv:
+            raise ValueError("Jacobian is unavailable: deriv['jacobian'] was not found.")
+
+        jac = self.deriv["jacobian"]
+        if inverse:
+            jac_out = xr.where(np.isclose(jac, 0.0), np.nan, 1.0 / jac)
+            jac_out.attrs = jac.attrs.copy()
+            jac_out.attrs.update(
+                {
+                    "name": "jacobian_inverse",
+                    "desc": "Inverse Jacobian of the transformation",
+                    "short_name": "$\\mathcal{J}^{-1}$",
+                }
+            )
+        else:
+            jac_out = jac
+
+        return self._project_metric_output(
+            field=jac_out,
+            return_in=return_space,
+            return_psi_norm=return_psi_norm,
+            return_rhopol=return_rhopol,
+        )
         
     def __call__(
         self,

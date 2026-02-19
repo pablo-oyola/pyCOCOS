@@ -1854,8 +1854,8 @@ class equilibrium:
         self._magnetic_coordinates_cache[coord_sys_lower] = mag_coords_obj
         
         # Also set as main attribute if this is the first/only coordinate system
-        if coord_sys_lower == 'boozer' or 'magnetic_coordinates' not in self.__dict__:
-            self.magnetic_coordinates = mag_coords_obj
+        self.magnetic_coordinates = mag_coords_obj
+        self.coord_sys = coordinate_system.lower()
         
         return mag_coords_obj
     

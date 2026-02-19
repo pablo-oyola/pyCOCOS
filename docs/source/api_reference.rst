@@ -23,3 +23,10 @@ Coordinates
 .. automodule:: pycocos.coordinates.registry
    :members:
    :undoc-members:
+
+Core
+----
+
+.. automodule:: pycocos.core.magnetic_coordinates
+   :members:
+   :undoc-members:
