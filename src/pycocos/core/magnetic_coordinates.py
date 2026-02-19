@@ -545,12 +545,12 @@ class magnetic_coordinates:
         # We have a consistent input, building the output array.
         if R is None:
             print('Generating R coordinates')
-            R = np.linspace(self.coords.R.min(), 
-                            self.coords.R.max(), 
+            R = np.linspace(float(self.coords.R.min().values), 
+                            float(self.coords.R.max().values), 
                             self.coords.R.size)
         if z is None:
-            z = np.linspace(self.coords.z.min(), 
-                            self.coords.z.max(), 
+            z = np.linspace(float(self.coords.z.min().values), 
+                            float(self.coords.z.max().values), 
                             self.coords.z.size)
         if phi is None:
             phi = np.linspace(0, 2*np.pi, nu.size)
@@ -1382,13 +1382,13 @@ class magnetic_coordinates:
         """
         # Building the new grid.
         if rmin is None:
-            rmin = self.coords.R.min()
+            rmin = float(self.coords.R.min().values)
         if rmax is None:
-            rmax = self.coords.R.max()
+            rmax = float(self.coords.R.max().values)
         if zmin is None:
-            zmin = self.coords.z.min()
+            zmin = float(self.coords.z.min().values)
         if zmax is None:
-            zmax = self.coords.z.max()
+            zmax = float(self.coords.z.max().values)
 
         # Checking the input size of the grid.
         if nr <= 0:
@@ -1413,8 +1413,8 @@ class magnetic_coordinates:
             npsi = self.coords.psi0.size
         
         # Building the new grid.
-        psi0 = np.linspace(self.coords.psi0.min(), 
-                           self.coords.psi0.max(), 
+        psi0 = np.linspace(float(self.coords.psi0.min().values), 
+                   float(self.coords.psi0.max().values), 
                            npsi)
         thetageom = np.linspace(0, 2*np.pi, ntht)
 

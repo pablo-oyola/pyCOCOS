@@ -372,8 +372,9 @@ class equilibrium:
         self._boundary.attrs['psimax'] = psimax
 
         # Getting the radius of the separatrix at the geometrical midplane.
-        nr_fine = int( (self.Rgrid[-1] - Raxis) / 1.0e-3)
-        rgrid_fine = np.linspace(Raxis, self.Rgrid[-1], nr_fine)
+        rgrid_max = float(self.Rgrid.values[-1])
+        nr_fine = int((rgrid_max - float(Raxis)) / 1.0e-3)
+        rgrid_fine = np.linspace(float(Raxis), rgrid_max, nr_fine)
 
         # Sometimes life is hard and the coils are close to our plasma
         # and there may be places outside the confined region where 
@@ -1483,11 +1484,16 @@ class equilibrium:
         jacobian_func = get_jacobian_function(coordinate_system)
         
         # Build fine grid for flux surface contours
-        nr_fine = int((self.Rgrid[-1] - self.Rgrid[0]) // dr_hr)
-        nz_fine = int((self.zgrid[-1] - self.zgrid[0]) // dz_hz)
+        rmin = float(self.Rgrid.values[0])
+        rmax = float(self.Rgrid.values[-1])
+        zmin = float(self.zgrid.values[0])
+        zmax = float(self.zgrid.values[-1])
 
-        R_fine = np.linspace(self.Rgrid[0], self.Rgrid[-1], nr_fine)
-        z_fine = np.linspace(self.zgrid[0], self.zgrid[-1], nz_fine)
+        nr_fine = int((rmax - rmin) // dr_hr)
+        nz_fine = int((zmax - zmin) // dz_hz)
+
+        R_fine = np.linspace(rmin, rmax, nr_fine)
+        z_fine = np.linspace(zmin, zmax, nz_fine)
 
         # Evaluate on fine grid (using new structured access)
         psip = self.flux.psi.interp(R=R_fine, z=z_fine, method='cubic').values
@@ -1521,7 +1527,8 @@ class equilibrium:
         # Transform psigrid to radial positions at midplane (using geometry)
         R_axis_val = float(self.geometry.R_axis.values)
         z_axis_val = float(self.geometry.z_axis.values)
-        Rgrid_mid = np.linspace(R_axis_val, self.geometry.R_boundary.max().values, 1000)
+        R_bdy_max = float(self.geometry.R_boundary.max().values)
+        Rgrid_mid = np.linspace(R_axis_val, R_bdy_max, 1000)
         psi_on_Rgrid = self.flux.psi.interp(R=Rgrid_mid,
                                             z=z_axis_val,
                                             method='cubic')
