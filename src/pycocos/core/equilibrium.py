@@ -7,6 +7,7 @@ import numpy as np
 import xarray as xr
 import os
 from typing import Union, Optional, Tuple, Dict, Any
+from numba import njit, prange
 from findiff import FinDiff
 from skimage import measure
 from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
@@ -15,6 +16,7 @@ from scipy.constants import mu_0
 # Importing the internal utils.
 from ..coordinates.registry import get_jacobian_function
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
+from ..coordinates.numba_runtime import ensure_numba_runtime_ready
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
 
 
@@ -109,6 +111,110 @@ def get_currents(R: float, z: float, br: float, bz: float, bphi: float):
     currents['jphi'] = jphi
 
     return currents
+
+
+_CURVATURE_EPS = 1.0e-14
+
+
+@njit(nogil=True, cache=True)
+def _grad_4th_order_point_2d(F, i, k, dR, dZ, NR, NZ):
+    """
+    Compute 4th-order derivatives at one (R, z) point.
+
+    Uses one-sided 4th-order stencils at boundaries and central 4th-order
+    stencils in the interior.
+    """
+    # R-derivative (non-periodic)
+    if i == 0:
+        dF_dR = (-25.0 * F[0, k] + 48.0 * F[1, k] - 36.0 * F[2, k] + 16.0 * F[3, k] - 3.0 * F[4, k]) / (12.0 * dR)
+    elif i == 1:
+        dF_dR = (-3.0 * F[0, k] - 10.0 * F[1, k] + 18.0 * F[2, k] - 6.0 * F[3, k] + F[4, k]) / (12.0 * dR)
+    elif i == NR - 2:
+        dF_dR = (3.0 * F[NR - 1, k] + 10.0 * F[NR - 2, k] - 18.0 * F[NR - 3, k] + 6.0 * F[NR - 4, k] - F[NR - 5, k]) / (12.0 * dR)
+    elif i == NR - 1:
+        dF_dR = (25.0 * F[NR - 1, k] - 48.0 * F[NR - 2, k] + 36.0 * F[NR - 3, k] - 16.0 * F[NR - 4, k] + 3.0 * F[NR - 5, k]) / (12.0 * dR)
+    else:
+        dF_dR = (-F[i + 2, k] + 8.0 * F[i + 1, k] - 8.0 * F[i - 1, k] + F[i - 2, k]) / (12.0 * dR)
+
+    # z-derivative (non-periodic)
+    if k == 0:
+        dF_dZ = (-25.0 * F[i, 0] + 48.0 * F[i, 1] - 36.0 * F[i, 2] + 16.0 * F[i, 3] - 3.0 * F[i, 4]) / (12.0 * dZ)
+    elif k == 1:
+        dF_dZ = (-3.0 * F[i, 0] - 10.0 * F[i, 1] + 18.0 * F[i, 2] - 6.0 * F[i, 3] + F[i, 4]) / (12.0 * dZ)
+    elif k == NZ - 2:
+        dF_dZ = (3.0 * F[i, NZ - 1] + 10.0 * F[i, NZ - 2] - 18.0 * F[i, NZ - 3] + 6.0 * F[i, NZ - 4] - F[i, NZ - 5]) / (12.0 * dZ)
+    elif k == NZ - 1:
+        dF_dZ = (25.0 * F[i, NZ - 1] - 48.0 * F[i, NZ - 2] + 36.0 * F[i, NZ - 3] - 16.0 * F[i, NZ - 4] + 3.0 * F[i, NZ - 5]) / (12.0 * dZ)
+    else:
+        dF_dZ = (-F[i, k + 2] + 8.0 * F[i, k + 1] - 8.0 * F[i, k - 1] + F[i, k - 2]) / (12.0 * dZ)
+
+    return dF_dR, dF_dZ
+
+
+@njit(parallel=True, nogil=True, cache=True, fastmath=True)
+def _curvature_axisymmetric_numba_kernel(R_1d, dR, dZ, b_R, b_phi, b_Z):
+    """
+    Compute kappa = (b dot grad)b in cylindrical coordinates for axisymmetric
+    fields (d/dphi = 0).
+    """
+    NR, NZ = b_R.shape
+    kappa_R = np.empty_like(b_R)
+    kappa_phi = np.empty_like(b_R)
+    kappa_Z = np.empty_like(b_R)
+
+    for i in prange(NR):
+        R_val = R_1d[i]
+        if np.abs(R_val) < _CURVATURE_EPS:
+            R_val = _CURVATURE_EPS
+
+        for k in range(NZ):
+            dbR_dR, dbR_dZ = _grad_4th_order_point_2d(b_R, i, k, dR, dZ, NR, NZ)
+            dbphi_dR, dbphi_dZ = _grad_4th_order_point_2d(b_phi, i, k, dR, dZ, NR, NZ)
+            dbZ_dR, dbZ_dZ = _grad_4th_order_point_2d(b_Z, i, k, dR, dZ, NR, NZ)
+
+            bR_val = b_R[i, k]
+            bphi_val = b_phi[i, k]
+            bZ_val = b_Z[i, k]
+
+            b_dot_grad_bR = bR_val * dbR_dR + bZ_val * dbR_dZ
+            b_dot_grad_bphi = bR_val * dbphi_dR + bZ_val * dbphi_dZ
+            b_dot_grad_bZ = bR_val * dbZ_dR + bZ_val * dbZ_dZ
+
+            kappa_R[i, k] = b_dot_grad_bR - (bphi_val * bphi_val / R_val)
+            kappa_phi[i, k] = b_dot_grad_bphi + (bR_val * bphi_val / R_val)
+            kappa_Z[i, k] = b_dot_grad_bZ
+
+    return kappa_R, kappa_phi, kappa_Z
+
+
+def _curvature_axisymmetric_findiff(R_1d: np.ndarray, dR: float, dZ: float,
+                                    b_R: np.ndarray, b_phi: np.ndarray, b_Z: np.ndarray):
+    """
+    Compute kappa = (b dot grad)b in cylindrical coordinates for axisymmetric
+    fields (d/dphi = 0) using FinDiff derivatives.
+    """
+    d_dR = FinDiff(0, dR, 1, acc=4)
+    d_dZ = FinDiff(1, dZ, 1, acc=4)
+
+    dbR_dR = d_dR(b_R)
+    dbR_dZ = d_dZ(b_R)
+    dbphi_dR = d_dR(b_phi)
+    dbphi_dZ = d_dZ(b_phi)
+    dbZ_dR = d_dR(b_Z)
+    dbZ_dZ = d_dZ(b_Z)
+
+    safe_R = R_1d[:, None].copy()
+    safe_R[np.abs(safe_R) < _CURVATURE_EPS] = _CURVATURE_EPS
+
+    b_dot_grad_bR = b_R * dbR_dR + b_Z * dbR_dZ
+    b_dot_grad_bphi = b_R * dbphi_dR + b_Z * dbphi_dZ
+    b_dot_grad_bZ = b_R * dbZ_dR + b_Z * dbZ_dZ
+
+    kappa_R = b_dot_grad_bR - (b_phi * b_phi / safe_R)
+    kappa_phi = b_dot_grad_bphi + (b_R * b_phi / safe_R)
+    kappa_Z = b_dot_grad_bZ
+
+    return kappa_R, kappa_phi, kappa_Z
 
 # ----------------------------------------------------------------------------
 # MAIN CLASS FUNCTION.
@@ -435,6 +541,9 @@ class equilibrium:
         Jaxis = np.sqrt(Jraxis**2 + Jzaxis**2 + Jphiaxis**2) * np.sign(Jphiaxis)
         self.Jdata.attrs['Jaxis'] = Jaxis
 
+        # Curvature is computed on demand by make_curvature/compute_curvature_vector.
+        self.Kdata = xr.Dataset()
+
         # Create structured data organization (Option A: sub-Datasets as views)
         # These provide convenient access while keeping backward compatibility
         self._build_structured_data()
@@ -513,6 +622,11 @@ class equilibrium:
         
         # Profiles: 1D profiles (initially empty, populated by EQDSK or user)
         self._profiles = xr.Dataset()
+        # Curvature: computed on demand by compute_curvature_vector/make_curvature
+        if hasattr(self, "Kdata") and len(self.Kdata.data_vars) > 0:
+            self._curvature = self.Kdata
+        else:
+            self._curvature = xr.Dataset()
         
         # Initialize profiles dict for tracking
         self._profiles_dict = {}
@@ -541,6 +655,11 @@ class equilibrium:
     def profiles(self) -> xr.Dataset:
         """1D profiles (q, pres, fpol, etc.)."""
         return self._profiles
+
+    @property
+    def curvature(self) -> xr.Dataset:
+        """Curvature vector components (kappa_R, kappa_phi, kappa_z, kappa_abs)."""
+        return self._curvature
     
     # Direct property access for common quantities
     @property
@@ -1044,6 +1163,141 @@ class equilibrium:
         
         return output
 
+    def compute_curvature_vector(
+        self,
+        use_numba: bool = True,
+        cache: bool = True,
+    ) -> xr.Dataset:
+        """
+        Compute magnetic-field-line curvature in cylindrical coordinates.
+
+        Computes ``kappa = (b dot nabla)b`` where ``b = B / |B|`` and returns
+        the cylindrical components ``(kappa_R, kappa_phi, kappa_z)`` on the
+        native ``(R, z)`` grid.
+
+        Notes
+        -----
+        - This routine assumes axisymmetric equilibrium data
+          (i.e. ``d/dphi = 0``).
+        - 4th-order finite-difference stencils are used in ``R`` and ``z``;
+          therefore, at least 5 points are required in each direction.
+
+        Parameters
+        ----------
+        use_numba : bool, optional
+            If True, use a Numba kernel for the hot loops. If False, use a
+            FinDiff-based NumPy implementation. Default is True.
+        cache : bool, optional
+            If True, store the result internally in ``self.Kdata``,
+            ``self.curvaturedata`` (legacy alias), and ``self._curvature``.
+            Default is True.
+
+        Returns
+        -------
+        xr.Dataset
+            Dataset with ``kappa_R``, ``kappa_phi``, ``kappa_z`` and
+            ``kappa_abs``.
+        """
+        if self.nr < 5 or self.nz < 5:
+            raise ValueError("Curvature computation requires at least 5 grid points in both R and z.")
+
+        R_vals = np.asarray(self.Rgrid.values, dtype=np.float64)
+        z_vals = np.asarray(self.zgrid.values, dtype=np.float64)
+
+        dR = float(R_vals[1] - R_vals[0])
+        dZ = float(z_vals[1] - z_vals[0])
+
+        if not np.allclose(np.diff(R_vals), dR, rtol=1.0e-8, atol=1.0e-12):
+            raise ValueError("R grid must be uniformly spaced for 4th-order finite differences.")
+        if not np.allclose(np.diff(z_vals), dZ, rtol=1.0e-8, atol=1.0e-12):
+            raise ValueError("z grid must be uniformly spaced for 4th-order finite differences.")
+
+        Babs = np.asarray(self.Bdata.Babs.values, dtype=np.float64)
+        Babs_safe = np.where(np.abs(Babs) < _CURVATURE_EPS, _CURVATURE_EPS, Babs)
+
+        b_R = np.asarray(self.Bdata.Br.values, dtype=np.float64) / Babs_safe
+        b_phi = np.asarray(self.Bdata.Bphi.values, dtype=np.float64) / Babs_safe
+        b_Z = np.asarray(self.Bdata.Bz.values, dtype=np.float64) / Babs_safe
+
+        if use_numba:
+            ensure_numba_runtime_ready()
+            kappa_R, kappa_phi, kappa_z = _curvature_axisymmetric_numba_kernel(
+                R_vals, dR, dZ, b_R, b_phi, b_Z
+            )
+        else:
+            kappa_R, kappa_phi, kappa_z = _curvature_axisymmetric_findiff(
+                R_vals, dR, dZ, b_R, b_phi, b_Z
+            )
+
+        curvature = xr.Dataset()
+        curvature["kappa_R"] = xr.DataArray(
+            kappa_R,
+            coords=(self.Rgrid, self.zgrid),
+            attrs={
+                "name": "kappa_R",
+                "units": "1/m",
+                "desc": "Radial component of field-line curvature vector",
+                "short_name": r"$\kappa_R$",
+            },
+        )
+        curvature["kappa_phi"] = xr.DataArray(
+            kappa_phi,
+            coords=(self.Rgrid, self.zgrid),
+            attrs={
+                "name": "kappa_phi",
+                "units": "1/m",
+                "desc": "Toroidal component of field-line curvature vector",
+                "short_name": r"$\kappa_\phi$",
+            },
+        )
+        curvature["kappa_z"] = xr.DataArray(
+            kappa_z,
+            coords=(self.Rgrid, self.zgrid),
+            attrs={
+                "name": "kappa_z",
+                "units": "1/m",
+                "desc": "Vertical component of field-line curvature vector",
+                "short_name": r"$\kappa_z$",
+            },
+        )
+        curvature["kappa_abs"] = np.sqrt(
+            curvature.kappa_R**2 + curvature.kappa_phi**2 + curvature.kappa_z**2
+        )
+        curvature.kappa_abs.attrs.update({
+            "name": "kappa_abs",
+            "units": "1/m",
+            "desc": "Magnitude of field-line curvature vector",
+            "short_name": r"$|\kappa|$",
+        })
+
+        if cache:
+            self.Kdata = curvature
+            # Backward-compatible alias used by early integrations.
+            self.curvaturedata = self.Kdata
+            self._curvature = self.Kdata
+
+            # Register/update plottable names without failing on recompute.
+            for var_name, var in self.Kdata.data_vars.items():
+                if var.ndim != 2:
+                    continue
+                if var_name in self.plot_2d_names:
+                    self.plot_2d_names[var_name] = var
+                elif var_name in self.plot_1d_names:
+                    self.plot_1d_names[var_name] = var
+                else:
+                    self.add_var(var_name, var)
+
+        return curvature
+
+    def make_curvature(self, use_numba: bool = True) -> xr.Dataset:
+        """
+        Compute curvature vectors and store them internally.
+
+        This convenience wrapper always updates the internal storage
+        (``Kdata``/``curvature``) and returns the computed dataset.
+        """
+        return self.compute_curvature_vector(use_numba=use_numba, cache=True)
+
     def summary(self) -> None:
         """
         Print a summary of equilibrium properties.
@@ -1133,6 +1387,9 @@ class equilibrium:
             for var_name in self.profiles.data_vars:
                 if self.profiles[var_name].ndim == 1:
                     plottable_1d.append(f"profiles.{var_name}")
+            for var_name in self.curvature.data_vars:
+                if self.curvature[var_name].ndim == 2:
+                    plottable_2d.append(f"curvature.{var_name}")
             
             # From legacy plot dicts (backward compatibility)
             plottable_2d.extend(self.plot_2d_names.keys())
@@ -1194,6 +1451,9 @@ class equilibrium:
         if name in self.profiles.data_vars:
             var = self.profiles[name]
             return (var, var.ndim == 2)
+        if name in self.curvature.data_vars:
+            var = self.curvature[name]
+            return (var, var.ndim == 2)
         
         # Try prefixed names (field.Br, flux.psi, profiles.q)
         if '.' in name:
@@ -1206,6 +1466,9 @@ class equilibrium:
                 return (var, var.ndim == 2)
             if prefix == 'profiles' and var_name in self.profiles.data_vars:
                 var = self.profiles[var_name]
+                return (var, var.ndim == 2)
+            if prefix == 'curvature' and var_name in self.curvature.data_vars:
+                var = self.curvature[var_name]
                 return (var, var.ndim == 2)
         
         return None
@@ -1788,6 +2051,25 @@ class equilibrium:
                            'short_name': 'R'}
         magdevs.z.attrs = {'name': 'z', 'units': 'm', 'desc': 'Height',
                            'short_name': 'z'}
+        
+        # Adding the profiles (I, q, F, h) to the magdevs dataset for easy access
+        magdevs['q'] = xr.DataArray(qprof, dims=('psi0',),
+                                    coords={'psi0': psigrid},
+                                    attrs={'name': 'q', 'units': '',
+                                           'desc': 'Safety factor',
+                                           'short_name': '$q$'})
+        magdevs['F'] = xr.DataArray(Fprof, dims=('psi0',),
+                                    coords={'psi0': psigrid},
+                                    attrs={'name': 'F', 'units': 'T*m',
+                                           'desc': 'F(psi) function in GS equation = RB_T', 
+                                             'short_name': '$F$'})
+        magdevs['I'] = xr.DataArray(Iprof*2*1e-7, dims=('psi0',),
+                                    coords={'psi0': psigrid},
+                                    attrs={'name': 'I', 'units': 'T*m',
+                                           'desc': 'Toroidal current',
+                                           'short_name': r'$\mu_0 I/2\pi$'})
+        magdevs['h'] = magdevs.q * magdevs.F - magdevs.I
+        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF - I', 'units': 'T*m', 'short_name': '$h$'}
 
         # Add inverse transformation
         leftside = Rtransform[:, -ntht_pad:]

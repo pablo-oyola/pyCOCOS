@@ -243,3 +243,40 @@ def test_compute_coordinates_rhopol_window_maps_to_expected_psi(monkeypatch, tmp
     assert np.isclose(captured["psigrid"][0], expected_psi_start)
     assert np.isclose(captured["psigrid"][-1], expected_psi_end)
 
+
+def test_compute_curvature_vector_toroidal_field_limit(monkeypatch, tmp_path):
+    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+
+    curvature = eq.make_curvature(use_numba=False)
+
+    expected_kappa_r = -1.0 / eq.Rgrid.values[:, None]
+    assert np.allclose(curvature["kappa_R"].values, expected_kappa_r, rtol=1.0e-7, atol=1.0e-9)
+    assert np.allclose(curvature["kappa_phi"].values, 0.0, atol=1.0e-10)
+    assert np.allclose(curvature["kappa_z"].values, 0.0, atol=1.0e-10)
+    assert hasattr(eq, "Kdata")
+    assert "kappa_R" in eq.Kdata
+    assert "kappa_R" in eq.curvature
+    assert hasattr(eq, "curvaturedata")
+
+
+def test_compute_curvature_vector_numba_matches_findiff(monkeypatch, tmp_path):
+    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+
+    reference = eq.compute_curvature_vector(use_numba=False, cache=False)
+    numba_out = eq.compute_curvature_vector(use_numba=True, cache=False)
+
+    assert np.allclose(numba_out["kappa_R"].values, reference["kappa_R"].values, atol=1.0e-9)
+    assert np.allclose(numba_out["kappa_phi"].values, reference["kappa_phi"].values, atol=1.0e-9)
+    assert np.allclose(numba_out["kappa_z"].values, reference["kappa_z"].values, atol=1.0e-9)
+
+
+def test_curvature_variables_are_resolvable_for_plotting(monkeypatch, tmp_path):
+    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+    eq.make_curvature(use_numba=False)
+
+    resolved = eq._resolve_plot_variable("curvature.kappa_R")  # noqa: SLF001 - resolver regression coverage
+    assert resolved is not None
+    var, is_2d = resolved
+    assert var.ndim == 2
+    assert is_2d
+
