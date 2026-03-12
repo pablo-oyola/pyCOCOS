@@ -210,37 +210,28 @@ class magnetic_coordinates:
             return xr.Dataset(), xr.Dataset()
 
         Rfac = self._build_radial_metric_factor()
-        dR = {
-            "psi": self.deriv["dR_dpsi"],
-            "theta": self.deriv["dR_dtheta"],
-            "zeta": self.deriv["dR_dzeta"],
-        }
-        dz = {
-            "psi": self.deriv["dz_dpsi"],
-            "theta": self.deriv["dz_dtheta"],
-            "zeta": self.deriv["dz_dzeta"],
-        }
-        dphi = {
-            "psi": self.deriv["dphi_dpsi"],
-            "theta": self.deriv["dphi_dtheta"],
-            "zeta": self.deriv["dphi_dzeta"],
-        }
+        dPsi = np.array([self.deriv.dPsi_dr.values, 
+                         self.deriv.dPsi_dphi.values, 
+                         self.deriv.dPsi_dz.values])
+        dTheta = np.array([self.deriv.dTheta_dr.values, 
+                         self.deriv.dTheta_dphi.values, 
+                         self.deriv.dTheta_dz.values])
+        dzeta = np.array([self.deriv.dzeta_dr.values, 
+                         self.deriv.dzeta_dphi.values, 
+                         self.deriv.dzeta_dz.values])
+        cov_vectors = {'psi': dPsi, 'theta': dTheta, 'zeta': dzeta}
 
         metric_covariant = xr.Dataset()
         for i in self._METRIC_INDEX_ORDER:
             for j in self._METRIC_INDEX_ORDER:
                 name = self._metric_component_name(i, j, "covariant")
-                gij = (
-                    dR[i] * dR[j]
-                    + dz[i] * dz[j]
-                    + (Rfac * dphi[i]) * (Rfac * dphi[j])
-                )
-                gij.attrs = {
-                    "name": name,
-                    "units": "",
-                    "desc": f"Covariant metric coefficient g_{i}_{j}",
-                    "short_name": f"$g_{{{i}{j}}}$",
-                }
+                gij = np.sum(cov_vectors[i] * cov_vectors[j], axis=0)
+                gij = xr.DataArray(gij, dims=('R', 'z'), 
+                                   coords={'R': self.coords.R.values, 
+                                           'z': self.coords.z.values}) 
+                gij.attrs = {'name': name, 'units': '', 
+                            'desc': f'Covariant metric coefficient g_{i}_{j}', 
+                            'short_name': f'$g_{{{i}{j}}}$'}
                 metric_covariant[name] = gij
 
         template = metric_covariant[
