@@ -1739,9 +1739,9 @@ class equilibrium:
 
         Notes
         -----
-        Currently only 'boozer' is fully implemented. Other coordinate systems
-        will raise NotImplementedError until their Jacobian functions are
-        implemented.
+        Available coordinate systems are driven by the Jacobian registry
+        (e.g. ``boozer``, ``pest``, ``equal_arc``, ``hamada``). Any registered
+        system can be computed by passing its name.
         """
         # Get the Jacobian function for this coordinate system
         jacobian_func = get_jacobian_function(coordinate_system)
