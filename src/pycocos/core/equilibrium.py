@@ -2063,13 +2063,15 @@ class equilibrium:
                                     attrs={'name': 'F', 'units': 'T*m',
                                            'desc': 'F(psi) function in GS equation = RB_T', 
                                              'short_name': '$F$'})
-        magdevs['I'] = xr.DataArray(Iprof*2*1e-7, dims=('psi0',),
+        # mu0 = 4*np.pi*1e-7
+        # Iprof *= mu0
+        magdevs['I'] = xr.DataArray(Iprof*2*np.pi, dims=('psi0',),
                                     coords={'psi0': psigrid},
                                     attrs={'name': 'I', 'units': 'T*m',
                                            'desc': 'Toroidal current',
-                                           'short_name': r'$\mu_0 I/2\pi$'})
-        magdevs['h'] = magdevs.q * magdevs.F - magdevs.I
-        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF - I', 'units': 'T*m', 'short_name': '$h$'}
+                                           'short_name': r'$\mu_0 I$'})
+        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I
+        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF + I', 'units': 'T*m', 'short_name': '$h$'}
 
         # Add inverse transformation
         leftside = Rtransform[:, -ntht_pad:]
