@@ -343,3 +343,24 @@ def test_cyl2mag_scalar_dict_multi_field_output():
     assert out['b'].dims == ('psi', 'theta', 'nu')
     assert np.allclose(out['a'].values, mag.cyl2mag_scalar(a, R=R, z=z, phi=phi).values, rtol=0.0, atol=1.0e-12)
     assert np.allclose(out['b'].values, mag.cyl2mag_scalar(b, R=R, z=z, phi=phi).values, rtol=0.0, atol=1.0e-12)
+
+
+def test_cyl2mag_dataarray_with_field_dimension():
+    """Batch dim named 'field' must not clash with internal stack dimension."""
+    mag = _build_synthetic_magnetic_coordinates()
+    R = mag.coords.R.values
+    z = mag.coords.z.values
+    da = xr.DataArray(
+        np.arange(3 * len(R) * len(z), dtype=float).reshape(3, len(R), len(z)),
+        dims=('field', 'R', 'z'),
+        coords={'field': [0, 1, 2], 'R': R, 'z': z},
+        attrs={'name': 'test'},
+    )
+    packed = mag._cyl2mag_pack_dataarray(da)
+    assert packed['input_kind'] == 'batch_dataarray'
+    assert packed['packed'].shape[0] == 3
+    assert packed['specs'][0]['extra_dims'] == ['field']
+
+    out = mag.cyl2mag_scalar(da)
+    assert out.dims == ('field', 'psi', 'theta', 'nu')
+    assert out.sizes['field'] == 3

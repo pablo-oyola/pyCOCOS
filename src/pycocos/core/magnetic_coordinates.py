@@ -1137,8 +1137,13 @@ class magnetic_coordinates:
             input_kind = 'scalar_dataarray'
             field_coord = np.array([0])
         else:
-            stacked = field.stack(field=extra_dims)
-            stacked = stacked.transpose('field', *spatial_dims)
+            # xarray forbids stack(new_dim=...) when new_dim already exists on the array
+            # (e.g. a dimension literally named 'field').
+            stack_dim = '_pycocos_mag_batch'
+            while stack_dim in field.dims:
+                stack_dim = stack_dim + '_'
+            stacked = field.stack({stack_dim: extra_dims})
+            stacked = stacked.transpose(stack_dim, *spatial_dims)
             packed = stacked.values
             specs = [{
                 'name': None,
@@ -1149,7 +1154,7 @@ class magnetic_coordinates:
                 'attrs': field.attrs.copy(),
             }]
             input_kind = 'batch_dataarray'
-            field_coord = np.asarray(stacked.coords['field'].values)
+            field_coord = np.asarray(stacked.coords[stack_dim].values)
 
         return {
             'R': R,
