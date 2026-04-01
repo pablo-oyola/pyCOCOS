@@ -2052,7 +2052,18 @@ class equilibrium:
         magdevs.z.attrs = {'name': 'z', 'units': 'm', 'desc': 'Height',
                            'short_name': 'z'}
         
-        # Adding the profiles (I, q, F, h) to the magdevs dataset for easy access
+        # Adding the profiles (I, q, F, h) to the magdevs dataset for easy access.
+        # Convention note:
+        #   The Boozer Jacobian relation is implemented in compute_coordinates as
+        #       J * B^2 = I_boozer + q*F
+        #   where I_boozer is the line-integrated profile returned by
+        #   compute_magnetic_coordinates (named Iprof in that function).
+        #   For historical compatibility we continue exposing magdevs['I'] as
+        #       I = 2*pi*I_boozer  (units T*m, short-name mu0*I),
+        #   and build h using I_boozer so that h remains consistent with J*B^2.
+        I_boozer = np.asarray(Iprof, dtype=float)
+        I_mu0 = 2.0 * np.pi * I_boozer
+
         magdevs['q'] = xr.DataArray(qprof, dims=('psi0',),
                                     coords={'psi0': psigrid},
                                     attrs={'name': 'q', 'units': '',
@@ -2063,15 +2074,20 @@ class equilibrium:
                                     attrs={'name': 'F', 'units': 'T*m',
                                            'desc': 'F(psi) function in GS equation = RB_T', 
                                              'short_name': '$F$'})
-        # mu0 = 4*np.pi*1e-7
-        # Iprof *= mu0
-        magdevs['I'] = xr.DataArray(Iprof*2*np.pi, dims=('psi0',),
+        magdevs['I_boozer'] = xr.DataArray(I_boozer, dims=('psi0',),
                                     coords={'psi0': psigrid},
                                     attrs={'name': 'I', 'units': 'T*m',
-                                           'desc': 'Toroidal current',
+                                           'desc': 'Boozer current profile entering J*B^2 = I_boozer + qF',
+                                           'short_name': r'$I_\mathrm{boozer}$'})
+        # Legacy/public profile retained for compatibility with existing consumers.
+        magdevs['I'] = xr.DataArray(I_mu0, dims=('psi0',),
+                                    coords={'psi0': psigrid},
+                                    attrs={'name': 'I', 'units': 'T*m',
+                                           'desc': 'Legacy current profile I = 2*pi*I_boozer (short name mu0*I)',
                                            'short_name': r'$\mu_0 I$'})
-        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I
-        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF + I', 'units': 'T*m', 'short_name': '$h$'}
+        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I_boozer
+        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF + I_boozer = qF + I/(2*pi)',
+                         'units': 'T*m', 'short_name': '$h$'}
 
         # Add inverse transformation
         leftside = Rtransform[:, -ntht_pad:]
@@ -2109,8 +2125,13 @@ class equilibrium:
                                               attrs={'name': 'q', 'units': '',
                                                      'desc': 'Safety factor',
                                                      'short_name': '$q$'})
-        Iprof *= 2*np.pi/(4.0*np.pi * 1e-7)
-        self.boozer_profs['I'] = xr.DataArray(Iprof, dims=('psi0',),
+        self.boozer_profs['I_boozer'] = xr.DataArray(I_boozer, dims=('psi0',),
+                                              coords=(psigrid,),
+                                              attrs={'name': 'I_boozer', 'units': 'T*m',
+                                                     'desc': 'Current profile used in J*B^2 = I_boozer + qF',
+                                                     'short_name': '$I_{boozer}$'})
+        I_amp = I_boozer * 2*np.pi/(4.0*np.pi * 1e-7)
+        self.boozer_profs['I'] = xr.DataArray(I_amp, dims=('psi0',),
                                               coords=(psigrid,),
                                               attrs={'name': 'I', 'units': 'A',
                                                      'desc': 'Toroidal current',

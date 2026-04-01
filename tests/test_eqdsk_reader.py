@@ -156,6 +156,55 @@ def test_build_magnetic_coordinates_dataset_has_expected_coordinate_names(monkey
     assert mag.coords["nu"].dims == ("psi0", "thetageom")
 
 
+def test_build_magnetic_coordinates_dataset_boozer_current_convention(monkeypatch, tmp_path):
+    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+
+    npsi = 8
+    ltheta = 24
+    ntht_pad = 2
+    theta = np.linspace(0.0, 2.0 * np.pi, ltheta)
+    psi0 = float(eq.geometry.attrs["psi_ax"]) + 0.01
+    psi1 = float(eq.geometry.attrs["psi_bdy"]) - 0.01
+    psigrid = np.linspace(psi0, psi1, npsi)
+
+    thtable = np.tile(theta, (npsi, 1))
+    nutable = np.zeros((npsi, ltheta))
+    jac = np.ones((npsi, ltheta))
+    Rtransform = np.tile(1.5 + 0.1 * np.cos(theta), (npsi, 1))
+    ztransform = np.tile(0.0 + 0.1 * np.sin(theta), (npsi, 1))
+    qprof = np.linspace(1.0, 2.0, npsi)
+    Fprof = np.linspace(2.0, 1.8, npsi)
+    Iprof = np.linspace(0.3, 0.5, npsi)
+
+    mag = eq._build_magnetic_coordinates_dataset(  # noqa: SLF001 - regression coverage for builder output
+        psigrid=psigrid,
+        thtable=thtable,
+        nutable=nutable,
+        jac=jac,
+        Rtransform=Rtransform,
+        ztransform=ztransform,
+        R_fine=eq.Rgrid.values,
+        z_fine=eq.zgrid.values,
+        qprof=qprof,
+        Fprof=Fprof,
+        Iprof=Iprof,
+        ntht_pad=ntht_pad,
+        coordinate_system="boozer",
+    )
+
+    # Public deriv.I keeps the historical 2*pi scaling.
+    np.testing.assert_allclose(mag.deriv["I"].values, 2.0 * np.pi * Iprof, rtol=1e-12, atol=1e-12)
+    # I_boozer is the profile that enters J*B^2 = I_boozer + qF.
+    np.testing.assert_allclose(mag.deriv["I_boozer"].values, Iprof, rtol=1e-12, atol=1e-12)
+    # h must stay consistent with the Boozer Jacobian relation.
+    np.testing.assert_allclose(
+        mag.deriv["h"].values,
+        qprof * Fprof + Iprof,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
 def test_plot2d_var_transposes_data_for_rz_layout(monkeypatch, tmp_path):
     import matplotlib
 

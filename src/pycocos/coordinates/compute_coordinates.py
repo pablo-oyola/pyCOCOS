@@ -154,7 +154,9 @@ def compute_magnetic_coordinates(
         ds = (dR * br_interp + dZ * bz_interp) / bpol_safe
         dlbpol = dR * br_interp + dZ * bz_interp
 
-        # Compute profiles
+        # Compute profiles.
+        # Iprof follows the Boozer-Jacobian convention used below:
+        #   J * B^2 = Iprof + q*F
         Iprof[ii] = np.sum(dlbpol) / (2*np.pi)
         Fprof[ii] = R[0] * bphi_interp[0]
         qprof[ii] = np.sum(ds * Fprof[ii] / (R**2 * bpol_safe)) / (2*np.pi)
