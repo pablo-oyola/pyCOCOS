@@ -209,7 +209,7 @@ class magnetic_coordinates:
             self._metric_missing_terms = missing
             return xr.Dataset(), xr.Dataset()
 
-        Rfac = self._build_radial_metric_factor()
+        # We build the covariant vectors  e^i = \grad x_i, where i = {psi, theta, zeta}.
         dPsi = np.array([self.deriv.dPsi_dr.values, 
                          self.deriv.dPsi_dphi.values, 
                          self.deriv.dPsi_dz.values])
@@ -220,6 +220,20 @@ class magnetic_coordinates:
                          self.deriv.dzeta_dphi.values, 
                          self.deriv.dzeta_dz.values])
         cov_vectors = {'psi': dPsi, 'theta': dTheta, 'zeta': dzeta}
+
+        # Similarly, we can build the inverse transformation vectors, \partial_i \vec{r},
+        # where i = {psi, theta, zeta}.
+        Rfac = self.deriv.dR_dzeta.R
+        d_dpsi = np.array([self.deriv.dR_dpsi.values, 
+                            self.deriv.dz_dpsi.values, 
+                            (Rfac*self.deriv.dphi_dpsi).values])
+        d_dtheta = np.array([self.deriv.dR_dtheta.values,
+                            self.deriv.dz_dtheta.values, 
+                            (Rfac*self.deriv.dphi_dtheta).values])
+        d_dzeta = np.array([self.deriv.dR_dzeta.values,
+                            self.deriv.dz_dzeta.values, 
+                            (Rfac*self.deriv.dphi_dzeta).values])
+        contra_vectors = {'psi': d_dpsi, 'theta': d_dtheta, 'zeta': d_dzeta}
 
         metric_covariant = xr.Dataset()
         for i in self._METRIC_INDEX_ORDER:
@@ -234,48 +248,19 @@ class magnetic_coordinates:
                             'short_name': f'$g_{{{i}{j}}}$'}
                 metric_covariant[name] = gij
 
-        template = metric_covariant[
-            self._metric_component_name("psi", "psi", "covariant")
-        ]
-        shape2d = template.shape
-        gcov = np.zeros((3, 3) + shape2d, dtype=np.float64)
-        for i_idx, i_name in enumerate(self._METRIC_INDEX_ORDER):
-            for j_idx, j_name in enumerate(self._METRIC_INDEX_ORDER):
-                gname = self._metric_component_name(i_name, j_name, "covariant")
-                gcov[i_idx, j_idx] = metric_covariant[gname].values
-
-        gcov_for_inv = np.moveaxis(gcov, (0, 1), (-2, -1))
-        gcov_flat = gcov_for_inv.reshape(-1, 3, 3)
-        gcontra_flat = np.full_like(gcov_flat, np.nan)
-        for idx, mat in enumerate(gcov_flat):
-            if not np.all(np.isfinite(mat)):
-                continue
-            try:
-                gcontra_flat[idx] = np.linalg.inv(mat)
-            except np.linalg.LinAlgError:
-                gcontra_flat[idx] = np.linalg.pinv(mat, rcond=1.0e-14)
-
-        gcontra = gcontra_flat.reshape(gcov_for_inv.shape)
-        gcontra = np.moveaxis(gcontra, (-2, -1), (0, 1))
-
         metric_contravariant = xr.Dataset()
-        for i_idx, i_name in enumerate(self._METRIC_INDEX_ORDER):
-            for j_idx, j_name in enumerate(self._METRIC_INDEX_ORDER):
-                name = self._metric_component_name(i_name, j_name, "contravariant")
-                gij = xr.DataArray(
-                    gcontra[i_idx, j_idx],
-                    dims=template.dims,
-                    coords=template.coords,
-                    attrs={
-                        "name": name,
-                        "units": "",
-                        "desc": f"Contravariant metric coefficient g^{i_name}_{j_name}",
-                        "short_name": f"$g^{{{i_name}{j_name}}}$",
-                    },
-                )
-                metric_contravariant[name] = gij
+        for i in self._METRIC_INDEX_ORDER:
+            for j in self._METRIC_INDEX_ORDER:
+                name = self._metric_component_name(i, j, "contravariant")
+                gij_contra = np.sum(contra_vectors[i] * contra_vectors[j], axis=0)
+                gij_contra = xr.DataArray(gij_contra, dims=('R', 'z'), 
+                                           coords={'R': self.coords.R.values, 
+                                                   'z': self.coords.z.values}) 
+                gij_contra.attrs = {'name': name, 'units': '', 
+                            'desc': f'Contravariant metric coefficient g^{{{i}}}^{{{j}}}', 
+                            'short_name': f'$g^{{{i}{j}}}$'}
+                metric_contravariant[name] = gij_contra
 
-        self._metric_missing_terms = []
         return metric_covariant, metric_contravariant
 
     def _project_metric_output(
