@@ -1698,7 +1698,8 @@ class equilibrium:
                            dr_hr: float=1.0e-3, dz_hz: float=1.0e-3,
                            padding: float=0.05, ntht_pad: int=5,
                            rhopol_min: Optional[float]=None,
-                           rhopol_max: Optional[float]=None):
+                           rhopol_max: Optional[float]=None,
+                           spectral_max_mode: int=16):
         """
         Compute magnetic coordinates for the specified coordinate system.
 
@@ -1731,6 +1732,9 @@ class equilibrium:
             Maximum normalized poloidal radius to include, in [0, 1].
             If provided (with or without ``rhopol_min``), this overrides
             symmetric ``padding`` behavior.
+        spectral_max_mode : int, optional
+            Maximum retained poloidal Fourier mode in the spectral surface
+            reconstruction. Default is 16.
 
         Returns
         -------
@@ -1813,6 +1817,13 @@ class equilibrium:
             psigrid = np.flip(psigrid, axis=0)
             frr0 = np.flip(frr0, axis=0)
 
+        psi_span = psi_edge - psi_axis
+        if abs(psi_span) < 1.0e-14:
+            rho_at_psi = np.zeros_like(psigrid, dtype=float)
+        else:
+            rho_norm = (psigrid - psi_axis) / psi_span
+            rho_at_psi = np.sqrt(np.clip(rho_norm, 0.0, None))
+
         # Compute coordinates using generic function
         # Pass frr0 (radial positions at midplane) corresponding to psigrid
         out = compute_magnetic_coordinates(
@@ -1825,7 +1836,9 @@ class equilibrium:
             phiclockwise=self.phiclockwise,
             jacobian_func=jacobian_func,
             R_at_psi=frr0,
+            rho_at_psi=rho_at_psi,
             coordinate_system=coordinate_system,
+            spectral_max_mode=spectral_max_mode,
         )
 
         qprof, Fprof, Iprof, thtable, nutable, jac, Rtransform, ztransform = out
@@ -1910,6 +1923,8 @@ class equilibrium:
         thetagrid = np.linspace(-ntht_pad*dtheta,
                                 2*np.pi + ntht_pad*dtheta,
                                 ltheta + 2*ntht_pad)
+        spline_kx = min(3, len(psigrid) - 1)
+        spline_ky = min(3, len(thetagrid) - 1)
 
         # Pad thtable
         thtable_padded = thtable.copy()
@@ -1926,7 +1941,13 @@ class equilibrium:
         )
 
         # Build interpolator and project to R-z plane
-        thtintrp = RectBivariateSpline(psigrid, thetagrid, thtable_padded)
+        thtintrp = RectBivariateSpline(
+            psigrid,
+            thetagrid,
+            thtable_padded,
+            kx=spline_kx,
+            ky=spline_ky,
+        )
         thtable_Rz = thtintrp(psirz, thetageom, grid=False)
         thtable_Rz = xr.DataArray(thtable_Rz, coords=(R_fine, z_fine),
                                     dims=('R', 'z'))
@@ -1941,7 +1962,13 @@ class equilibrium:
             dims=('psi0', 'thetageom'),
         )
 
-        nutintrp = RectBivariateSpline(psigrid, thetagrid, nutable_padded)
+        nutintrp = RectBivariateSpline(
+            psigrid,
+            thetagrid,
+            nutable_padded,
+            kx=spline_kx,
+            ky=spline_ky,
+        )
         nutable_Rz = nutintrp(psirz, thetageom, grid=False)
         nutable_Rz = xr.DataArray(nutable_Rz, coords=(R_fine, z_fine),
                                     dims=('R', 'z'))
@@ -1950,12 +1977,44 @@ class equilibrium:
         leftside = jac[:, -ntht_pad:]
         rightside = jac[:, :ntht_pad]
         jacobian_padded = np.concatenate((leftside, jac, rightside), axis=1)
-        jacinterp = RectBivariateSpline(psigrid, thetagrid, jacobian_padded)
+        jacinterp = RectBivariateSpline(
+            psigrid,
+            thetagrid,
+            jacobian_padded,
+            kx=spline_kx,
+            ky=spline_ky,
+        )
         jac_Rz = jacinterp(psirz, thetageom, grid=False)
+
+        # Build padded inverse maps and differentiate them on (psi0, theta_star)
+        leftside = Rtransform[:, -ntht_pad:]
+        rightside = Rtransform[:, :ntht_pad]
+        Rtransform_padded = np.concatenate((leftside, Rtransform, rightside), axis=1)
+        leftside = ztransform[:, -ntht_pad:]
+        rightside = ztransform[:, :ntht_pad]
+        ztransform_padded = np.concatenate((leftside, ztransform, rightside), axis=1)
+
+        Rinv_intrp = RectBivariateSpline(
+            psigrid,
+            thetagrid,
+            Rtransform_padded,
+            kx=spline_kx,
+            ky=spline_ky,
+        )
+        zinv_intrp = RectBivariateSpline(
+            psigrid,
+            thetagrid,
+            ztransform_padded,
+            kx=spline_kx,
+            ky=spline_ky,
+        )
+
+        psirz_vals = np.asarray(psirz, dtype=float)
+        thtable_rz_vals = np.asarray(thtable_Rz, dtype=float)
 
         # Compute derivatives
         d_dr = FinDiff(0, R_fine[1] - R_fine[0], 1, acc=4)
-        d_dz = FinDiff(0, z_fine[1] - z_fine[0], 1, acc=4)
+        d_dz = FinDiff(1, z_fine[1] - z_fine[0], 1, acc=4)
 
         dPsi_dr = d_dr(psirz)
         dPsi_dz = d_dz(psirz)
@@ -1969,13 +2028,13 @@ class equilibrium:
         dzeta_dz = d_dz(nutable_Rz)
         dzeta_dphi = np.ones_like(nutable_Rz)
 
-        # Inverse transformation derivatives
-        dR_dpsi = dTheta_dz / jac_Rz
-        dR_dtheta = -dPsi_dz / jac_Rz
+        # Inverse transformation derivatives from the fitted inverse maps.
+        dR_dpsi = Rinv_intrp(psirz_vals, thtable_rz_vals, dx=1, dy=0, grid=False)
+        dR_dtheta = Rinv_intrp(psirz_vals, thtable_rz_vals, dx=0, dy=1, grid=False)
         dR_dzeta = np.zeros_like(dR_dpsi)
 
-        dz_dpsi = -dTheta_dr / jac_Rz
-        dz_dtheta = dPsi_dr / jac_Rz
+        dz_dpsi = zinv_intrp(psirz_vals, thtable_rz_vals, dx=1, dy=0, grid=False)
+        dz_dtheta = zinv_intrp(psirz_vals, thtable_rz_vals, dx=0, dy=1, grid=False)
         dz_dzeta = np.zeros_like(dz_dpsi)
 
         dphi_dpsi = (dTheta_dr * dzeta_dz - dTheta_dz * dzeta_dr) / jac_Rz
@@ -2090,9 +2149,6 @@ class equilibrium:
                          'units': 'T*m', 'short_name': '$h$'}
 
         # Add inverse transformation
-        leftside = Rtransform[:, -ntht_pad:]
-        rightside = Rtransform[:, :ntht_pad]
-        Rtransform_padded = np.concatenate((leftside, Rtransform, rightside), axis=1)
         magcoords['R_inv'] = xr.DataArray(Rtransform_padded,
                                           dims=('psi0', 'theta_star'),
                                           coords={'psi0': psigrid,
@@ -2102,9 +2158,6 @@ class equilibrium:
                                                  'units': 'm',
                                                  'short_name': '$R(\\Psi, \\Theta^*)$'})
         
-        leftside = ztransform[:, -ntht_pad:]
-        rightside = ztransform[:, :ntht_pad]
-        ztransform_padded = np.concatenate((leftside, ztransform, rightside), axis=1)
         magcoords['z_inv'] = xr.DataArray(ztransform_padded,
                                           dims=('psi0', 'theta_star'),
                                           coords={'psi0': psigrid,
