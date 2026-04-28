@@ -115,78 +115,6 @@ def get_currents(R: float, z: float, br: float, bz: float, bphi: float):
 
 _CURVATURE_EPS = 1.0e-14
 
-
-@njit(nogil=True, cache=True)
-def _grad_4th_order_point_2d(F, i, k, dR, dZ, NR, NZ):
-    """
-    Compute 4th-order derivatives at one (R, z) point.
-
-    Uses one-sided 4th-order stencils at boundaries and central 4th-order
-    stencils in the interior.
-    """
-    # R-derivative (non-periodic)
-    if i == 0:
-        dF_dR = (-25.0 * F[0, k] + 48.0 * F[1, k] - 36.0 * F[2, k] + 16.0 * F[3, k] - 3.0 * F[4, k]) / (12.0 * dR)
-    elif i == 1:
-        dF_dR = (-3.0 * F[0, k] - 10.0 * F[1, k] + 18.0 * F[2, k] - 6.0 * F[3, k] + F[4, k]) / (12.0 * dR)
-    elif i == NR - 2:
-        dF_dR = (3.0 * F[NR - 1, k] + 10.0 * F[NR - 2, k] - 18.0 * F[NR - 3, k] + 6.0 * F[NR - 4, k] - F[NR - 5, k]) / (12.0 * dR)
-    elif i == NR - 1:
-        dF_dR = (25.0 * F[NR - 1, k] - 48.0 * F[NR - 2, k] + 36.0 * F[NR - 3, k] - 16.0 * F[NR - 4, k] + 3.0 * F[NR - 5, k]) / (12.0 * dR)
-    else:
-        dF_dR = (-F[i + 2, k] + 8.0 * F[i + 1, k] - 8.0 * F[i - 1, k] + F[i - 2, k]) / (12.0 * dR)
-
-    # z-derivative (non-periodic)
-    if k == 0:
-        dF_dZ = (-25.0 * F[i, 0] + 48.0 * F[i, 1] - 36.0 * F[i, 2] + 16.0 * F[i, 3] - 3.0 * F[i, 4]) / (12.0 * dZ)
-    elif k == 1:
-        dF_dZ = (-3.0 * F[i, 0] - 10.0 * F[i, 1] + 18.0 * F[i, 2] - 6.0 * F[i, 3] + F[i, 4]) / (12.0 * dZ)
-    elif k == NZ - 2:
-        dF_dZ = (3.0 * F[i, NZ - 1] + 10.0 * F[i, NZ - 2] - 18.0 * F[i, NZ - 3] + 6.0 * F[i, NZ - 4] - F[i, NZ - 5]) / (12.0 * dZ)
-    elif k == NZ - 1:
-        dF_dZ = (25.0 * F[i, NZ - 1] - 48.0 * F[i, NZ - 2] + 36.0 * F[i, NZ - 3] - 16.0 * F[i, NZ - 4] + 3.0 * F[i, NZ - 5]) / (12.0 * dZ)
-    else:
-        dF_dZ = (-F[i, k + 2] + 8.0 * F[i, k + 1] - 8.0 * F[i, k - 1] + F[i, k - 2]) / (12.0 * dZ)
-
-    return dF_dR, dF_dZ
-
-
-@njit(parallel=True, nogil=True, cache=True, fastmath=True)
-def _curvature_axisymmetric_numba_kernel(R_1d, dR, dZ, b_R, b_phi, b_Z):
-    """
-    Compute kappa = (b dot grad)b in cylindrical coordinates for axisymmetric
-    fields (d/dphi = 0).
-    """
-    NR, NZ = b_R.shape
-    kappa_R = np.empty_like(b_R)
-    kappa_phi = np.empty_like(b_R)
-    kappa_Z = np.empty_like(b_R)
-
-    for i in prange(NR):
-        R_val = R_1d[i]
-        if np.abs(R_val) < _CURVATURE_EPS:
-            R_val = _CURVATURE_EPS
-
-        for k in range(NZ):
-            dbR_dR, dbR_dZ = _grad_4th_order_point_2d(b_R, i, k, dR, dZ, NR, NZ)
-            dbphi_dR, dbphi_dZ = _grad_4th_order_point_2d(b_phi, i, k, dR, dZ, NR, NZ)
-            dbZ_dR, dbZ_dZ = _grad_4th_order_point_2d(b_Z, i, k, dR, dZ, NR, NZ)
-
-            bR_val = b_R[i, k]
-            bphi_val = b_phi[i, k]
-            bZ_val = b_Z[i, k]
-
-            b_dot_grad_bR = bR_val * dbR_dR + bZ_val * dbR_dZ
-            b_dot_grad_bphi = bR_val * dbphi_dR + bZ_val * dbphi_dZ
-            b_dot_grad_bZ = bR_val * dbZ_dR + bZ_val * dbZ_dZ
-
-            kappa_R[i, k] = b_dot_grad_bR - (bphi_val * bphi_val / R_val)
-            kappa_phi[i, k] = b_dot_grad_bphi + (bR_val * bphi_val / R_val)
-            kappa_Z[i, k] = b_dot_grad_bZ
-
-    return kappa_R, kappa_phi, kappa_Z
-
-
 def _curvature_axisymmetric_findiff(R_1d: np.ndarray, dR: float, dZ: float,
                                     b_R: np.ndarray, b_phi: np.ndarray, b_Z: np.ndarray):
     """
@@ -1165,7 +1093,6 @@ class equilibrium:
 
     def compute_curvature_vector(
         self,
-        use_numba: bool = True,
         cache: bool = True,
     ) -> xr.Dataset:
         """
@@ -1219,15 +1146,9 @@ class equilibrium:
         b_phi = np.asarray(self.Bdata.Bphi.values, dtype=np.float64) / Babs_safe
         b_Z = np.asarray(self.Bdata.Bz.values, dtype=np.float64) / Babs_safe
 
-        if use_numba:
-            ensure_numba_runtime_ready()
-            kappa_R, kappa_phi, kappa_z = _curvature_axisymmetric_numba_kernel(
-                R_vals, dR, dZ, b_R, b_phi, b_Z
-            )
-        else:
-            kappa_R, kappa_phi, kappa_z = _curvature_axisymmetric_findiff(
-                R_vals, dR, dZ, b_R, b_phi, b_Z
-            )
+        kappa_R, kappa_phi, kappa_z = _curvature_axisymmetric_findiff(
+            R_vals, dR, dZ, b_R, b_phi, b_Z
+        )
 
         curvature = xr.Dataset()
         curvature["kappa_R"] = xr.DataArray(
@@ -1289,14 +1210,14 @@ class equilibrium:
 
         return curvature
 
-    def make_curvature(self, use_numba: bool = True) -> xr.Dataset:
+    def make_curvature(self) -> xr.Dataset:
         """
         Compute curvature vectors and store them internally.
 
         This convenience wrapper always updates the internal storage
         (``Kdata``/``curvature``) and returns the computed dataset.
         """
-        return self.compute_curvature_vector(use_numba=use_numba, cache=True)
+        return self.compute_curvature_vector(cache=True)
 
     def summary(self) -> None:
         """
