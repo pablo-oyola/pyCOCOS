@@ -252,15 +252,23 @@ def read_eqdsk(
     # We check which is the input COCOS.
     cocos_in = assign_cocos(d['qpsi'][0], d['cpasma'], d['bcentr'],
                             d['simagx'], d['sibdry'], phiclockwise=phiclockwise)
-    
+
     if cocos_in != cocos:
         logger.warning(f'The input COCOS is {cocos_in}. Transforming to COCOS: {cocos}')
-    
+
     # Transforming the equilibrium to the output COCOS.
     d = fromCocosNtoCocosM(d, cocos)
 
+    # After the COCOS transform the toroidal-angle orientation is determined by
+    # the TARGET cocos number, not by the user-supplied input hint. Even-numbered
+    # COCOS conventions (2/4/6/8 and 12/14/16/18) put phi clockwise viewed from
+    # above; odd-numbered conventions put phi counterclockwise. We compute the
+    # post-transform hint from this rule so the verification call uses a
+    # convention-consistent default.
+    phiclockwise_out = (cocos % 10) % 2 == 0
     cocos_out = assign_cocos(d['qpsi'][0], d['cpasma'], d['bcentr'],
-                             d['simagx'], d['sibdry'])
+                             d['simagx'], d['sibdry'],
+                             phiclockwise=phiclockwise_out)
 
     # We need now to transform the generated dictionary and 
     # transform it to the standard that is used in this library.
@@ -507,9 +515,9 @@ class eqdsk(equilibrium):
             _fpolrz = xr.DataArray(self._gdata['fpolrz'], dims=('R', 'z'),
                                     coords=(self.Rgrid, self.zgrid),
                                     attrs={ 'name': 'fpolrz',
-                                            'units': '$T\cdot m$',
-                                            'desc': '$RB_\\phi$',
-                                            'short_name': '$RB_\\phi$'
+                                            'units': r'$T\cdot m$',
+                                            'desc': r'$RB_\phi$',
+                                            'short_name': r'$RB_\phi$'
                                          })
             self.add_var('fpolrz', _fpolrz)
         
