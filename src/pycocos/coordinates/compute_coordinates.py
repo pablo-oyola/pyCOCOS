@@ -284,7 +284,18 @@ def _compute_surface_coordinate_row(
     dlbpol = dR * br_vals + dZ * bz_vals
 
     Iprof = np.sum(dlbpol) / (2.0 * np.pi)
-    Fprof = R[0] * bphi_vals[0]
+    # F = R*B_phi is a flux function (constant on each flux surface in an
+    # axisymmetric equilibrium). Sampling at a single tracing point made the
+    # surface-integrated q profile sensitive to local tracing noise; use the
+    # arc-weighted average over the closed poloidal loop instead, which is
+    # robust to local sample-spacing variations and converges to the exact
+    # flux function as the surface tracing refines.
+    dlp_at_vertex = 0.5 * (np.roll(dlp, 1) + dlp)
+    arc_total = float(np.sum(dlp_at_vertex))
+    if arc_total > 0.0:
+        Fprof = float(np.sum(R * bphi_vals * dlp_at_vertex) / arc_total)
+    else:
+        Fprof = float(R[0] * bphi_vals[0])
     qprof = np.sum(ds * Fprof / (R**2 * bpol_safe)) / (2.0 * np.pi)
 
     jac_context = make_jacobian_context(
@@ -372,6 +383,7 @@ def compute_magnetic_coordinates(
     coordinate_system: str = "boozer",
     rho_at_psi: Optional[np.ndarray] = None,
     spectral_max_mode: int = _DEFAULT_SPECTRAL_MAX_FOURIER_MODE,
+    n_theta_geom: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute magnetic coordinates using a generic Jacobian function.
@@ -379,65 +391,86 @@ def compute_magnetic_coordinates(
     Parameters
     ----------
     Rgrid : np.ndarray
-        Radial grid where (br, bz, bphi) are defined
+        Radial grid where (br, bz, bphi) are defined.
     zgrid : np.ndarray
-        Vertical grid where (br, bz, bphi) are defined
+        Vertical grid where (br, bz, bphi) are defined.
     br : np.ndarray
-        Radial component of the magnetic field
+        Radial component of the magnetic field.
     bz : np.ndarray
-        Vertical component of the magnetic field
+        Vertical component of the magnetic field.
     bphi : np.ndarray
-        Toroidal component of the magnetic field
+        Toroidal component of the magnetic field.
     raxis : float
-        Radial position of the magnetic axis
+        Radial position of the magnetic axis.
     zaxis : float
-        Vertical position of the magnetic axis
+        Vertical position of the magnetic axis.
     psigrid : np.ndarray
-        Poloidal flux grid where coordinates are defined
+        Poloidal flux grid where coordinates are defined.
     ltheta : int, optional
-        Number of points in the poloidal direction. Default is 256
+        Number of points in the poloidal direction. Default is 256.
     phiclockwise : bool, optional
-        Whether toroidal angle increases clockwise. Default is True
+        Whether toroidal angle increases clockwise. Default is True.
     jacobian_func : Callable, optional
-        Function to compute Jacobian: jacobian_func(context) -> J
-        If None, uses Boozer Jacobian
+        Function to compute Jacobian: ``jacobian_func(context) -> J``. If
+        ``None``, uses Boozer Jacobian.
     R_at_psi : np.ndarray, optional
-        Radial positions corresponding to psigrid at midplane.
-        If None, will be computed from psigrid
+        Radial positions corresponding to psigrid at midplane. If None, will
+        be computed from psigrid.
     coordinate_system : str, optional
         Name of coordinate system, used for Jacobian context construction.
-        Default is 'boozer'
+        Default is ``'boozer'``.
     rho_at_psi : np.ndarray, optional
-        Normalized radial labels associated with ``psigrid``.
-        Used internally for spectral surface reconstruction.
+        Normalized radial labels associated with ``psigrid``. Used internally
+        for spectral surface reconstruction.
     spectral_max_mode : int, optional
         Maximum retained poloidal Fourier mode in the spectral surface
         reconstruction. Default is 16.
+    n_theta_geom : int, optional
+        Number of points used to discretize the geometric poloidal angle when
+        tracing each flux surface. The default ``None`` selects the
+        module-level ``_THETA_GEOM_POINTS`` (currently 7200) which is dense
+        enough for production runs at any reasonable ``ltheta``. Lower it
+        when sweeping many surfaces in a diagnostic; raise it when a
+        particular shape requires extra angular resolution. Must be at least
+        ``max(4 * ltheta, 64)`` to keep the spectral surface reconstruction
+        well-resolved.
+
     Returns
     -------
     qprof : np.ndarray
-        Safety factor profile
+        Safety factor profile.
     Fprof : np.ndarray
-        F(psi) = R*B_phi profile
+        ``F(psi) = R*B_phi`` profile.
     Iprof : np.ndarray
-        Toroidal current profile
+        Toroidal current profile.
     thtable : np.ndarray
-        Magnetic poloidal angle table (psi x theta)
+        Magnetic poloidal angle table (psi x theta).
     nutable : np.ndarray
-        Magnetic toroidal angle table (psi x theta)
+        Magnetic toroidal angle table (psi x theta).
     jacobian : np.ndarray
-        Jacobian table (psi x theta)
+        Jacobian table (psi x theta).
     Rtransform : np.ndarray
-        Inverse transformation R(psi, theta)
+        Inverse transformation ``R(psi, theta)``.
     ztransform : np.ndarray
-        Inverse transformation z(psi, theta)
+        Inverse transformation ``z(psi, theta)``.
     """
     if jacobian_func is None:
         jacobian_func = compute_boozer_jacobian
     spectral_max_mode = _validate_spectral_max_mode(spectral_max_mode)
 
+    if n_theta_geom is None:
+        n_theta_geom = _THETA_GEOM_POINTS
+    else:
+        n_theta_geom = int(n_theta_geom)
+        min_required = max(4 * int(ltheta), 64)
+        if n_theta_geom < min_required:
+            raise ValueError(
+                f"n_theta_geom must be at least max(4*ltheta, 64) = {min_required}, "
+                f"got {n_theta_geom}."
+            )
+
     # Generate theta grids
-    thetageom = np.linspace(0, 2.0 * np.pi, _THETA_GEOM_POINTS)
+    thetageom = np.linspace(0, 2.0 * np.pi, n_theta_geom)
     theta_eval = thetageom[:-1]
     thgeogrid = np.linspace(0, 2.0 * np.pi, ltheta)
     thmaggrid = np.linspace(0, 2.0 * np.pi, ltheta)

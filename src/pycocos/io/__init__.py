@@ -15,7 +15,6 @@ from .cocos import (
 
 __all__ = [
     "eqdsk",
-    "cocos",
     "EQDSK",
     "COCOS",
     "cocos",

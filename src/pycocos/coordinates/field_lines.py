@@ -9,7 +9,6 @@ import numpy as np
 from numba import njit
 from typing import Tuple
 from ..utils.numba_utils import interp2d_fast
-from scipy.interpolate import RegularGridInterpolator
 
 
 @njit(nogil=True, cache=True)

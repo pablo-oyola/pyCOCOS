@@ -81,10 +81,18 @@ def make_jacobian_context(
 
 def _normalize_jacobian_for_two_pi_span(context: Mapping[str, Any], jacobian: np.ndarray) -> np.ndarray:
     """
-    Normalize Jacobian so implied poloidal-angle span is 2*pi.
+    Normalize Jacobian so the implied poloidal-angle span is ``2*pi``.
 
-    Follows Eq. 8.99/8.100 logic through:
-      ``dtheta = R / (|J| |grad(psi)|) dlp``
+    Follows Eq. 8.99/8.100 logic through ``dtheta = R / (|J| |grad(psi)|) dlp``.
+
+    This per-surface integral plays the role of ``alpha(psi)`` in Cheng & Chance
+    1987 Eq. 10, which the paper introduces with the requirement that ``theta``
+    increases by ``2*pi`` during one poloidal circuit. The power-family
+    coordinates (``pest``, ``equal_arc``, ``hamada``) have only a power-law
+    geometric definition with no built-in normalization, so the alpha factor
+    must be computed numerically here. The Boozer Jacobian carries its
+    ``alpha(psi)`` analytically through ``h = I + qF`` and therefore bypasses
+    this routine.
     """
     grad_psi = compute_grad_psi_abs(context["R"], context["Bpol"])
     span = compute_theta_span(context["R"], jacobian, grad_psi, context["dlp"])
@@ -98,8 +106,20 @@ def _normalize_jacobian_for_two_pi_span(context: Mapping[str, Any], jacobian: np
 
 def build_boozer_jacobian_from_context(context: Mapping[str, Any]) -> np.ndarray:
     """
-    Boozer Jacobian:
-      J = h(psi) / B^2, with h = I + qF
+    Boozer Jacobian: ``J = h(psi) / B^2`` with ``h = I + q*F``.
+
+    Notes
+    -----
+    Unlike the power-family coordinates handled by
+    :func:`build_power_family_jacobian_from_context`, the Boozer Jacobian does
+    NOT call :func:`_normalize_jacobian_for_two_pi_span`. This is intentional:
+    ``h(psi) = I + q*F`` is itself the surface integral that enforces a
+    ``2*pi`` poloidal-angle span (it plays the role of ``alpha(psi)`` in
+    Cheng & Chance 1987 Eq. 10). Applying the explicit theta-span
+    renormalization on top would double-correct the Jacobian and would also
+    introduce a small finite-resolution integration error on top of the
+    analytical normalization. Consistency of the result can be checked with
+    :func:`boozer_consistency_residual`.
     """
     ensure_numba_runtime_ready()
     h_val = float(context["I"]) + float(context["q"]) * float(context["F"])

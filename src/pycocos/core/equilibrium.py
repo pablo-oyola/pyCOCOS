@@ -7,7 +7,6 @@ import numpy as np
 import xarray as xr
 import os
 from typing import Union, Optional, Tuple, Dict, Any
-from numba import njit, prange
 from findiff import FinDiff
 from skimage import measure
 from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
@@ -16,7 +15,6 @@ from scipy.constants import mu_0
 # Importing the internal utils.
 from ..coordinates.registry import get_jacobian_function
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
-from ..coordinates.numba_runtime import ensure_numba_runtime_ready
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
 
 

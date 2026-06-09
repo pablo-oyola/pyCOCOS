@@ -12,7 +12,7 @@ import numpy as np
 EPS = 1.0e-14
 
 
-@nb.njit(nogil=True)
+@nb.njit(cache=True, nogil=True)
 def compute_grad_psi_abs(R: np.ndarray, bpol: np.ndarray) -> np.ndarray:
     """
     Compute ``|grad(psi)|`` using axisymmetric identity:
@@ -27,7 +27,7 @@ def compute_grad_psi_abs(R: np.ndarray, bpol: np.ndarray) -> np.ndarray:
     return out
 
 
-@nb.njit(nogil=True)
+@nb.njit(cache=True, nogil=True)
 def build_boozer_jacobian(B: np.ndarray, h: float) -> np.ndarray:
     """
     Build Boozer Jacobian: J = h / B^2.
@@ -41,7 +41,7 @@ def build_boozer_jacobian(B: np.ndarray, h: float) -> np.ndarray:
     return out
 
 
-@nb.njit(nogil=True)
+@nb.njit(cache=True, nogil=True)
 def build_power_law_jacobian(
     R: np.ndarray,
     grad_psi: np.ndarray,
@@ -77,7 +77,7 @@ def build_power_law_jacobian(
     return out
 
 
-@nb.njit(nogil=True)
+@nb.njit(cache=True, nogil=True)
 def compute_theta_span(
     R: np.ndarray,
     jacobian: np.ndarray,
@@ -97,7 +97,7 @@ def compute_theta_span(
     return span
 
 
-@nb.njit(nogil=True)
+@nb.njit(cache=True, nogil=True)
 def apply_scalar_scale(values: np.ndarray, scale: float) -> np.ndarray:
     """
     Multiply a vector by a scalar and return a new array.
