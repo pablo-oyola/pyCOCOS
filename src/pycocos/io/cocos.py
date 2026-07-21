@@ -6,9 +6,59 @@ used in tokamak equilibrium codes.
 Reference: O. Sauter et al, Comp. Phys. Comm., 184 (2013) 293-302
 https://www.sciencedirect.com/science/article/pii/S0010465512002962
 """
-import numpy as np
 import copy
-from typing import Any, Optional, Dict, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Literal, Optional, Tuple
+
+import numpy as np
+
+
+FluxNormalization = Literal["Wb", "Wb/rad"]
+_VALID_COCOS_IDS = tuple(range(1, 9)) + tuple(range(11, 19))
+
+
+@dataclass(frozen=True)
+class COCOSResolution:
+    """Candidate COCOS conventions consistent with the supplied information.
+
+    A plain axisymmetric EQDSK does not encode every fact needed to identify a
+    unique COCOS convention.  In particular, callers may omit toroidal-angle
+    orientation and poloidal-flux normalization here without forcing an
+    assumption.  :attr:`candidates` then retains every consistent convention.
+    """
+
+    candidates: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.candidates:
+            raise ValueError("At least one COCOS candidate is required")
+        if self.candidates != tuple(sorted(set(self.candidates))):
+            raise ValueError("COCOS candidates must be sorted and unique")
+        invalid = tuple(
+            candidate
+            for candidate in self.candidates
+            if candidate not in _VALID_COCOS_IDS
+        )
+        if invalid:
+            raise ValueError(f"Invalid COCOS candidates: {invalid}")
+
+    @property
+    def cocos(self) -> Optional[int]:
+        """Return the unique COCOS ID, or ``None`` when still ambiguous."""
+        return self.candidates[0] if self.is_unique else None
+
+    @property
+    def is_unique(self) -> bool:
+        """Whether the available information selects one COCOS convention."""
+        return len(self.candidates) == 1
+
+    def require_unique(self) -> int:
+        """Return the unique COCOS ID or raise with the remaining candidates."""
+        if self.cocos is None:
+            raise ValueError(
+                f"COCOS is ambiguous; candidates are {self.candidates}"
+            )
+        return self.cocos
 
 class COCOS:
     """
@@ -58,11 +108,14 @@ class COCOS:
         sign_q_pos: int,
         sign_pprime_pos: int
     ) -> None:
-        
-        # # Checking all the inputs of this class are either +1 or -1 (
-        # # except for cocos which is an integer)
-        if not all([i in [-1, 1] for i in [sigma_Bp, sigma_RpZ, 
-                                           sigma_rhotp, sign_q_pos, sign_pprime_pos]]):
+        signs = (
+            sigma_Bp,
+            sigma_RpZ,
+            sigma_rhotp,
+            sign_q_pos,
+            sign_pprime_pos,
+        )
+        if not all(sign in (-1, 1) for sign in signs):
             raise ValueError("All inputs must be either +1 or -1")
 
         self.cocos = cocos
@@ -72,6 +125,17 @@ class COCOS:
         self.sigma_rhotp = sigma_rhotp
         self.sign_q_pos = sign_q_pos
         self.sign_pprime_pos = sign_pprime_pos
+
+    @property
+    def phiclockwise(self) -> bool:
+        """Whether the COCOS toroidal angle increases clockwise from +Z."""
+        return self.sigma_RpZ < 0
+
+    @property
+    def flux_normalization(self) -> FluxNormalization:
+        """Poloidal-flux normalization encoded by this COCOS convention."""
+        return "Wb" if self.exp_Bp else "Wb/rad"
+
 
 def cocos(cocos_in: int) -> COCOS:
     """
@@ -97,6 +161,12 @@ def cocos(cocos_in: int) -> COCOS:
     >>> cc = cocos(11)  # ITER/Boozer convention
     >>> cc = cocos(3)   # EFIT convention
     """
+    if isinstance(cocos_in, (bool, np.bool_)) or not isinstance(
+        cocos_in,
+        (int, np.integer),
+    ):
+        raise TypeError("cocos_in must be an integer COCOS ID")
+    cocos_in = int(cocos_in)
     exp_Bp = 1 if cocos_in >= 11 else 0
 
     if cocos_in in (1, 11):
@@ -123,87 +193,84 @@ def cocos(cocos_in: int) -> COCOS:
     else:
         raise ValueError(f"COCOS = {cocos_in} does not exist")
 
-def assign(
+
+def _finite_nonzero_sign(value: float, name: str) -> int:
+    """Return the sign of a finite, nonzero scalar convention quantity."""
+    array = np.asarray(value)
+    if array.ndim != 0:
+        raise TypeError(f"{name} must be a scalar")
+    try:
+        scalar = float(array)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a real scalar") from exc
+    if not np.isfinite(scalar) or scalar == 0.0:
+        raise ValueError(f"{name} must be finite and nonzero")
+    return 1 if scalar > 0.0 else -1
+
+
+def identify_cocos(
     q: float,
     ip: float,
     b0: float,
     psiaxis: float,
     psibndr: float,
-    phiclockwise: bool = False,
-    weberperrad: bool = True
-) -> int:
+    phiclockwise: Optional[bool] = None,
+    flux_normalization: Optional[FluxNormalization] = None,
+) -> COCOSResolution:
+    """Identify every COCOS convention consistent with the supplied facts.
+
+    If toroidal-angle orientation or flux normalization is omitted, the
+    returned resolution remains ambiguous rather than silently guessing.
     """
-    Automatically determine COCOS convention from equilibrium parameters.
+    if phiclockwise is not None and not isinstance(
+        phiclockwise, (bool, np.bool_)
+    ):
+        raise TypeError("phiclockwise must be a boolean or None")
 
-    Parameters
-    ----------
-    q : float
-        Safety factor (at any point, sign included)
-    ip : float
-        Plasma current (sign included)
-    b0 : float
-        Toroidal field (sign included)
-    psiaxis : float
-        Poloidal flux at the magnetic axis
-    psibndr : float
-        Poloidal flux at the boundary
-    phiclockwise : bool, optional
-        If True, toroidal angle increases clockwise when viewed from above.
-        Default is False
-    weberperrad : bool, optional
-        If True, poloidal flux is in Wb/rad (divided by 2π).
-        True for COCOS ID 1-8, False for COCOS ID 11-18.
-        Default is True
+    if flux_normalization not in (None, "Wb", "Wb/rad"):
+        raise ValueError("flux_normalization must be either 'Wb' or 'Wb/rad'")
 
-    Returns
-    -------
-    int
-        The COCOS number (1-18) corresponding to this equilibrium
+    sign_q = _finite_nonzero_sign(q, "q")
+    sign_ip = _finite_nonzero_sign(ip, "ip")
+    sign_b0 = _finite_nonzero_sign(b0, "b0")
 
-    Raises
-    ------
-    ValueError
-        If correct COCOS could not be determined
+    try:
+        psi_difference = float(np.asarray(psibndr)) - float(np.asarray(psiaxis))
+    except (TypeError, ValueError) as exc:
+        raise TypeError("psiaxis and psibndr must be real scalars") from exc
+    psi_difference_sign = _finite_nonzero_sign(
+        psi_difference,
+        "psibndr - psiaxis",
+    )
 
-    Examples
-    --------
-    >>> cocos_id = assign(q=2.0, ip=1e6, b0=2.5, psiaxis=0.0, psibndr=1.0)
-    """
-    sign_q  = np.sign(q)
-    sign_ip = np.sign(ip)
-    sign_b0 = np.sign(b0)
-    cocos = set([1, 2, 3, 4, 5, 6, 7, 8])
+    sigma_bp = psi_difference_sign * sign_ip
+    sigma_rhothetaphi = sign_q * sign_ip * sign_b0
 
-    sigma_bp = np.sign(psibndr-psiaxis)/sign_ip
-    if sigma_bp > 0:
-        for i in [3,4,7,8]:
-            cocos.discard(i)
+    base_candidates = []
+    for cocos_id in range(1, 9):
+        descriptor = cocos(cocos_id)
+        if descriptor.sigma_Bp != sigma_bp:
+            continue
+        if descriptor.sigma_rhotp != sigma_rhothetaphi:
+            continue
+        if (
+            phiclockwise is not None
+            and descriptor.phiclockwise != bool(phiclockwise)
+        ):
+            continue
+        base_candidates.append(cocos_id)
+
+    if flux_normalization == "Wb/rad":
+        candidates = base_candidates
+    elif flux_normalization == "Wb":
+        candidates = [candidate + 10 for candidate in base_candidates]
     else:
-        for i in [1,2,5,6]:
-            cocos.discard(i)
+        candidates = base_candidates + [
+            candidate + 10 for candidate in base_candidates
+        ]
 
-    sigma_rhothetaphi = sign_q/(sign_ip*sign_b0)
-    if sigma_rhothetaphi < 0:
-        for i in [1,2,7,8]:
-            cocos.discard(i)
-    else:
-        for i in [3,4,5,6]:
-            cocos.discard(i)
+    return COCOSResolution(tuple(sorted(candidates)))
 
-    if phiclockwise:
-        for i in [1,3,5,7]:
-            cocos.discard(i)
-    else:
-        for i in [2,4,6,8]:
-            cocos.discard(i)
-
-
-    if len(cocos) > 1:
-        raise ValueError("Could not determine COCOS")
-    cocos = cocos.pop()
-    if not weberperrad: # COCOS ID 11-18 are NOT divided by 2*pi.
-        cocos += 10
-    return cocos
 
 def transform_cocos(
     cc_in: COCOS,
@@ -287,7 +354,7 @@ def transform_cocos(
     transforms["Z"] = ld_eff
     transforms["PRES"] = (lB_eff ** 2) / (mu0 ** exp_mu0_eff)
     transforms["PSI"] = lB_eff * (ld_eff ** 2) * sigma_Ip_eff * sigma_Bp_eff \
-        * ((2 * np.pi) ** exp_Bp_eff) * (ld_eff ** 2) * lB_eff
+        * ((2 * np.pi) ** exp_Bp_eff)
     transforms["TOR"] = lB_eff * (ld_eff ** 2) * sigma_B0_eff
     transforms["PPRIME"] = (lB_eff / ((ld_eff ** 2) * (mu0 ** exp_mu0_eff))) \
         * sigma_Ip_eff * sigma_Bp_eff / ((2 * np.pi) ** exp_Bp_eff)
@@ -301,12 +368,11 @@ def transform_cocos(
 
     return transforms
 
+
 def fromCocosNtoCocosM(
     eqd: Dict[str, Any],
     cocos_m: int,
-    cocos_n: Optional[int] = None,
-    phiclockwise: Optional[bool] = None,
-    weberperrad: bool = True
+    cocos_n: int,
 ) -> Dict[str, Any]:
     """
     Transform equilibrium dictionary from one COCOS to another.
@@ -317,12 +383,8 @@ def fromCocosNtoCocosM(
         Dictionary from reading the EQDSK file
     cocos_m : int
         Target COCOS convention (1-18)
-    cocos_n : int, optional
-        Input COCOS convention. If None, will be auto-detected
-    phiclockwise : bool, optional
-        Whether toroidal angle increases clockwise. Used for auto-detection
-    weberperrad : bool, optional
-        Whether flux is in Wb/rad. Used for auto-detection. Default is True
+    cocos_n : int
+        Input COCOS convention (1-18)
 
     Returns
     -------
@@ -333,39 +395,34 @@ def fromCocosNtoCocosM(
     --------
     >>> eqd_cocos1 = fromCocosNtoCocosM(eqd_data, cocos_m=1, cocos_n=3)
     """
-    if not cocos_n: # If None, determine from G-EQDSK data
-        cocos_n = assign(eqd["qpsi"][0], eqd["cpasma"], eqd["bcentr"],
-                         eqd["simagx"], eqd["sibdry"], phiclockwise,
-                         weberperrad)
-
     transform_dict = transform_cocos(cocos(cocos_n), cocos(cocos_m))
 
-    # Define output
     eqdout = copy.deepcopy(eqd)
-    # eqdout["nx"]    = eqd["nx"]    # For clarity (this is not altered)
-    # eqdout["ny"]    = eqd["ny"]    # -||-
-    # eqdout["nbdry"] = eqd["nbdry"] # -||-
-    # eqdout["nlim"]  = eqd["nlim"]  # -||-
-    eqdout["rdim"]    = eqd["rdim"]    * transform_dict["R"]
-    eqdout["zdim"]    = eqd["zdim"]    * transform_dict["Z"]
-    eqdout["rcentr"]  = eqd["rcentr"]  * transform_dict["R"]
-    eqdout["rleft"]   = eqd["rleft"]   * transform_dict["R"]
-    eqdout["zmid"]    = eqd["zmid"]    * transform_dict["Z"]
-    eqdout["rmagx"]   = eqd["rmagx"]   * transform_dict["R"]
-    eqdout["zmagx"]   = eqd["zmagx"]   * transform_dict["Z"]
-    eqdout["simagx"]  = eqd["simagx"]  * transform_dict["PSI"]
-    eqdout["sibdry"]  = eqd["sibdry"]  * transform_dict["PSI"]
-    eqdout["bcentr"]  = eqd["bcentr"]  * transform_dict["B"]
-    eqdout["cpasma"]  = eqd["cpasma"]  * transform_dict["I"]
-    eqdout["fpol"]    = eqd["fpol"]    * transform_dict["F"]
-    eqdout["pres"]    = eqd["pres"]    * transform_dict["PRES"]
-    eqdout["ffprime"] = eqd["ffprime"] * transform_dict["FFPRIME"]
-    eqdout["pprime"]  = eqd["pprime"]  * transform_dict["PPRIME"]
-    eqdout["psi"]     = eqd["psi"]     * transform_dict["PSI"]
-    eqdout["qpsi"]    = eqd["qpsi"]    * transform_dict["Q"]
-    eqdout["rbdry"]   = eqd["rbdry"]   * transform_dict["R"]
-    eqdout["zbdry"]   = eqd["zbdry"]   * transform_dict["Z"]
-    eqdout["rlim"]    = eqd["rlim"]    * transform_dict["R"]
-    eqdout["zlim"]    = eqd["zlim"]    * transform_dict["Z"]
+    field_transforms = {
+        "rdim": "R",
+        "zdim": "Z",
+        "rcentr": "R",
+        "rleft": "R",
+        "zmid": "Z",
+        "rmagx": "R",
+        "zmagx": "Z",
+        "simagx": "PSI",
+        "sibdry": "PSI",
+        "bcentr": "B",
+        "cpasma": "I",
+        "fpol": "F",
+        "pres": "PRES",
+        "ffprime": "FFPRIME",
+        "pprime": "PPRIME",
+        "psi": "PSI",
+        "qpsi": "Q",
+        "rbdry": "R",
+        "zbdry": "Z",
+        "rlim": "R",
+        "zlim": "Z",
+    }
+    for field, transform in field_transforms.items():
+        if field in eqd:
+            eqdout[field] = eqd[field] * transform_dict[transform]
 
     return eqdout

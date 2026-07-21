@@ -5,8 +5,7 @@ related to tokamaks.
 
 import numpy as np
 import xarray as xr
-import os
-from typing import Union, Optional, Tuple, Dict, Any
+from typing import Union, Optional, Tuple, Dict, Any, Literal
 from findiff import FinDiff
 from skimage import measure
 from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
@@ -16,6 +15,39 @@ from scipy.constants import mu_0
 from ..coordinates.registry import get_jacobian_function
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
+
+
+def _inverse_toroidal_derivatives(
+    dpsi_dR,
+    dpsi_dZ,
+    dtheta_dR,
+    dtheta_dZ,
+    dnu_dR,
+    dnu_dZ,
+):
+    r"""Return inverse toroidal derivatives for ``zeta = phi + nu``.
+
+    The denominator here is the direct two-dimensional determinant
+
+    ``D_RZ = det(partial(psi, theta) / partial(R, Z))``.
+
+    It is distinct from the signed physical coordinate Jacobian
+
+    ``J = [grad(psi) . (grad(theta) x grad(zeta))]**-1 = -R / D_RZ``.
+
+    In particular, ``phi = zeta - nu(psi, theta)`` makes
+    ``partial(phi)/partial(zeta)`` exactly one.
+    """
+    direct_det = dpsi_dR * dtheta_dZ - dpsi_dZ * dtheta_dR
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dphi_dpsi = (
+            dtheta_dR * dnu_dZ - dtheta_dZ * dnu_dR
+        ) / direct_det
+        dphi_dtheta = (
+            dpsi_dZ * dnu_dR - dpsi_dR * dnu_dZ
+        ) / direct_det
+    dphi_dzeta = np.ones_like(direct_det, dtype=np.float64)
+    return direct_det, dphi_dpsi, dphi_dtheta, dphi_dzeta
 
 
 def _require_matplotlib_pyplot():
@@ -176,7 +208,11 @@ class equilibrium:
     psi_ax : float
         Poloidal flux at magnetic axis
     phiclockwise : bool, optional
-        Whether toroidal angle increases clockwise. Default is True
+        Orientation of arrays supplied directly to this generic constructor.
+        Default is False, the canonical internal COCOS-1 orientation.
+    flux_normalization : {"Wb", "Wb/rad"}, optional
+        Poloidal-flux normalization of the supplied arrays. Default is
+        ``"Wb/rad"``.
 
     Attributes
     ----------
@@ -213,7 +249,8 @@ class equilibrium:
         zaxis: float,
         psi_edge: float,
         psi_ax: float,
-        phiclockwise: bool = True
+        phiclockwise: bool = False,
+        flux_normalization: Literal["Wb", "Wb/rad"] = "Wb/rad",
     ) -> None:
         """
         Initialize a generic equilibrium.
@@ -241,7 +278,11 @@ class equilibrium:
         psi_ax : float
             Poloidal flux at magnetic axis
         phiclockwise : bool, optional
-            Whether toroidal angle increases clockwise. Default is True
+            Toroidal-angle orientation of the supplied arrays. Default is
+            False.
+        flux_normalization : {"Wb", "Wb/rad"}, optional
+            Poloidal-flux normalization of the supplied arrays. Default is
+            ``"Wb/rad"``.
 
         Raises
         ------
@@ -250,7 +291,13 @@ class equilibrium:
         """
         rgrid = np.atleast_1d(rgrid)
         zgrid = np.atleast_1d(zgrid)
-        self.phiclockwise = phiclockwise
+        if not isinstance(phiclockwise, (bool, np.bool_)):
+            raise TypeError("phiclockwise must be a boolean.")
+        if flux_normalization not in ("Wb", "Wb/rad"):
+            raise ValueError("flux_normalization must be either 'Wb' or 'Wb/rad'")
+
+        self.phiclockwise = bool(phiclockwise)
+        self.flux_normalization = flux_normalization
         
         # Store axis values for later use in _build_structured_data
         self._Raxis_init = Raxis
@@ -357,18 +404,20 @@ class equilibrium:
                                                 attrs={'name': 'Psi',
                                                         'desc': 'Poloidal magnetic flux',
                                                         'short_name': '$\\Psi$',
-                                                        'units': 'Wb'})
+                                                        'units': self.flux_normalization})
+
+        psimax = psi_edge - psi_ax
+        flux_tolerance = max(1.0e-10, 1.0e-3 * abs(psimax))
 
         # Checking consistency of the axis flux.
         psiax_intrp = self.fluxdata.psipol.interp(R=Raxis, z=zaxis, method='cubic')
-        if(np.abs(psiax_intrp - psi_ax) > 1.0e-4):
+        if np.abs(psiax_intrp - psi_ax) > flux_tolerance:
             raise ValueError('The specified magnetic axis is not ' +
                              'consistent with the input flux: ' +
                              '%f (evaluated) vs %f (input)' % (psiax_intrp, psi_ax))
 
         # With the psipol, we get the magnetic axis and the separatrix values
         # for the flux to finally get rhopol.
-        psimax = psi_edge - psi_ax
         self.fluxdata['rhopol'] = np.sqrt((self.fluxdata.psipol - psi_ax) / psimax)
         self.fluxdata.rhopol.attrs['units'] = ''
         self.fluxdata.rhopol.attrs['desc'] = 'Radial magnetic coordinate'
@@ -396,7 +445,7 @@ class equilibrium:
         # Checking consistency of the flux at the LCFS.
         psiedge_intrp = self.fluxdata.psipol.interp(R=self._boundary.R[0],
                                                     z=self._boundary.z[0], method='cubic')
-        if(np.abs(psiedge_intrp - psi_edge) > 1.0e-4):
+        if np.abs(psiedge_intrp - psi_edge) > flux_tolerance:
             raise ValueError('The specified separatrix flux is not consistent with the equilibrium.')
 
         self._boundary.attrs['psi_bdy'] = psi_edge
@@ -1238,9 +1287,9 @@ class equilibrium:
         print(f"  B_axis = {float(self.Bdata.Baxis.values):.3f} T")
         
         print(f"\nFlux Surfaces:")
-        print(f"  psi_ax = {self.geometry.attrs.get('psi_ax', 'N/A'):.3e} Wb")
-        print(f"  psi_bdy = {self.geometry.attrs.get('psi_bdy', 'N/A'):.3e} Wb")
-        print(f"  psimax = {self.geometry.attrs.get('psimax', 'N/A'):.3e} Wb")
+        print(f"  psi_ax = {self.geometry.attrs.get('psi_ax', 'N/A'):.3e} {self.flux_normalization}")
+        print(f"  psi_bdy = {self.geometry.attrs.get('psi_bdy', 'N/A'):.3e} {self.flux_normalization}")
+        print(f"  psimax = {self.geometry.attrs.get('psimax', 'N/A'):.3e} {self.flux_normalization}")
         
         if len(self._profiles) > 0:
             print(f"\nProfiles available:")
@@ -1703,11 +1752,9 @@ class equilibrium:
             psi0 = psi_axis + rho_min**2 * (psi_edge - psi_axis)
             psi1 = psi_axis + rho_max**2 * (psi_edge - psi_axis)
         else:
-            psi0 = np.amin([psi_axis, psi_edge])
-            psi1 = np.amax([psi_axis, psi_edge])
-            dpsi = psi1 - psi0
-            psi0 += padding * dpsi
-            psi1 -= padding * dpsi
+            psi_span = psi_edge - psi_axis
+            psi0 = psi_axis + padding * psi_span
+            psi1 = psi_axis + (1.0 - padding) * psi_span
         psigrid = np.linspace(psi0, psi1, lpsi)
 
         # Transform psigrid to radial positions at midplane (using geometry)
@@ -1731,10 +1778,6 @@ class equilibrium:
         if len(idx) > 1:
             frr0 = np.delete(frr0, idx[1:])
             psigrid = np.delete(psigrid, idx[1:])
-
-        if psi1 < psi0:
-            psigrid = np.flip(psigrid, axis=0)
-            frr0 = np.flip(frr0, axis=0)
 
         psi_span = psi_edge - psi_axis
         if abs(psi_span) < 1.0e-14:
@@ -1762,11 +1805,25 @@ class equilibrium:
 
         qprof, Fprof, Iprof, thtable, nutable, jac, Rtransform, ztransform = out
 
-        if psi1 < psi0:
-            thtable = np.flip(thtable, axis=0)
-            nutable = np.flip(nutable, axis=0)
-            psigrid = np.flip(psigrid, axis=0)
-            frr0 = np.flip(frr0, axis=0)
+        # Surface tracing and near-axis regularization use axis-to-boundary
+        # order. Sort every radial output together only at the storage
+        # boundary because scipy's spline constructors require increasing
+        # physical psi. The physical axis-to-boundary direction is retained
+        # separately in psi0 metadata.
+        psi_order = np.argsort(psigrid)
+        psigrid = np.asarray(psigrid)[psi_order]
+        qprof = np.asarray(qprof)[psi_order]
+        Fprof = np.asarray(Fprof)[psi_order]
+        Iprof = np.asarray(Iprof)[psi_order]
+        thtable = np.asarray(thtable)[psi_order, :]
+        nutable = np.asarray(nutable)[psi_order, :]
+        jac = np.asarray(jac)[psi_order, :]
+        Rtransform = np.asarray(Rtransform)[psi_order, :]
+        ztransform = np.asarray(ztransform)[psi_order, :]
+        if np.any(np.diff(psigrid) <= 0.0):
+            raise ValueError(
+                "Computed magnetic-coordinate psi grid must be strictly increasing."
+            )
 
         # Continue with post-processing
         return self._build_magnetic_coordinates_dataset(
@@ -1800,7 +1857,8 @@ class equilibrium:
         thtable : np.ndarray
             Magnetic poloidal angle table
         nutable : np.ndarray
-            Magnetic toroidal angle table
+            Axisymmetric toroidal gauge-shift table ``nu(psi, theta)`` in
+            ``zeta = phi + nu``
         jac : np.ndarray
             Jacobian table
         Rtransform : np.ndarray
@@ -1816,7 +1874,7 @@ class equilibrium:
         Fprof : np.ndarray
             F(psi) profile
         Iprof : np.ndarray
-            Toroidal current profile
+            Covariant Boozer magnetic-field coefficient ``I = B_Theta``
         ntht_pad : int
             Number of padding points for theta
 
@@ -1956,15 +2014,40 @@ class equilibrium:
         dz_dtheta = zinv_intrp(psirz_vals, thtable_rz_vals, dx=0, dy=1, grid=False)
         dz_dzeta = np.zeros_like(dz_dpsi)
 
-        dphi_dpsi = (dTheta_dr * dzeta_dz - dTheta_dz * dzeta_dr) / jac_Rz
-        dphi_dtheta = (dPsi_dz * dzeta_dr - dPsi_dr * dzeta_dz) / jac_Rz
-        dphi_dzeta = (dTheta_dz * dPsi_dr - dTheta_dr * dPsi_dz) / jac_Rz + 1.0
+        (
+            direct_det_Rz,
+            dphi_dpsi,
+            dphi_dtheta,
+            dphi_dzeta,
+        ) = _inverse_toroidal_derivatives(
+            dPsi_dr,
+            dPsi_dz,
+            dTheta_dr,
+            dTheta_dz,
+            dzeta_dr,
+            dzeta_dz,
+        )
+
+        if self.flux_normalization == "Wb/rad":
+            jacobian_units = "m**3/Wb"
+            position_per_flux_units = "m*rad/Wb"
+            angle_per_flux_units = "rad**2/Wb"
+            flux_per_length_units = "Wb/(rad*m)"
+            flux_per_angle_units = "Wb/rad**2"
+            direct_det_units = "Wb/m**2"
+        else:
+            jacobian_units = "m**3/(Wb*rad)"
+            position_per_flux_units = "m/Wb"
+            angle_per_flux_units = "rad/Wb"
+            flux_per_length_units = "Wb/m"
+            flux_per_angle_units = "Wb/rad"
+            direct_det_units = "Wb*rad/m**2"
 
         # Build coordinate dataset
         magcoords = xr.Dataset()
         magcoords['psi'] = xr.DataArray(psirz, dims=('R', 'z'),
                                         coords={'R': R_fine, 'z': z_fine},
-                                        attrs={'name': 'psi', 'units': 'Wb',
+                                        attrs={'name': 'psi', 'units': self.flux_normalization,
                                                'desc': 'Poloidal flux',
                                                'short_name': '$\\Psi$'})
         magcoords['theta'] = thtable_da
@@ -1972,17 +2055,18 @@ class equilibrium:
                                     'desc': 'Magnetic poloidal angle',
                                     'short_name': '$\\Theta*$'}
         magcoords['nu'] = nutable_da
-        magcoords['nu'].attrs = {'name': 'nu', 'units': 'rad',
-                                  'desc': 'Magnetic toroidal angle',
-                                  'short_name': '$\\nu$'}
+        magcoords['nu'].attrs = {
+            'name': 'nu',
+            'units': 'rad',
+            'desc': 'Toroidal gauge shift nu(psi, theta) in zeta = phi + nu',
+            'short_name': '$\\nu$',
+            'gauge_relation': 'zeta = phi + nu',
+        }
 
         magcoords.R.attrs = {'name': 'R', 'units': 'm', 'desc': 'Major radius',
                              'short_name': 'R'}
         magcoords.z.attrs = {'name': 'z', 'units': 'm', 'desc': 'Height',
                              'short_name': 'z'}
-        magcoords.psi0.attrs = {'name': 'psi0', 'units': 'Wb',
-                                'desc': 'Poloidal flux at the magnetic axis',
-                                'short_name': '$\\Psi_0$'}
         magcoords.thetageom.attrs = {'name': 'thetageom', 'units': 'rad',
                                      'desc': 'Geometrical poloidal angle',
                                      'short_name': '$\\Theta_{geom}$'}
@@ -1991,30 +2075,33 @@ class equilibrium:
         magdevs = xr.Dataset()
         magdevs['jacobian'] = xr.DataArray(jac_Rz, dims=('R', 'z'),
                                            coords={'R': R_fine, 'z': z_fine},
-                                           attrs={'name': 'jacobian', 'units': '',
-                                                  'desc': 'Jacobian of the transformation',
+                                           attrs={'name': 'jacobian', 'units': jacobian_units,
+                                                  'desc': ('Signed physical Jacobian '
+                                                           '[grad(psi) . (grad(theta) x grad(zeta))]**-1'),
                                                   'short_name': '$\\mathcal{J}$'})
         
         # Add all derivative arrays with proper attributes
         derivatives = {
-            'dR_dpsi': (dR_dpsi, 'm/Wb', 'Partial derivative of R with respect to poloidal flux'),
+            'dR_dpsi': (dR_dpsi, position_per_flux_units, 'Partial derivative of R with respect to poloidal flux'),
             'dR_dtheta': (dR_dtheta, 'm/rad', 'Partial derivative of R with respect to magnetic poloidal angle'),
             'dR_dzeta': (dR_dzeta, 'm/rad', 'Partial derivative of R with respect to magnetic toroidal angle'),
-            'dz_dpsi': (dz_dpsi, 'm/Wb', 'Partial derivative of z with respect to poloidal flux'),
+            'dz_dpsi': (dz_dpsi, position_per_flux_units, 'Partial derivative of z with respect to poloidal flux'),
             'dz_dtheta': (dz_dtheta, 'm/rad', 'Partial derivative of z with respect to magnetic poloidal angle'),
             'dz_dzeta': (dz_dzeta, 'm/rad', 'Partial derivative of z with respect to magnetic toroidal angle'),
-            'dphi_dpsi': (dphi_dpsi, 'rad/Wb', 'Partial derivative of phi with respect to poloidal flux'),
+            'dphi_dpsi': (dphi_dpsi, angle_per_flux_units, 'Partial derivative of phi with respect to poloidal flux'),
             'dphi_dtheta': (dphi_dtheta, 'rad/rad', 'Partial derivative of phi with respect to magnetic poloidal angle'),
             'dphi_dzeta': (dphi_dzeta, 'rad/rad', 'Partial derivative of phi with respect to magnetic toroidal angle'),
-            'dPsi_dr': (dPsi_dr, 'Wb/m', 'Partial derivative of poloidal flux with respect to R'),
-            'dPsi_dz': (dPsi_dz, 'Wb/m', 'Partial derivative of poloidal flux with respect to z'),
-            'dPsi_dphi': (dPsi_dphi, 'Wb/rad', 'Partial derivative of poloidal flux with respect to phi'),
+            'dPsi_dr': (dPsi_dr, flux_per_length_units, 'Partial derivative of poloidal flux with respect to R'),
+            'dPsi_dz': (dPsi_dz, flux_per_length_units, 'Partial derivative of poloidal flux with respect to z'),
+            'dPsi_dphi': (dPsi_dphi, flux_per_angle_units, 'Partial derivative of poloidal flux with respect to phi'),
             'dTheta_dr': (dTheta_dr, 'rad/m', 'Partial derivative of magnetic poloidal angle with respect to R'),
             'dTheta_dz': (dTheta_dz, 'rad/m', 'Partial derivative of magnetic poloidal angle with respect to z'),
             'dTheta_dphi': (dTheta_dphi, 'rad/rad', 'Partial derivative of magnetic poloidal angle with respect to phi'),
             'dzeta_dr': (dzeta_dr, 'rad/m', 'Partial derivative of magnetic toroidal angle with respect to R'),
             'dzeta_dz': (dzeta_dz, 'rad/m', 'Partial derivative of magnetic toroidal angle with respect to z'),
             'dzeta_dphi': (dzeta_dphi, 'rad/rad', 'Partial derivative of magnetic toroidal angle with respect to phi'),
+            'direct_det_Rz': (direct_det_Rz, direct_det_units,
+                              'Direct determinant det(partial(psi, theta)/partial(R, Z)); physical J = -R/direct_det_Rz'),
         }
         
         for name, (data, units, desc) in derivatives.items():
@@ -2030,15 +2117,10 @@ class equilibrium:
         magdevs.z.attrs = {'name': 'z', 'units': 'm', 'desc': 'Height',
                            'short_name': 'z'}
         
-        # Adding the profiles (I, q, F, h) to the magdevs dataset for easy access.
-        # Convention note:
-        #   The Boozer Jacobian relation is implemented in compute_coordinates as
-        #       J * B^2 = I_boozer + q*F
-        #   where I_boozer is the line-integrated profile returned by
-        #   compute_magnetic_coordinates (named Iprof in that function).
-        #   For historical compatibility we continue exposing magdevs['I'] as
-        #       I = 2*pi*I_boozer  (units T*m, short-name mu0*I),
-        #   and build h using I_boozer so that h remains consistent with J*B^2.
+        # Solver-facing Boozer convention: I=B_Theta and h=J*B^2=I+qF.
+        # The former 2*pi-scaled ``I`` is retained under an explicit legacy
+        # name so callers cannot silently confuse it with the covariant field
+        # coefficient.
         I_boozer = np.asarray(Iprof, dtype=float)
         I_mu0 = 2.0 * np.pi * I_boozer
 
@@ -2052,20 +2134,39 @@ class equilibrium:
                                     attrs={'name': 'F', 'units': 'T*m',
                                            'desc': 'F(psi) function in GS equation = RB_T', 
                                              'short_name': '$F$'})
-        magdevs['I_boozer'] = xr.DataArray(I_boozer, dims=('psi0',),
+        magdevs['I'] = xr.DataArray(I_boozer, dims=('psi0',),
                                     coords={'psi0': psigrid},
                                     attrs={'name': 'I', 'units': 'T*m',
-                                           'desc': 'Boozer current profile entering J*B^2 = I_boozer + qF',
-                                           'short_name': r'$I_\mathrm{boozer}$'})
-        # Legacy/public profile retained for compatibility with existing consumers.
-        magdevs['I'] = xr.DataArray(I_mu0, dims=('psi0',),
-                                    coords={'psi0': psigrid},
-                                    attrs={'name': 'I', 'units': 'T*m',
-                                           'desc': 'Legacy current profile I = 2*pi*I_boozer (short name mu0*I)',
-                                           'short_name': r'$\mu_0 I$'})
-        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I_boozer
-        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF + I_boozer = qF + I/(2*pi)',
-                         'units': 'T*m', 'short_name': '$h$'}
+                                           'desc': ('Covariant Boozer magnetic-field '
+                                                    'coefficient I = B_Theta'),
+                                           'short_name': r'$I=B_\Theta$'})
+        magdevs['I_boozer'] = magdevs['I'].copy(deep=False)
+        magdevs['I_boozer'].attrs = magdevs['I'].attrs.copy()
+        magdevs['I_boozer'].attrs.update({
+            'name': 'I_boozer',
+            'desc': 'Alias for the covariant Boozer coefficient I = B_Theta',
+            'alias_for': 'I',
+        })
+        magdevs['I_legacy_2pi'] = xr.DataArray(
+            I_mu0,
+            dims=('psi0',),
+            coords={'psi0': psigrid},
+            attrs={
+                'name': 'I_legacy_2pi',
+                'units': 'T*m',
+                'desc': 'Deprecated 2*pi-scaled current coefficient',
+                'short_name': r'$2\pi I$',
+                'deprecated': 'Use I or I_boozer; both equal B_Theta.',
+                'replacement': 'I',
+            },
+        )
+        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I
+        magdevs['h'].attrs = {
+            'name': 'h',
+            'desc': 'Signed Boozer Jacobian factor h = J*B**2 = I + qF',
+            'units': 'T*m',
+            'short_name': '$h$',
+        }
 
         # Add inverse transformation
         magcoords['R_inv'] = xr.DataArray(Rtransform_padded,
@@ -2089,6 +2190,22 @@ class equilibrium:
         magcoords.theta_star.attrs = {'name': 'theta_star', 'units': 'rad',
                                       'desc': 'Magnetic poloidal angle',
                                       'short_name': '$\\Theta^*$'}
+        psi_axis = float(self.geometry.attrs.get('psi_ax', self._psi_ax_init))
+        psi_boundary = float(
+            self.geometry.attrs.get('psi_bdy', self._psi_edge_init)
+        )
+        magcoords.psi0.attrs = {
+            'name': 'psi0',
+            'units': self.flux_normalization,
+            'desc': 'Strictly increasing physical poloidal-flux spline coordinate',
+            'short_name': '$\\Psi_0$',
+            'psi_axis': psi_axis,
+            'psi_boundary': psi_boundary,
+            'normalization': (
+                'psi_N = (psi - psi_axis) / (psi_boundary - psi_axis)'
+            ),
+        }
+        magdevs.psi0.attrs = magcoords.psi0.attrs.copy()
 
         # Save profiles
         self.boozer_profs = xr.Dataset()
@@ -2097,26 +2214,70 @@ class equilibrium:
                                               attrs={'name': 'q', 'units': '',
                                                      'desc': 'Safety factor',
                                                      'short_name': '$q$'})
-        self.boozer_profs['I_boozer'] = xr.DataArray(I_boozer, dims=('psi0',),
-                                              coords=(psigrid,),
-                                              attrs={'name': 'I_boozer', 'units': 'T*m',
-                                                     'desc': 'Current profile used in J*B^2 = I_boozer + qF',
-                                                     'short_name': '$I_{boozer}$'})
+        self.boozer_profs['I'] = xr.DataArray(
+            I_boozer,
+            dims=('psi0',),
+            coords=(psigrid,),
+            attrs={
+                'name': 'I',
+                'units': 'T*m',
+                'desc': 'Covariant Boozer magnetic-field coefficient I = B_Theta',
+                'short_name': r'$I=B_\Theta$',
+            },
+        )
+        self.boozer_profs['I_boozer'] = self.boozer_profs['I'].copy(deep=False)
+        self.boozer_profs['I_boozer'].attrs = self.boozer_profs['I'].attrs.copy()
+        self.boozer_profs['I_boozer'].attrs.update({
+            'name': 'I_boozer',
+            'desc': 'Alias for the covariant Boozer coefficient I = B_Theta',
+            'alias_for': 'I',
+        })
         I_amp = I_boozer * 2*np.pi/(4.0*np.pi * 1e-7)
-        self.boozer_profs['I'] = xr.DataArray(I_amp, dims=('psi0',),
-                                              coords=(psigrid,),
-                                              attrs={'name': 'I', 'units': 'A',
-                                                     'desc': 'Toroidal current',
-                                                     'short_name': '$I$'})
+        self.boozer_profs['I_toroidal_A'] = xr.DataArray(
+            I_amp,
+            dims=('psi0',),
+            coords=(psigrid,),
+            attrs={
+                'name': 'I_toroidal_A',
+                'units': 'A',
+                'desc': 'Enclosed toroidal current inferred from 2*pi*I/mu0',
+                'short_name': r'$I_\mathrm{tor}$',
+            },
+        )
         self.boozer_profs['F'] = xr.DataArray(Fprof, dims=('psi0',),
                                               coords=(psigrid,),
                                               attrs={'name': 'F', 'units': 'T*m',
                                                      'desc': 'F(psi) function in GS equation = RB_T',
                                                      'short_name': '$F$'})
+        self.boozer_profs.psi0.attrs = magcoords.psi0.attrs.copy()
 
-        # Map regions outside LCFS to NaN
-        rhoprz = self.flux.rho.interp(R=R_fine, z=z_fine, method='cubic')
-        flags = rhoprz > 1.0
+        # Build the LCFS mask from finite physical psi rather than interpolating
+        # rho, whose source grid legitimately contains NaNs outside the LCFS.
+        psi_span = psi_boundary - psi_axis
+        if abs(psi_span) < 1.0e-14:
+            raise ValueError("Axis and boundary poloidal flux must be distinct.")
+        rho_squared = (np.asarray(psirz, dtype=float) - psi_axis) / psi_span
+        inside_lcfs = (
+            np.isfinite(rho_squared)
+            & (rho_squared >= -1.0e-12)
+            & (rho_squared <= 1.0 + 1.0e-12)
+        )
+        inside_lcfs_da = xr.DataArray(
+            inside_lcfs,
+            dims=('R', 'z'),
+            coords={'R': R_fine, 'z': z_fine},
+            attrs={
+                'name': 'inside_lcfs',
+                'units': '',
+                'desc': 'True where normalized physical poloidal flux is in [0, 1]',
+            },
+        )
+        magcoords['inside_lcfs'] = inside_lcfs_da
+        for name, field in list(magdevs.data_vars.items()):
+            if field.dims == ('R', 'z'):
+                attrs = field.attrs.copy()
+                magdevs[name] = field.where(inside_lcfs_da)
+                magdevs[name].attrs = attrs
 
         # Store computed coordinates for easy access
         mag_coords_obj = MagneticCoordinates(magcoords, magdevs,
@@ -2156,183 +2317,3 @@ class equilibrium:
         if not hasattr(self, '_magnetic_coordinates_cache'):
             self._magnetic_coordinates_cache = {}
         return self._magnetic_coordinates_cache
-
-    def to_geqdsk(
-        self,
-        filename: str,
-        cocos: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Save the equilibrium to a g-EQDSK file.
-
-        When the internal object has not a clearly defined COCOS
-        convention, this will try to change it to COCOS=1 by default.
-
-        Parameters
-        ----------
-        filename : str
-            Name of the output file
-        cocos : int, optional
-            COCOS convention to use. If None, uses COCOS=1. Default is None
-
-        Returns
-        -------
-        dict
-            Dictionary containing the g-EQDSK data that was written
-
-        Raises
-        ------
-        ValueError
-            If file already exists
-        """
-
-        if os.path.isfile(filename):
-            raise ValueError(f'File {filename} already exists.' + 
-                              'Please remove it before saving.')
-        
-        # Before saving the gdata.
-
-        # Creating the gdata dictionary.
-        gdata = dict()
-        gdata['nx'] = self.Rgrid.size
-        gdata['ny'] = self.zgrid.size
-        gdata['rmagx'] = float(self.geometry.R_axis.values)
-        gdata['zmagx'] = float(self.geometry.z_axis.values)
-        gdata['bcentr'] = float(self.Bdata.Baxis.values)
-        gdata['rleft'] = float(self.Rgrid[0].values)
-        gdata['zmid'] = float(np.nanmean(self.zgrid.values))
-        gdata['rdim'] = float(self.Rgrid[-1].values - self.Rgrid[0].values)
-        gdata['zdim'] = float(self.zgrid[-1].values - self.zgrid[0].values)
-
-        # Saving the Psi value.
-        psip = self.flux.psi.values
-        gdata['psi'] = psip
-        gdata['simagx'] = float(self.geometry.attrs.get('psi_ax'))
-        gdata['sibdry'] = float(self.geometry.attrs.get('psi_bdy'))
-        gdata['nbdry'] = 1
-        gdata['nlim'] = 1
-        gdata['rbdry'] = self.geometry.R_boundary.values
-        gdata['zbdry'] = self.geometry.z_boundary.values
-
-        # We need now to get the fpol, pressure and current.
-        # Getting the magnetic coordinates.
-        cache = getattr(self, '_magnetic_coordinates_cache', {})
-        if 'boozer' not in cache:
-            self.compute_coordinates(coordinate_system='boozer', lpsi=501) # We need to compute the Boozer transformation.
-
-        psi_ax = float(self.geometry.attrs.get('psi_ax'))
-        psi_bdy = float(self.geometry.attrs.get('psi_bdy'))
-        psiN = psi_bdy - psi_ax
-        dpsi_nominal = psiN / (gdata['nx'] - 1)
-        nx_2 = int((self.flux.rho.max().values**2 * psiN)/dpsi_nominal) + 1
-
-        rhopol_integral = np.linspace(0, float(self.flux.rho.max().values), nx_2)
-        psi_integral = rhopol_integral**2 * psiN + psi_ax
-        fpol_full = np.zeros_like(rhopol_integral)
-
-        flags_extrapolate = np.zeros_like(rhopol_integral, dtype=bool)
-
-        # We need to manually recompute the value of the function F:
-        for ii, irhop in enumerate(rhopol_integral):
-            R, z = self.rhopol2rz(irhop)
-            R = R[0]
-            z = z[0]
-
-            if R is None:
-                flags_extrapolate[ii] = True
-                continue
-
-            Bvalue = self.getB(R, z, grid=False)
-
-            # We need to interpolate the pressure gradient.
-            fpol_full[ii] = np.nanmean(R * Bvalue.Bphi.values)
-        
-        # We need to extrapolate to the values that the algorithm could not
-        # find.
-        fpol_full[flags_extrapolate] = np.interp(rhopol_integral[flags_extrapolate],
-                                                 rhopol_integral[~flags_extrapolate],
-                                                 fpol_full[~flags_extrapolate])
-        
-        
-
-        # From the Boozer transformation, we can get the fpol, pressure and current.
-        psi1d = np.linspace(psi_ax, psi_bdy, gdata['nx'])
-        psiN = psi_bdy - psi_ax
-        fpol = InterpolatedUnivariateSpline(psi_integral, fpol_full, k=3)(psi1d)
-        gdata['fpol'] = fpol
-
-        # Getting the derivative.
-        d_dpsi = FinDiff(0, 1, acc=4)
-        ffprime = d_dpsi(fpol_full, psi_integral) * fpol_full
-        idx = np.where(flags_extrapolate[:nx_2//2])[0][-1] + 3
-        gdata['ffprime'] = InterpolatedUnivariateSpline(psi_integral[idx:], 
-                                                        ffprime[idx:], k=1)(psi1d)
-
-        # From the Grad-Shafranov equation, one can get the pressure
-        # gradient in magnetic coordinates.
-        d_dR = FinDiff(0, self.Rgrid.values[1] - self.Rgrid.values[0], 1, acc=4)
-        d_dz = FinDiff(1, self.zgrid.values[1] - self.zgrid.values[0], 1, acc=4)
-
-        tmp1 = d_dR(self.Bdata.Bz.values) / self.Rgrid.values[:, None]
-        tmp2 = d_dz(self.Bdata.Br.values) / self.Rgrid.values[:, None]
-
-        # \\mu_0 pprime = - [ FF'/R^2 + dB_z/dR / R - dB_R/dz / R ]
-        ffprime_rz = InterpolatedUnivariateSpline(psi_integral[idx:], 
-                                                  ffprime[idx:], ext=3,
-                                                  k=3)(self.fluxdata.psipol.values)
-        pprime_rz = - (ffprime_rz / self.Rgrid.values[:, None]**2 - tmp1 + tmp2)
-
-        gdata['pprime_rz'] = pprime_rz
-        gdata['ffprime_rz'] = ffprime_rz
-
-        # We need now the average pressure gradient in the flux surface.
-        pprime = np.zeros_like(rhopol_integral)
-        ffprime_check = np.zeros_like(rhopol_integral)
-
-        pprime_intrp = RectBivariateSpline(self.Rgrid.values, self.zgrid.values,
-                                             pprime_rz)
-        ffprime_rz_intrp = RectBivariateSpline(self.Rgrid.values, self.zgrid.values,
-                                               ffprime_rz)
-        
-        for ii, irhop in enumerate(rhopol_integral):
-            R, z = self.rhopol2rz(irhop)
-            R = R[0]
-            z = z[0]
-
-            if R is None:
-                pprime[ii] = 0
-                ffprime_check[ii] = 0
-                continue
-
-            # We need to interpolate the pressure gradient.
-            tmp = pprime_intrp(R, z, grid=False)
-
-            thetaval = np.arctan2(z - float(self.geometry.z_axis.values), 
-                                  R - float(self.geometry.R_axis.values))
-            # plt.plot(thetaval, tmp)
-            pprime[ii] = np.nanmean(tmp)
-            ffprime_check[ii] = np.nanmean(ffprime_rz_intrp(R, z, grid=False))
-
-        
-        gdata['pprime'] = InterpolatedUnivariateSpline(psi_integral, pprime,
-                                                       k=3)(psi1d) / (4*np.pi * 1e-7)
-        gdata['ffprime_check'] = ffprime_check
-
-        # plt.plot(psi_integral, pprime, 'r-')
-        # plt.plot(self._gdata['psi_1d'], self._gdata['pprime'], 'b--')
-
-        # To get now the total pressure, we need to integrate the pprime
-        # along the magnetic flux. Since we don't have any indication on
-        # boundary condition, we will consider that for the largest value
-        # of rhopol, the pressure is zero.
-        ptotal = np.zeros_like(rhopol_integral)
-        psi_integral = rhopol_integral**2 * psiN + psi_ax
-        ptotal[-1] = 0.0
-
-        for ii in range(len(rhopol_integral) - 2, -1, -1):
-            ptotal[ii] = ptotal[ii+1] + pprime[ii] * (psi_integral[ii+1] - psi_integral[ii])
-
-        gdata['ptotal'] = InterpolatedUnivariateSpline(psi_integral, ptotal, k=3)(psi1d)
-
-
-        return gdata

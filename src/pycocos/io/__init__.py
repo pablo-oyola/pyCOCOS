@@ -7,8 +7,9 @@ from . import cocos
 from .eqdsk import eqdsk as EQDSK
 from .cocos import (
     COCOS,
+    COCOSResolution,
     cocos,
-    assign,
+    identify_cocos,
     transform_cocos,
     fromCocosNtoCocosM,
 )
@@ -17,9 +18,9 @@ __all__ = [
     "eqdsk",
     "EQDSK",
     "COCOS",
+    "COCOSResolution",
     "cocos",
-    "assign",
+    "identify_cocos",
     "transform_cocos",
     "fromCocosNtoCocosM",
 ]
-
