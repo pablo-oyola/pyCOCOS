@@ -765,25 +765,84 @@ def test_cocos_info_uses_explicit_input_and_internal_fields(
     assert info["sigma_RpZ_internal"] == 1
 
 
-def test_build_magnetic_coordinates_dataset_has_expected_coordinate_names(monkeypatch, tmp_path):
-    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+@pytest.mark.parametrize(
+    (
+        "cocos_internal",
+        "flux_units",
+        "position_per_flux_units",
+        "angle_per_flux_units",
+        "flux_per_length_units",
+        "flux_per_angle_units",
+        "jacobian_units",
+        "direct_det_units",
+    ),
+    (
+        (
+            1,
+            "Wb/rad",
+            "m*rad/Wb",
+            "rad**2/Wb",
+            "Wb/(rad*m)",
+            "Wb/rad**2",
+            "m**3/Wb",
+            "Wb/m**2",
+        ),
+        (
+            12,
+            "Wb",
+            "m/Wb",
+            "rad/Wb",
+            "Wb/m",
+            "Wb/rad",
+            "m**3/(Wb*rad)",
+            "Wb*rad/m**2",
+        ),
+    ),
+    ids=("cocos_1", "cocos_12"),
+)
+def test_build_magnetic_coordinates_dataset_has_expected_coordinate_names(
+    monkeypatch,
+    tmp_path,
+    cocos_internal,
+    flux_units,
+    position_per_flux_units,
+    angle_per_flux_units,
+    flux_per_length_units,
+    flux_per_angle_units,
+    jacobian_units,
+    direct_det_units,
+):
+    eq = _make_fake_eq_instance(
+        monkeypatch,
+        tmp_path,
+        cocos_input=cocos_internal,
+        cocos_internal=cocos_internal,
+    )
 
     npsi = 12
     ltheta = 32
     ntht_pad = 3
     theta = np.linspace(0.0, 2.0 * np.pi, ltheta)
-    psi0 = float(eq.geometry.attrs["psi_ax"]) + 0.01
-    psi1 = float(eq.geometry.attrs["psi_bdy"]) - 0.01
-    psigrid = np.linspace(psi0, psi1, npsi)
+    psi_axis = float(eq.geometry.attrs["psi_ax"])
+    psi_boundary = float(eq.geometry.attrs["psi_bdy"])
+    # The spline coordinate stays ascending even when physical psi decreases
+    # from axis to boundary, as it does for COCOS 12.
+    psi_axis_order = psi_axis + np.linspace(0.05, 0.95, npsi) * (
+        psi_boundary - psi_axis
+    )
+    psi_order = np.argsort(psi_axis_order)
+    psigrid = psi_axis_order[psi_order]
 
     thtable = np.tile(theta, (npsi, 1))
     nutable = np.zeros((npsi, ltheta))
     jac = np.ones((npsi, ltheta))
-    Rtransform = np.tile(1.5 + 0.1 * np.cos(theta), (npsi, 1))
-    ztransform = np.tile(0.0 + 0.1 * np.sin(theta), (npsi, 1))
-    qprof = np.linspace(1.0, 2.0, npsi)
-    Fprof = np.linspace(2.0, 1.8, npsi)
-    Iprof = np.linspace(1.0e6, 1.1e6, npsi)
+    psi_scale = (psi_boundary - psi_axis) / 0.16
+    surface_radius = np.sqrt((psigrid - psi_axis) / psi_scale)
+    Rtransform = 1.5 + surface_radius[:, None] * np.cos(theta)[None, :]
+    ztransform = surface_radius[:, None] * np.sin(theta)[None, :]
+    qprof = np.linspace(1.0, 2.0, npsi)[psi_order]
+    Fprof = np.linspace(2.0, 1.8, npsi)[psi_order]
+    Iprof = np.linspace(1.0e6, 1.1e6, npsi)[psi_order]
 
     mag = eq._build_magnetic_coordinates_dataset(  # noqa: SLF001 - regression coverage for builder output
         psigrid=psigrid,
@@ -808,26 +867,84 @@ def test_build_magnetic_coordinates_dataset_has_expected_coordinate_names(monkey
     assert "nu_shift" not in mag.coords
     assert mag.coords["nu"].attrs["name"] == "nu"
     assert mag.coords["nu"].attrs["gauge_relation"] == "zeta = phi + nu"
-    assert eq.fluxdata["psipol"].attrs["units"] == "Wb/rad"
-    assert mag.coords["psi"].attrs["units"] == "Wb/rad"
-    assert mag.coords["psi0"].attrs["units"] == "Wb/rad"
-    assert mag.deriv["psi0"].attrs["units"] == "Wb/rad"
-    assert mag.deriv["dR_dpsi"].attrs["units"] == "m*rad/Wb"
-    assert mag.deriv["dphi_dpsi"].attrs["units"] == "rad**2/Wb"
-    assert mag.deriv["dPsi_dr"].attrs["units"] == "Wb/(rad*m)"
-    assert mag.deriv["dPsi_dphi"].attrs["units"] == "Wb/rad**2"
+    assert eq.fluxdata["psipol"].attrs["units"] == flux_units
+    assert mag.coords["psi"].attrs["units"] == flux_units
+    assert mag.coords["psi0"].attrs["units"] == flux_units
+    assert mag.deriv["psi0"].attrs["units"] == flux_units
+    assert mag.deriv["dR_dpsi"].attrs["units"] == position_per_flux_units
+    assert mag.deriv["dphi_dpsi"].attrs["units"] == angle_per_flux_units
+    assert mag.deriv["dPsi_dr"].attrs["units"] == flux_per_length_units
+    assert mag.deriv["dPsi_dphi"].attrs["units"] == flux_per_angle_units
     # The theta derivative contributes one radian, so the signed physical
     # three-coordinate Jacobian and direct R-Z determinant retain these units.
-    assert mag.deriv["jacobian"].attrs["units"] == "m**3/Wb"
-    assert mag.deriv["direct_det_Rz"].attrs["units"] == "Wb/m**2"
+    assert mag.deriv["jacobian"].attrs["units"] == jacobian_units
+    assert mag.deriv["direct_det_Rz"].attrs["units"] == direct_det_units
     assert "inside_lcfs" in mag.coords
     inside = mag.coords["inside_lcfs"].values
     assert inside.dtype == np.bool_
     assert np.any(inside)
     assert np.any(~inside)
-    np.testing.assert_array_equal(mag.deriv["dphi_dzeta"].values[inside], 1.0)
-    assert np.all(np.isnan(mag.deriv["dphi_dzeta"].values[~inside]))
-    assert np.all(np.isnan(mag.deriv["jacobian"].values[~inside]))
+    fitted = mag.coords["inside_coordinate_domain"].values
+    assert np.any(fitted)
+    assert np.any(inside & ~fitted)
+
+    rr, zz = np.meshgrid(eq.Rgrid.values, eq.zgrid.values, indexing="ij")
+    expected_dpsi_dr = 2.0 * psi_scale * (rr - 1.5)
+    expected_dpsi_dz = 2.0 * psi_scale * zz
+
+    for name in ("dPsi_dr", "dPsi_dz", "dPsi_dphi"):
+        assert np.all(np.isfinite(mag.deriv[name].values))
+        assert (
+            mag.deriv[name].attrs["validity_domain"]
+            == "finite_equilibrium_RZ_grid"
+        )
+    np.testing.assert_allclose(
+        mag.deriv["dPsi_dr"].values,
+        expected_dpsi_dr,
+        rtol=3.0e-4,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        mag.deriv["dPsi_dz"].values,
+        expected_dpsi_dz,
+        rtol=3.0e-4,
+        atol=1.0e-10,
+    )
+    np.testing.assert_array_equal(mag.deriv["dPsi_dphi"].values, 0.0)
+
+    np.testing.assert_array_equal(mag.deriv["dphi_dzeta"].values[fitted], 1.0)
+    assert np.all(np.isnan(mag.deriv["dphi_dzeta"].values[~fitted]))
+    assert np.all(np.isnan(mag.deriv["jacobian"].values[~fitted]))
+    assert np.all(np.isnan(mag.deriv["direct_det_Rz"].values[~fitted]))
+    assert np.all(np.isnan(mag.deriv["dTheta_dr"].values[~fitted]))
+    assert np.all(np.isnan(mag.deriv["dR_dpsi"].values[~fitted]))
+
+    gpsi_psi = mag.metric("psi", "psi", tensor="contravariant")
+    expected_gpsi_psi = (
+        mag.deriv["dPsi_dr"] ** 2
+        + (mag.deriv["dPsi_dphi"] / mag.deriv.R) ** 2
+        + mag.deriv["dPsi_dz"] ** 2
+    )
+    assert np.all(np.isfinite(gpsi_psi.values))
+    np.testing.assert_allclose(gpsi_psi, expected_gpsi_psi)
+    gpsi_theta = mag.metric("psi", "theta", tensor="contravariant")
+    assert np.all(np.isnan(gpsi_theta.values[~fitted]))
+
+    outside_index = tuple(np.argwhere(~inside)[0])
+    R_outside = np.array([mag.coords.R.values[outside_index[0]]])
+    z_outside = np.array([mag.coords.z.values[outside_index[1]]])
+    exterior_gradient = mag._transform_deriv(  # noqa: SLF001
+        R_outside,
+        z_outside,
+        only="dPsi_dr",
+    )
+    np.testing.assert_allclose(
+        exterior_gradient["dPsi_dr"].values,
+        expected_dpsi_dr[outside_index],
+        rtol=3.0e-4,
+        atol=1.0e-10,
+    )
+
     assert "direct_det_Rz" in mag.deriv
     assert mag.coords["psi0"].attrs["psi_axis"] == pytest.approx(
         eq.geometry.attrs["psi_ax"]
@@ -851,8 +968,15 @@ def test_build_magnetic_coordinates_dataset_boozer_current_convention(monkeypatc
     thtable = np.tile(theta, (npsi, 1))
     nutable = np.zeros((npsi, ltheta))
     jac = np.ones((npsi, ltheta))
-    Rtransform = np.tile(1.5 + 0.1 * np.cos(theta), (npsi, 1))
-    ztransform = np.tile(0.0 + 0.1 * np.sin(theta), (npsi, 1))
+    psi_scale = (
+        float(eq.geometry.attrs["psi_bdy"])
+        - float(eq.geometry.attrs["psi_ax"])
+    ) / 0.16
+    surface_radius = np.sqrt(
+        (psigrid - float(eq.geometry.attrs["psi_ax"])) / psi_scale
+    )
+    Rtransform = 1.5 + surface_radius[:, None] * np.cos(theta)[None, :]
+    ztransform = surface_radius[:, None] * np.sin(theta)[None, :]
     qprof = np.linspace(1.0, 2.0, npsi)
     Fprof = np.linspace(2.0, 1.8, npsi)
     Iprof = np.linspace(0.3, 0.5, npsi)
@@ -873,25 +997,11 @@ def test_build_magnetic_coordinates_dataset_boozer_current_convention(monkeypatc
         coordinate_system="boozer",
     )
 
-    # I and I_boozer are the covariant Boozer coefficient B_Theta.
+    # I is the one canonical covariant Boozer coefficient B_Theta.
     np.testing.assert_allclose(mag.deriv["I"].values, Iprof, rtol=1e-12, atol=1e-12)
-    np.testing.assert_allclose(mag.deriv["I_boozer"].values, Iprof, rtol=1e-12, atol=1e-12)
-    np.testing.assert_allclose(
-        mag.deriv["I_legacy_2pi"].values,
-        2.0 * np.pi * Iprof,
-        rtol=1e-12,
-        atol=1e-12,
-    )
-    assert mag.deriv["I_boozer"].attrs["alias_for"] == "I"
-    assert mag.deriv["I_legacy_2pi"].attrs["replacement"] == "I"
-    np.testing.assert_allclose(eq.boozer_profs["I"].values, Iprof)
-    np.testing.assert_allclose(eq.boozer_profs["I_boozer"].values, Iprof)
-    np.testing.assert_allclose(
-        eq.boozer_profs["I_toroidal_A"].values,
-        Iprof / 2.0e-7,
-    )
-    assert eq.boozer_profs["I"].attrs["units"] == "T*m"
-    assert eq.boozer_profs["I_toroidal_A"].attrs["units"] == "A"
+    assert "I_boozer" not in mag.deriv
+    assert "I_legacy_2pi" not in mag.deriv
+    assert not hasattr(eq, "boozer_profs")
     # h must stay consistent with the Boozer Jacobian relation.
     np.testing.assert_allclose(
         mag.deriv["h"].values,

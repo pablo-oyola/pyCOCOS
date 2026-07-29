@@ -23,7 +23,8 @@ def _fake_integrate_pol_field_line(
     zline = zaxis + radius * np.sin(theta)
     brline = -np.sin(theta)
     bzline = np.cos(theta)
-    bphiline = np.full_like(theta, 2.0)
+    # Axisymmetric equilibrium requirement: F=R*Bphi is a flux function.
+    bphiline = 2.0 / rline
     return rline, zline, brline, bzline, bphiline, len(theta)
 
 
@@ -67,4 +68,3 @@ def test_compute_magnetic_coordinates_coordinate_system_path(monkeypatch, coordi
     assert Rtransform.shape == (5, 64)
     assert ztransform.shape == (5, 64)
     assert np.isfinite(jacobian).all()
-

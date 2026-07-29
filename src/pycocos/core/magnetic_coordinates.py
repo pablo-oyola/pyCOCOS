@@ -522,7 +522,8 @@ class magnetic_coordinates:
         only : str, optional
             If df=1, return only this derivative. Default is None
         fill_nan : bool, optional
-            If True, fill values outside LCFS with NaN. Default is True
+            If True, fill values outside the fitted psi0 table interval with
+            NaN. Default is True
 
         Returns
         -------
@@ -563,11 +564,13 @@ class magnetic_coordinates:
         :param R: Radial values to evaluate the transformation.
         :param z: Vertical values to evaluate the transformation.
         :param grid: True to return the coordinates in a grid.
-        :param fill_nan: when True the values outside the LCFS
-                            are filled with NaN. Otherwise, the
-                            simple internal extrapolation is kept.
+        :param fill_nan: when True the values outside the fitted psi0 table
+                            interval are filled with NaN. Otherwise, the simple
+                            internal extrapolation is kept.
         """
         output = xr.Dataset()
+        R = np.atleast_1d(np.asarray(R, dtype=np.float64))
+        z = np.atleast_1d(np.asarray(z, dtype=np.float64))
 
         if grid:
             grr, gzz = np.meshgrid(R, z, indexing='ij')
@@ -599,24 +602,73 @@ class magnetic_coordinates:
                                grr - self.Raxis)
         thetageom = np.mod(thetageom + 2*np.pi, 2.0*np.pi)
 
-        for name in ('theta', 'nu'):
-            # Building the Bivariate interpolator.
-            intrp = RectBivariateSpline(self.coords.psi0.values,
-                                        self.coords.thetageom.values,
-                                        self.coords[name].values, kx=3, ky=5)
-            tmp = xr.DataArray(intrp(output.psi.values,
-                                     thetageom, grid=False))
-            if grid:
-                output[name] = xr.DataArray(tmp, dims=('R', 'z'),
-                                            coords={'R': R, 'z': z})
-            else:
-                output[name] = xr.DataArray(tmp)
-            
-            # Adding the corresponding metadata.
-            output[name].attrs = {'desc': self.coords[name].desc,
-                                  'units': self.coords[name].units,
-                                  'short_name': self.coords[name].short_name,
-                                  'name': self.coords[name].name}
+        coordinate_map = getattr(self, "_coordinate_map", None)
+        if coordinate_map is not None:
+            psi_values = np.asarray(output.psi.values, dtype=np.float64)
+            theta_values = np.full(psi_values.shape, np.nan, dtype=np.float64)
+            nu_values = np.full(psi_values.shape, np.nan, dtype=np.float64)
+            valid = np.isfinite(psi_values)
+            if fill_nan:
+                valid &= (
+                    (psi_values >= np.min(coordinate_map.psi))
+                    & (psi_values <= np.max(coordinate_map.psi))
+                )
+            flat_valid = np.flatnonzero(valid.ravel())
+            for start in range(0, flat_valid.size, 20_000):
+                selected = flat_valid[start:start + 20_000]
+                theta_chunk = coordinate_map.solve_theta(
+                    psi=psi_values.ravel()[selected],
+                    R=np.asarray(grr).ravel()[selected],
+                    z=np.asarray(gzz).ravel()[selected],
+                    initial_theta=np.asarray(thetageom).ravel()[selected],
+                    tolerance=5.0e-11,
+                    max_iterations=30,
+                )
+                theta_values.ravel()[selected] = theta_chunk
+                nu_values.ravel()[selected] = coordinate_map.evaluate(
+                    "nu",
+                    psi_values.ravel()[selected],
+                    theta_chunk,
+                )
+            mapped_values = {
+                "theta": theta_values,
+                "nu": nu_values,
+            }
+            for name, values in mapped_values.items():
+                if grid:
+                    output[name] = xr.DataArray(
+                        values,
+                        dims=('R', 'z'),
+                        coords={'R': R, 'z': z},
+                    )
+                else:
+                    output[name] = xr.DataArray(values)
+                output[name].attrs = {
+                    'desc': self.coords[name].desc,
+                    'units': self.coords[name].units,
+                    'short_name': self.coords[name].short_name,
+                    'name': self.coords[name].name,
+                }
+        else:
+            for name in ('theta', 'nu'):
+                # Datasets constructed outside Equilibrium retain their
+                # explicit direct tables as the public transform definition.
+                intrp = RectBivariateSpline(self.coords.psi0.values,
+                                            self.coords.thetageom.values,
+                                            self.coords[name].values, kx=3, ky=5)
+                tmp = xr.DataArray(intrp(output.psi.values,
+                                         thetageom, grid=False))
+                if grid:
+                    output[name] = xr.DataArray(tmp, dims=('R', 'z'),
+                                                coords={'R': R, 'z': z})
+                else:
+                    output[name] = xr.DataArray(tmp)
+
+                # Adding the corresponding metadata.
+                output[name].attrs = {'desc': self.coords[name].desc,
+                                      'units': self.coords[name].units,
+                                      'short_name': self.coords[name].short_name,
+                                      'name': self.coords[name].name}
 
         # Check whether Psi lies in the domain of the theta and nu tables.
         if fill_nan:
@@ -632,14 +684,14 @@ class magnetic_coordinates:
             output['z'] = z
 
         # Adding the attributes to the coordinates.
-        output.R.attrs = {'desc': self.coords.R.desc,
-                          'units': self.coords.R.units,
-                          'short_name': self.coords.R.short_name,
-                          'name': self.coords.R.name}
-        output.z.attrs = {'desc': self.coords.z.desc,
-                          'units': self.coords.z.units,
-                          'short_name': self.coords.z.short_name,
-                          'name': self.coords.z.name}
+        output.R.attrs = {'desc': 'Major radius',
+                          'units': self.coords.R.units if 'units' in self.coords.R.attrs else 'm',
+                          'short_name': self.coords.R.short_name if 'short_name' in self.coords.R.attrs else 'R',
+                          'name': self.coords.R.name if 'name' in self.coords.R.attrs else 'R'}
+        output.z.attrs = {'desc': 'Vertical position',
+                          'units': self.coords.z.units if 'units' in self.coords.z.attrs else 'm',
+                          'short_name': self.coords.z.short_name if 'short_name' in self.coords.z.attrs else 'z',
+                          'name': self.coords.z.name if 'name' in self.coords.z.attrs else 'z'}
 
         return output
 
@@ -834,12 +886,21 @@ class magnetic_coordinates:
         else:
             psi_eval = gpsi
 
+        coordinate_map = getattr(self, "_coordinate_map", None)
         for ivar in ('R_inv', 'z_inv'):
-            inverse_values = np.asarray(self.coords[ivar].values)[psi_order]
-            intrp = RectBivariateSpline(psi0_spline,
-                                        self.coords.theta_star.values,
-                                        inverse_values)
-            tmp = intrp(psi_eval, gtht, grid=False)
+            if coordinate_map is not None:
+                mapped_name = "R" if ivar == "R_inv" else "z"
+                tmp = coordinate_map.evaluate(
+                    mapped_name,
+                    psi_eval,
+                    gtht,
+                )
+            else:
+                inverse_values = np.asarray(self.coords[ivar].values)[psi_order]
+                intrp = RectBivariateSpline(psi0_spline,
+                                            self.coords.theta_star.values,
+                                            inverse_values)
+                tmp = intrp(psi_eval, gtht, grid=False)
             if grid:
                 output[ivar] = xr.DataArray(tmp, dims=('psi', 'thetamag'),
                                             coords={'psi': psi, 'thetamag': thetamag})
@@ -1036,21 +1097,39 @@ class magnetic_coordinates:
         """
         psi_axis, psi_boundary = self._physical_psi_endpoints()
         psi_span = psi_boundary - psi_axis
+        psi_table = np.asarray(self.coords.psi0.values, dtype=np.float64)
+        if psi_table.ndim != 1 or psi_table.size < 2:
+            raise ValueError(
+                "coords.psi0 must be a one-dimensional grid with at least two points."
+            )
+        if not np.all(np.isfinite(psi_table)):
+            raise ValueError(
+                "coords.psi0 must contain only finite physical flux values."
+            )
+
+        # The fitted magnetic-coordinate table usually excludes the exact axis
+        # and LCFS.  Order its physical fluxes by outward normalized flux so the
+        # returned coordinate is convention-independent even when physical psi
+        # decreases from axis to boundary.
+        psi_norm_table = (psi_table - psi_axis) / psi_span
+        outward_order = np.argsort(psi_norm_table)
+        psi_norm_eval = psi_norm_table[outward_order]
+        psi_eval = psi_table[outward_order]
+        if np.any(np.diff(psi_norm_eval) <= 0.0):
+            raise ValueError("coords.psi0 must define distinct outward flux surfaces.")
+        tolerance = 100.0 * np.finfo(np.float64).eps
+        if psi_norm_eval[0] < -tolerance or psi_norm_eval[-1] > 1.0 + tolerance:
+            raise ValueError(
+                "coords.psi0 lies outside the physical axis-to-boundary flux interval."
+            )
+        psi_norm_eval = np.clip(psi_norm_eval, 0.0, 1.0)
 
         if return_rhopol:
-            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
-            psi_norm_eval = Psi**2
-            psi_eval = psi_axis + psi_norm_eval * psi_span
-            psi_is_norm_eval = True
+            Psi = np.sqrt(psi_norm_eval)
         elif return_psi_norm:
-            Psi = np.linspace(0.0, 1.0, self.coords.psi0.size)
-            psi_norm_eval = Psi
-            psi_eval = psi_axis + psi_norm_eval * psi_span
-            psi_is_norm_eval = True
+            Psi = psi_norm_eval
         else:
-            Psi = np.linspace(psi_axis, psi_boundary, self.coords.psi0.size)
-            psi_eval = Psi
-            psi_is_norm_eval = False
+            Psi = psi_eval.copy()
 
         Theta = np.linspace(0.0, 2.0*np.pi, self.coords.thetageom.size)
 
@@ -1061,7 +1140,7 @@ class magnetic_coordinates:
             'Psi': Psi,
             'psi_eval': psi_eval,
             'Theta': Theta,
-            'psi_is_norm_eval': psi_is_norm_eval,
+            'psi_is_norm_eval': False,
         }
 
     def _cyl2mag_build_sampling_map(
@@ -1078,10 +1157,10 @@ class magnetic_coordinates:
         Theta = flux_grid['Theta']
         psi_eval = flux_grid['psi_eval']
 
-        inv = self.transform_inverse(psi=Psi,
+        inv = self.transform_inverse(psi=psi_eval,
                                      thetamag=Theta,
                                      grid=True,
-                                     psi_is_norm=flux_grid['psi_is_norm_eval'])
+                                     psi_is_norm=False)
         R_out = inv.R_inv.values
         z_out = inv.z_inv.values
 
@@ -1174,25 +1253,57 @@ class magnetic_coordinates:
             )
 
             values_rg = np.moveaxis(field_values_interp, 0, -1)
-            intrp = RegularGridInterpolator((R, z, phi_interp),
-                                            values_rg,
-                                            method='linear',
-                                            fill_value=0.0,
-                                            bounds_error=False)
+            interpolation_grid = (R, z, phi_interp)
             points = np.column_stack((sampling['Rout'].ravel(),
                                       sampling['zout'].ravel(),
                                       phi_eval.ravel()))
         else:
             values_rg = np.moveaxis(field_values, 0, -1)
-            intrp = RegularGridInterpolator((R, z),
-                                            values_rg,
-                                            method='linear',
-                                            fill_value=0.0,
-                                            bounds_error=False)
+            interpolation_grid = (R, z)
             points = np.column_stack((sampling['Rout'].ravel(),
                                       sampling['zout'].ravel()))
 
-        values = intrp(points)
+        if not np.any(np.isnan(values_rg)):
+            intrp = RegularGridInterpolator(interpolation_grid,
+                                             values_rg,
+                                             method='linear',
+                                             fill_value=0.0,
+                                             bounds_error=False)
+            values = intrp(points)
+        else:
+            # Metric and Jacobian fields are intentionally NaN outside the
+            # LCFS.  For an interpolation cell cut by that mask, interpolate
+            # the finite vertices and renormalize their weights independently
+            # for every batched field.  This never invents a value when the
+            # complete stencil is missing.
+            finite = ~np.isnan(values_rg)
+            numerator_intrp = RegularGridInterpolator(
+                interpolation_grid,
+                np.where(finite, values_rg, 0.0),
+                method='linear',
+                fill_value=0.0,
+                bounds_error=False,
+            )
+            denominator_intrp = RegularGridInterpolator(
+                interpolation_grid,
+                finite.astype(np.float64),
+                method='linear',
+                fill_value=0.0,
+                bounds_error=False,
+            )
+            numerator = numerator_intrp(points)
+            denominator = denominator_intrp(points)
+            values = np.full(
+                numerator.shape,
+                np.nan,
+                dtype=np.result_type(numerator.dtype, np.float64),
+            )
+            np.divide(
+                numerator,
+                denominator,
+                out=values,
+                where=denominator > 0.0,
+            )
         values = values.reshape(output_shape + (field_values.shape[0],))
         return np.moveaxis(values, -1, 0)
 
@@ -1474,14 +1585,18 @@ class magnetic_coordinates:
                 out.psi.attrs = {
                     'name': 'rhopol',
                     'units': '',
-                    'desc': 'Sqrt normalized poloidal flux',
+                    'desc': (
+                        'Sqrt normalized poloidal flux on the fitted psi0 interval'
+                    ),
                     'short_name': '$\\rho_{pol}$'
                 }
             elif return_psi_norm:
                 out.psi.attrs = {
                     'name': 'psi_norm',
                     'units': '',
-                    'desc': 'Normalized poloidal flux',
+                    'desc': (
+                        'Physical normalized poloidal flux on the fitted psi0 interval'
+                    ),
                     'short_name': '$\\Psi_N$'
                 }
             return out

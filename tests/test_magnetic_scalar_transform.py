@@ -314,6 +314,22 @@ def test_cyl2mag_scalar_returns_normalized_flux_coordinate():
     assert out.psi.attrs['name'] == 'psi_norm'
 
 
+def test_cyl2mag_scalar_normalized_flux_uses_active_physical_interval():
+    mag = _build_synthetic_magnetic_coordinates()
+    mag.coords.psi0.attrs.update({
+        'psi_axis': 1.0,
+        'psi_boundary': 2.0,
+    })
+
+    flux_grid = mag._cyl2mag_build_flux_grid(  # noqa: SLF001
+        return_psi_norm=True,
+        return_rhopol=False,
+    )
+
+    np.testing.assert_allclose(flux_grid['Psi'][[0, -1]], [0.05, 0.95])
+    np.testing.assert_allclose(flux_grid['psi_eval'][[0, -1]], [1.05, 1.95])
+
+
 def test_cyl2mag_scalar_returns_rhopol_coordinate():
     mag = _build_synthetic_magnetic_coordinates()
 
@@ -338,8 +354,8 @@ def test_cyl2mag_scalar_returns_rhopol_coordinate():
 def test_normalized_flux_mapping_preserves_descending_axis_to_boundary_direction():
     mag = _build_synthetic_magnetic_coordinates()
     mag.coords.psi0.attrs.update({
-        'psi_axis': 1.95,
-        'psi_boundary': 1.05,
+        'psi_axis': 2.0,
+        'psi_boundary': 1.0,
         'normalization': (
             'psi_N = (psi - psi_axis) / (psi_boundary - psi_axis)'
         ),
@@ -349,6 +365,7 @@ def test_normalized_flux_mapping_preserves_descending_axis_to_boundary_direction
         return_psi_norm=True,
         return_rhopol=False,
     )
+    np.testing.assert_allclose(flux_grid['Psi'][[0, -1]], [0.05, 0.95])
     np.testing.assert_allclose(flux_grid['psi_eval'][[0, -1]], [1.95, 1.05])
     assert np.all(np.diff(flux_grid['psi_eval']) < 0.0)
 
@@ -357,9 +374,8 @@ def test_normalized_flux_mapping_preserves_descending_axis_to_boundary_direction
         thetamag=np.zeros(2),
         psi_is_norm=True,
     )
-    # The synthetic inverse map is exactly R(psi, theta) = psi, so this also
-    # verifies that normalized queries are converted to physical flux before
-    # evaluating the strictly increasing spline coordinate.
+    # Normalized queries are converted using the physical endpoints.  FITPACK
+    # bounds evaluation to the fitted inverse-map table at either end.
     np.testing.assert_allclose(inverse['R_inv'].values, [1.95, 1.05])
     np.testing.assert_allclose(inverse['z_inv'].values, 0.0)
 
@@ -367,8 +383,55 @@ def test_normalized_flux_mapping_preserves_descending_axis_to_boundary_direction
         return_psi_norm=False,
         return_rhopol=True,
     )
-    expected = 1.95 + rho_grid['Psi']**2 * (1.05 - 1.95)
+    np.testing.assert_allclose(
+        rho_grid['Psi'][[0, -1]],
+        np.sqrt([0.05, 0.95]),
+    )
+    expected = 2.0 + rho_grid['Psi']**2 * (1.0 - 2.0)
     np.testing.assert_allclose(rho_grid['psi_eval'], expected)
+
+
+def test_cyl2mag_interpolation_renormalizes_finite_vertices_per_field():
+    field_values = np.array(
+        [
+            [[1.0, np.nan], [3.0, 5.0]],
+            [[np.nan, 2.0], [4.0, 6.0]],
+            [[np.nan, np.nan], [np.nan, np.nan]],
+        ]
+    )
+    sampling = {
+        'output_shape': (1, 1, 1),
+        'Rout': np.array([[[0.5]]]),
+        'zout': np.array([[[0.5]]]),
+    }
+
+    result = magnetic_coordinates._cyl2mag_interp_batch(  # noqa: SLF001
+        field_values=field_values,
+        R=np.array([0.0, 1.0]),
+        z=np.array([0.0, 1.0]),
+        sampling=sampling,
+    )
+
+    np.testing.assert_allclose(result[:2, 0, 0, 0], [3.0, 4.0])
+    assert np.isnan(result[2, 0, 0, 0])
+
+
+def test_cyl2mag_interpolation_keeps_exact_finite_corner():
+    field_values = np.array([[[7.0, np.nan], [np.nan, np.nan]]])
+    sampling = {
+        'output_shape': (1, 1, 1),
+        'Rout': np.array([[[0.0]]]),
+        'zout': np.array([[[0.0]]]),
+    }
+
+    result = magnetic_coordinates._cyl2mag_interp_batch(  # noqa: SLF001
+        field_values=field_values,
+        R=np.array([0.0, 1.0]),
+        z=np.array([0.0, 1.0]),
+        sampling=sampling,
+    )
+
+    assert result[0, 0, 0, 0] == pytest.approx(7.0)
 
 
 def test_cyl2mag_scalar_rejects_conflicting_flux_coordinate_options():
