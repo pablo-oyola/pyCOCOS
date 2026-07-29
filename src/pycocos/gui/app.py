@@ -111,6 +111,7 @@ class EquilibriumGuiApp:
         self._current_plot_is_2d = False
 
         self.path_var = self.tk.StringVar()
+        self.cocos_input_var = self.tk.StringVar()
         self.plot_mode_var = self.tk.StringVar(value="2D")
         self.plot_var_var = self.tk.StringVar()
         self.lpsi_var = self.tk.StringVar(value="201")
@@ -163,6 +164,14 @@ class EquilibriumGuiApp:
 
         self.ttk.Label(frame, text="EQDSK path:").pack(anchor=self.tk.W)
         self.ttk.Entry(frame, textvariable=self.path_var).pack(fill=self.tk.X, pady=(2, 6))
+
+        self.ttk.Label(frame, text="Input COCOS:").pack(anchor=self.tk.W)
+        self.ttk.Combobox(
+            frame,
+            textvariable=self.cocos_input_var,
+            state="readonly",
+            values=[*range(1, 9), *range(11, 19)],
+        ).pack(fill=self.tk.X, pady=(2, 6))
 
         btn_row = self.ttk.Frame(frame)
         btn_row.pack(fill=self.tk.X)
@@ -538,9 +547,17 @@ class EquilibriumGuiApp:
             self.messagebox.showerror("File not found", f"Cannot locate file:\n{path}")
             return
 
+        cocos_text = self.cocos_input_var.get().strip()
+        if not cocos_text:
+            self.messagebox.showwarning(
+                "Missing convention",
+                "Select the input EQDSK COCOS convention before loading.",
+            )
+            return
+
         try:
             t0 = time.perf_counter()
-            self.eq = EQDSK(str(path))
+            self.eq = EQDSK(str(path), cocos_in=int(cocos_text))
             dt = time.perf_counter() - t0
         except Exception as exc:
             self.messagebox.showerror("Load failed", f"Could not load equilibrium:\n{exc}")

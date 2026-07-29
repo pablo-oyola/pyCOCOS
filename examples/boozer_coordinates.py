@@ -5,7 +5,7 @@ Example: Computing Boozer coordinates.
 from pycocos import EQDSK
 
 # Load equilibrium
-eq = EQDSK("equilibrium.geqdsk")
+eq = EQDSK("equilibrium.geqdsk", cocos_in=1, cocos_internal=1)
 
 # Compute Boozer coordinates (J = (I + qF) / B^2).
 # Other available systems: "pest", "equal_arc", "hamada".
@@ -19,8 +19,11 @@ print(f"Theta: {coords.theta.values}")
 print(f"Nu: {coords.nu.values}")
 
 # Transform from magnetic to cylindrical coordinates
-cyl_coords = mag_coords.transform_inverse(psi=0.5, thetamag=0.0)
+cyl_coords = mag_coords.transform_inverse(
+    psi=0.5,
+    thetamag=0.0,
+    psi_is_norm=True,
+)
 
 print(f"R: {cyl_coords.R_inv.values}")
 print(f"z: {cyl_coords.z_inv.values}")
-
