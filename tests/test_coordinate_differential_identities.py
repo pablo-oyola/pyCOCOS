@@ -59,7 +59,7 @@ def _analytic_grad_psi(theta: np.ndarray) -> np.ndarray:
     return np.einsum("ij,...j->...i", _SHAPE_INVERSE.T, polar_gradient)
 
 
-def _builder_result():
+def _builder_result(core_indices=None):
     R_grid = np.linspace(1.0, 2.0, 61)
     z_grid = np.linspace(-0.5, 0.5, 61)
     RR, ZZ = np.meshgrid(R_grid, z_grid, indexing="ij")
@@ -103,6 +103,36 @@ def _builder_result():
         Iprof=np.linspace(0.2, 0.3, psi.size),
         ntht_pad=3,
         coordinate_system="boozer",
+        core_indices=core_indices,
+        radial_support_metadata={
+            "family": "analytic",
+            "requested_guard_surfaces": 3,
+            "inner_guard_surfaces": (
+                0 if core_indices is None else int(core_indices[0])
+            ),
+            "outer_guard_surfaces": (
+                0
+                if core_indices is None
+                else int(psi.size - 1 - core_indices[-1])
+            ),
+        },
+    )
+
+
+def test_builder_keeps_hidden_radial_support_private():
+    core_indices = np.arange(3, 14, dtype=np.int64)
+    magnetic = _builder_result(core_indices=core_indices)
+
+    assert magnetic.coords.sizes["psi0"] == core_indices.size
+    assert magnetic.deriv.sizes["psi0"] == core_indices.size
+    assert magnetic._coordinate_map.psi.size == 17  # noqa: SLF001
+    assert magnetic.coords.attrs["radial_core_nsurface"] == core_indices.size
+    assert magnetic.coords.attrs["radial_support_nsurface"] == 17
+    assert magnetic.coords.attrs["radial_inner_guard_surfaces"] == 3
+    assert magnetic.coords.attrs["radial_outer_guard_surfaces"] == 3
+    assert (
+        magnetic._coordinate_diagnostics["radial_support"]["core_nsurface"]  # noqa: SLF001
+        == core_indices.size
     )
 
 

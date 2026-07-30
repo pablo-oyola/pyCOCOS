@@ -1067,6 +1067,11 @@ def test_compute_coordinates_rhopol_window_maps_to_expected_psi(monkeypatch, tmp
         ltheta = int(kwargs["ltheta"])
         npsi = psigrid.size
         captured["psigrid"] = psigrid.copy()
+        tracing_R = np.asarray(kwargs["Rgrid"], dtype=float)
+        tracing_z = np.asarray(kwargs["zgrid"], dtype=float)
+        kwargs["diagnostics"]["coordinate_psi_field"] = (
+            tracing_R[:, None] + 2.0 * tracing_z[None, :]
+        )
         qprof = np.ones(npsi)
         Fprof = np.ones(npsi)
         Iprof = np.ones(npsi)
@@ -1078,11 +1083,22 @@ def test_compute_coordinates_rhopol_window_maps_to_expected_psi(monkeypatch, tmp
         return qprof, Fprof, Iprof, thtable, nutable, jac, Rtransform, ztransform
 
     monkeypatch.setattr(equilibrium_mod, "compute_magnetic_coordinates", _fake_compute_magnetic_coordinates)
-    monkeypatch.setattr(
-        eq,
-        "_build_magnetic_coordinates_dataset",
-        lambda *args, **kwargs: SimpleNamespace(dummy=True),
-    )
+    def _capture_builder(*args, **kwargs):
+        captured["builder_psigrid"] = np.asarray(args[0], dtype=float).copy()
+        captured["core_indices"] = np.asarray(
+            kwargs["core_indices"],
+            dtype=int,
+        ).copy()
+        captured["support_metadata"] = dict(
+            kwargs["radial_support_metadata"]
+        )
+        captured["coordinate_psi_field"] = np.asarray(
+            kwargs["coordinate_psi_field"],
+            dtype=float,
+        ).copy()
+        return SimpleNamespace(dummy=True)
+
+    monkeypatch.setattr(eq, "_build_magnetic_coordinates_dataset", _capture_builder)
 
     out = eq.compute_coordinates(
         coordinate_system="boozer",
@@ -1097,8 +1113,37 @@ def test_compute_coordinates_rhopol_window_maps_to_expected_psi(monkeypatch, tmp
     psi_edge = float(eq.geometry.attrs["psi_bdy"])
     expected_psi_start = psi_axis + (0.2**2) * (psi_edge - psi_axis)
     expected_psi_end = psi_axis + (0.8**2) * (psi_edge - psi_axis)
-    assert np.isclose(captured["psigrid"][0], expected_psi_start)
-    assert np.isclose(captured["psigrid"][-1], expected_psi_end)
+    core_psi = captured["builder_psigrid"][captured["core_indices"]]
+    assert np.isclose(core_psi[0], expected_psi_start)
+    assert np.isclose(core_psi[-1], expected_psi_end)
+    assert captured["psigrid"].size > 9
+    assert captured["support_metadata"]["core_nsurface"] == 9
+    assert captured["support_metadata"]["support_nsurface"] == (
+        captured["psigrid"].size
+    )
+    assert captured["coordinate_psi_field"].shape == (
+        eq.Rgrid.size,
+        eq.zgrid.size,
+    )
+    np.testing.assert_allclose(
+        captured["coordinate_psi_field"],
+        np.asarray(eq.Rgrid)[:, None] + 2.0 * np.asarray(eq.zgrid)[None, :],
+        rtol=0.0,
+        atol=2.0e-14,
+    )
+
+
+def test_radial_support_preserves_endpoint_inclusive_core():
+    core = np.linspace(0.0, 1.0, 9)
+    support, core_indices = equilibrium_mod._extend_radial_support(  # noqa: SLF001
+        core,
+        lower_bound=0.0,
+        upper_bound=1.0,
+        guard_surfaces=3,
+    )
+
+    np.testing.assert_array_equal(support, core)
+    np.testing.assert_array_equal(core_indices, np.arange(core.size))
 
 
 def test_compute_coordinates_keeps_descending_physical_flux_spline_sorted(
@@ -1145,6 +1190,10 @@ def test_compute_coordinates_keeps_descending_physical_flux_spline_sorted(
     def _capture_builder(*args, **kwargs):
         captured["builder_psigrid"] = np.asarray(args[0], dtype=float).copy()
         captured["builder_qprof"] = np.asarray(args[8], dtype=float).copy()
+        captured["core_indices"] = np.asarray(
+            kwargs["core_indices"],
+            dtype=int,
+        ).copy()
         return SimpleNamespace(dummy=True)
 
     monkeypatch.setattr(
@@ -1175,6 +1224,13 @@ def test_compute_coordinates_keeps_descending_physical_flux_spline_sorted(
     np.testing.assert_array_equal(
         captured["builder_qprof"],
         captured["builder_psigrid"],
+    )
+    expected_core = -0.16 * np.linspace(0.2, 0.8, 9) ** 2
+    np.testing.assert_allclose(
+        captured["builder_psigrid"][captured["core_indices"]],
+        np.sort(expected_core),
+        rtol=0.0,
+        atol=1.0e-15,
     )
 
 

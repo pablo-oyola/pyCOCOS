@@ -8,7 +8,7 @@ import xarray as xr
 from typing import Union, Optional, Tuple, Dict, Any, Literal
 from findiff import FinDiff
 from skimage import measure
-from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
+from scipy.interpolate import CubicSpline, InterpolatedUnivariateSpline, RectBivariateSpline
 from scipy.constants import mu_0
 
 # Importing the internal utils.
@@ -16,6 +16,51 @@ from ..coordinates.registry import get_jacobian_function
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
 from ..coordinates.coordinate_map import SpectralCoordinateMap
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
+
+
+def _extend_radial_support(
+    core: np.ndarray,
+    *,
+    lower_bound: float,
+    upper_bound: float,
+    guard_surfaces: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Add hidden same-spacing guard nodes without changing the core grid."""
+    values = np.asarray(core, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or values.size < 2
+        or not np.all(np.isfinite(values))
+        or np.any(np.diff(values) <= 0.0)
+    ):
+        raise ValueError("radial core grid must be finite and strictly increasing.")
+    if isinstance(guard_surfaces, bool) or not isinstance(
+        guard_surfaces,
+        (int, np.integer),
+    ):
+        raise TypeError("radial_guard_surfaces must be an integer.")
+    guard_count = int(guard_surfaces)
+    if guard_count < 0:
+        raise ValueError("radial_guard_surfaces must be non-negative.")
+    if not (
+        np.isfinite(lower_bound)
+        and np.isfinite(upper_bound)
+        and lower_bound < upper_bound
+        and lower_bound <= values[0] < values[-1] <= upper_bound
+    ):
+        raise ValueError("radial support bounds must contain the core grid.")
+
+    left_step = values[1] - values[0]
+    right_step = values[-1] - values[-2]
+    left = values[0] - left_step * np.arange(guard_count, 0, -1)
+    right = values[-1] + right_step * np.arange(1, guard_count + 1)
+    left = left[left > lower_bound]
+    right = right[right < upper_bound]
+    support = np.concatenate((left, values, right))
+    core_indices = left.size + np.arange(values.size, dtype=np.int64)
+    if not np.array_equal(support[core_indices], values):
+        raise RuntimeError("radial support construction changed the requested core.")
+    return support, core_indices
 
 
 def _inverse_toroidal_derivatives(
@@ -1668,7 +1713,10 @@ class equilibrium:
                            padding: float=0.05, ntht_pad: int=5,
                            rhopol_min: Optional[float]=None,
                            rhopol_max: Optional[float]=None,
-                           spectral_max_mode: int=16):
+                           spectral_max_mode: int=16,
+                           radial_guard_surfaces: int=3,
+                           enforce_up_down_symmetry: bool=False,
+                           symmetry_tolerance: Optional[float]=None):
         """
         Compute magnetic coordinates for the specified coordinate system.
 
@@ -1706,6 +1754,19 @@ class equilibrium:
         spectral_max_mode : int, optional
             Maximum retained poloidal Fourier mode in the spectral surface
             reconstruction. Default is 16.
+        radial_guard_surfaces : int, optional
+            Number of hidden same-spacing radial support surfaces added on
+            each physically available side of the requested grid. The returned
+            ``psi0`` grid still contains exactly ``lpsi`` points. Default is 3.
+        enforce_up_down_symmetry : bool, optional
+            Explicitly project the common ``R(psi,theta)``, ``z(psi,theta)``,
+            and ``nu(psi,theta)`` map onto up-down parity before derivatives
+            and metrics are constructed. General equilibria remain unchanged
+            by default.
+        symmetry_tolerance : float, optional
+            Maximum relative R/Z asymmetry accepted when explicit projection
+            is requested. A finite positive value is required whenever
+            ``enforce_up_down_symmetry=True``.
 
         Returns
         -------
@@ -1771,12 +1832,32 @@ class equilibrium:
             # uniform-psi mesh severely under-resolves R(psi) ~ sqrt(psi)
             # near the magnetic axis and corrupts radial map derivatives.
             rho_grid = np.linspace(rho_min, rho_max, lpsi)
-            psigrid = psi_axis + rho_grid**2 * (psi_edge - psi_axis)
+            support_rho, core_indices = _extend_radial_support(
+                rho_grid,
+                lower_bound=0.0,
+                upper_bound=1.0,
+                guard_surfaces=radial_guard_surfaces,
+            )
+            core_psigrid_requested = (
+                psi_axis + rho_grid**2 * (psi_edge - psi_axis)
+            )
+            psigrid = psi_axis + support_rho**2 * (psi_edge - psi_axis)
+            support_family = "rhopol"
         else:
             psi_span = psi_edge - psi_axis
-            psi0 = psi_axis + padding * psi_span
-            psi1 = psi_axis + (1.0 - padding) * psi_span
-            psigrid = np.linspace(psi0, psi1, lpsi)
+            normalized_core = np.linspace(padding, 1.0 - padding, lpsi)
+            normalized_support, core_indices = _extend_radial_support(
+                normalized_core,
+                lower_bound=0.0,
+                upper_bound=1.0,
+                guard_surfaces=radial_guard_surfaces,
+            )
+            core_psigrid_requested = (
+                psi_axis + normalized_core * psi_span
+            )
+            psigrid = psi_axis + normalized_support * psi_span
+            support_rho = np.sqrt(np.clip(normalized_support, 0.0, 1.0))
+            support_family = "psi_n"
 
         # Transform psigrid to radial positions at midplane (using geometry)
         R_axis_val = float(self.geometry.R_axis.values)
@@ -1809,6 +1890,7 @@ class equilibrium:
 
         # Compute coordinates using generic function
         # Pass frr0 (radial positions at midplane) corresponding to psigrid
+        coordinate_construction_diagnostics: Dict[str, Any] = {}
         out = compute_magnetic_coordinates(
             Rgrid=R_fine, zgrid=z_fine,
             br=br_fine, bz=bz_fine, bphi=bphi_fine,
@@ -1824,9 +1906,42 @@ class equilibrium:
             spectral_max_mode=spectral_max_mode,
             psi_field=psip,
             flux_scale=abs(psi_edge - psi_axis),
+            enforce_up_down_symmetry=enforce_up_down_symmetry,
+            symmetry_tolerance=symmetry_tolerance,
+            diagnostics=coordinate_construction_diagnostics,
         )
 
         qprof, Fprof, Iprof, thtable, nutable, jac, Rtransform, ztransform = out
+        coordinate_psi_field = coordinate_construction_diagnostics.pop(
+            "coordinate_psi_field",
+            None,
+        )
+        if coordinate_psi_field is not None:
+            # Coordinate construction operates on the refined tracing grid,
+            # while the public R-z dataset intentionally retains the original
+            # equilibrium grid. Carry the consistently projected flux field
+            # across that existing boundary instead of changing public shapes.
+            public_R = np.asarray(self.Rgrid, dtype=np.float64)
+            public_z = np.asarray(self.zgrid, dtype=np.float64)
+            coordinate_psi_values = np.asarray(
+                coordinate_psi_field,
+                dtype=np.float64,
+            )
+            expected_tracing_shape = (R_fine.size, z_fine.size)
+            if coordinate_psi_values.shape != expected_tracing_shape:
+                raise ValueError(
+                    "projected coordinate psi field has shape "
+                    f"{coordinate_psi_values.shape}; expected tracing-grid "
+                    f"shape {expected_tracing_shape}."
+                )
+            coordinate_psi_field = RectBivariateSpline(
+                R_fine,
+                z_fine,
+                coordinate_psi_values,
+                kx=min(3, R_fine.size - 1),
+                ky=min(3, z_fine.size - 1),
+                s=0.0,
+            )(public_R, public_z)
 
         # Surface tracing and near-axis regularization use axis-to-boundary
         # order. Sort every radial output together only at the storage
@@ -1843,10 +1958,70 @@ class equilibrium:
         jac = np.asarray(jac)[psi_order, :]
         Rtransform = np.asarray(Rtransform)[psi_order, :]
         ztransform = np.asarray(ztransform)[psi_order, :]
+        symmetry_projection_audit = coordinate_construction_diagnostics.get(
+            "up_down_symmetry"
+        )
+        if isinstance(symmetry_projection_audit, dict):
+            for name, values in tuple(symmetry_projection_audit.items()):
+                if (
+                    isinstance(values, np.ndarray)
+                    and values.shape == (psi_order.size,)
+                ):
+                    symmetry_projection_audit[name] = values[psi_order]
+                elif isinstance(values, dict):
+                    for field_name, field_values in tuple(values.items()):
+                        field_array = np.asarray(field_values)
+                        if field_array.shape == (psi_order.size,):
+                            values[field_name] = field_array[psi_order]
         if np.any(np.diff(psigrid) <= 0.0):
             raise ValueError(
                 "Computed magnetic-coordinate psi grid must be strictly increasing."
             )
+        sorted_core = np.sort(
+            np.asarray(core_psigrid_requested, dtype=np.float64)
+        )
+        core_indices = np.searchsorted(psigrid, sorted_core)
+        if (
+            core_indices.shape != (lpsi,)
+            or np.any(core_indices >= psigrid.size)
+            or not np.allclose(
+                psigrid[core_indices],
+                sorted_core,
+                rtol=0.0,
+                atol=10.0 * np.finfo(np.float64).eps
+                * max(1.0, float(np.max(np.abs(psigrid)))),
+            )
+        ):
+            raise ValueError(
+                "Hidden radial support construction lost a requested core surface."
+            )
+        if abs(psi_span) < 1.0e-14:
+            final_support_rho = np.zeros_like(psigrid, dtype=np.float64)
+            final_core_rho = np.zeros_like(sorted_core, dtype=np.float64)
+        else:
+            final_support_rho = np.sqrt(
+                np.clip((psigrid - psi_axis) / psi_span, 0.0, None)
+            )
+            final_core_rho = np.sqrt(
+                np.clip((sorted_core - psi_axis) / psi_span, 0.0, None)
+            )
+        radial_scale = max(
+            1.0,
+            float(np.max(np.abs(final_support_rho))),
+        )
+        radial_tolerance = 10.0 * np.finfo(np.float64).eps * radial_scale
+        inner_guard_surfaces = int(
+            np.count_nonzero(
+                final_support_rho
+                < float(np.min(final_core_rho)) - radial_tolerance
+            )
+        )
+        outer_guard_surfaces = int(
+            np.count_nonzero(
+                final_support_rho
+                > float(np.max(final_core_rho)) + radial_tolerance
+            )
+        )
 
         # Continue with post-processing
         return self._build_magnetic_coordinates_dataset(
@@ -1855,6 +2030,21 @@ class equilibrium:
             np.asarray(self.zgrid, dtype=np.float64),
             qprof, Fprof, Iprof, ntht_pad, coordinate_system,
             spectral_max_mode=spectral_max_mode,
+            core_indices=core_indices,
+            radial_support_metadata={
+                "family": support_family,
+                "requested_guard_surfaces": int(radial_guard_surfaces),
+                "support_nsurface": int(psigrid.size),
+                "core_nsurface": int(lpsi),
+                "inner_guard_surfaces": inner_guard_surfaces,
+                "outer_guard_surfaces": outer_guard_surfaces,
+                "support_rhopol_min": float(np.min(final_support_rho)),
+                "support_rhopol_max": float(np.max(final_support_rho)),
+            },
+            symmetry_projection_audit=coordinate_construction_diagnostics.get(
+                "up_down_symmetry"
+            ),
+            coordinate_psi_field=coordinate_psi_field,
         )
     
     def _build_magnetic_coordinates_dataset(
@@ -1873,6 +2063,10 @@ class equilibrium:
         ntht_pad: int,
         coordinate_system: str = 'boozer',
         spectral_max_mode: Optional[int] = None,
+        core_indices: Optional[np.ndarray] = None,
+        radial_support_metadata: Optional[Dict[str, Any]] = None,
+        symmetry_projection_audit: Optional[Dict[str, Any]] = None,
+        coordinate_psi_field: Optional[np.ndarray] = None,
     ) -> MagneticCoordinates:
         """
         Build the MagneticCoordinates dataset from computed coordinate arrays.
@@ -1912,89 +2106,103 @@ class equilibrium:
         MagneticCoordinates
             Magnetic coordinates object
         """
-        ltheta = thtable.shape[1]
-        
-        # Build coordinate grids (using geometry for axis)
-        R_axis_val = float(self.geometry.R_axis.values)
-        z_axis_val = float(self.geometry.z_axis.values)
-        grr, gzz = np.meshgrid(R_fine, z_fine, indexing='ij')
-        thetageom = np.arctan2(gzz - z_axis_val,
-                               grr - R_axis_val)
-        thetageom = np.mod(thetageom + 2*np.pi, 2*np.pi)
-        psirz = self.flux.psi.interp(R=R_fine, z=z_fine, method='cubic')
-
-        # Add padding to theta grid
-        thetagrid = np.linspace(0, 2*np.pi, ltheta)
-        dtheta = thetagrid[1] - thetagrid[0]
-        thetagrid = np.linspace(-ntht_pad*dtheta,
-                                2*np.pi + ntht_pad*dtheta,
-                                ltheta + 2*ntht_pad)
-        # Pad thtable
-        thtable_padded = thtable.copy()
-        thtable_padded[:, -1] = 2*np.pi
-        thtable_padded[:, 0] = 0.0
-        leftside = thtable_padded[:, -ntht_pad:] - 2*np.pi
-        rightside = thtable_padded[:, :ntht_pad] + 2*np.pi
-        thtable_padded = np.concatenate((leftside, thtable_padded, rightside), axis=1)
-
-        thtable_da = xr.DataArray(
-            thtable_padded,
-            coords={'psi0': psigrid, 'thetageom': thetagrid},
-            dims=('psi0', 'thetageom'),
-        )
-
-        # Keep the public direct tables, while the authoritative inverse map
-        # below uses nu sampled on the uniform magnetic-angle grid.
-        leftside = nutable[:, -ntht_pad:]
-        rightside = nutable[:, :ntht_pad]
-        nutable_padded = np.concatenate((leftside, nutable, rightside), axis=1)
-        nutable_da = xr.DataArray(
-            nutable_padded,
-            coords={'psi0': psigrid, 'thetageom': thetagrid},
-            dims=('psi0', 'thetageom'),
-        )
-        # Build padded public inverse maps.
-        leftside = Rtransform[:, -ntht_pad:]
-        rightside = Rtransform[:, :ntht_pad]
-        Rtransform_padded = np.concatenate((leftside, Rtransform, rightside), axis=1)
-        leftside = ztransform[:, -ntht_pad:]
-        rightside = ztransform[:, :ntht_pad]
-        ztransform_padded = np.concatenate((leftside, ztransform, rightside), axis=1)
+        support_psi = np.asarray(psigrid, dtype=np.float64)
+        support_theta_table = np.asarray(thtable, dtype=np.float64)
+        support_nu_table = np.asarray(nutable, dtype=np.float64)
+        support_jacobian_table = np.asarray(jac, dtype=np.float64)
+        support_R = np.asarray(Rtransform, dtype=np.float64)
+        support_z = np.asarray(ztransform, dtype=np.float64)
+        support_q = np.asarray(qprof, dtype=np.float64)
+        support_F = np.asarray(Fprof, dtype=np.float64)
+        support_I = np.asarray(Iprof, dtype=np.float64)
+        ltheta = support_theta_table.shape[1]
+        support_nsurface = support_psi.size
+        expected_surface_shape = (support_nsurface, ltheta)
+        for name, values in (
+            ("theta", support_theta_table),
+            ("nu", support_nu_table),
+            ("jacobian", support_jacobian_table),
+            ("R", support_R),
+            ("z", support_z),
+        ):
+            if values.shape != expected_surface_shape:
+                raise ValueError(
+                    f"{name} support table has shape {values.shape}; "
+                    f"expected {expected_surface_shape}."
+                )
+        for name, values in (
+            ("q", support_q),
+            ("F", support_F),
+            ("I", support_I),
+        ):
+            if values.shape != (support_nsurface,):
+                raise ValueError(
+                    f"{name} support profile has shape {values.shape}; "
+                    f"expected {(support_nsurface,)}."
+                )
+        if core_indices is None:
+            core_selection = np.arange(support_nsurface, dtype=np.int64)
+        else:
+            core_selection = np.asarray(core_indices, dtype=np.int64)
+            if (
+                core_selection.ndim != 1
+                or core_selection.size < 2
+                or np.any(np.diff(core_selection) <= 0)
+                or core_selection[0] < 0
+                or core_selection[-1] >= support_nsurface
+            ):
+                raise ValueError(
+                    "core_indices must select an increasing interior radial grid."
+                )
 
         # Convert direct surface-parameter tables to the same uniform magnetic
-        # angle used by Rtransform/ztransform.
+        # angle used by Rtransform/ztransform. Periodic cubic interpolation
+        # avoids a directional seam bias in nu and the target Jacobian.
         magnetic_theta = np.linspace(0.0, 2.0*np.pi, ltheta)
-        nu_magnetic = np.empty_like(nutable, dtype=np.float64)
-        jacobian_magnetic = np.empty_like(jac, dtype=np.float64)
-        for radial_index in range(len(psigrid)):
-            theta_row = np.asarray(thtable[radial_index], dtype=np.float64)
+        support_nu_magnetic = np.empty_like(
+            support_nu_table,
+            dtype=np.float64,
+        )
+        support_jacobian_magnetic = np.empty_like(
+            support_jacobian_table,
+            dtype=np.float64,
+        )
+        for radial_index in range(support_nsurface):
+            theta_row = support_theta_table[radial_index]
             if np.any(np.diff(theta_row) <= 0.0):
                 raise ValueError(
                     "Direct magnetic-angle table must be strictly increasing "
                     f"on surface {radial_index}."
                 )
-            nu_magnetic[radial_index] = np.interp(
-                magnetic_theta,
+            nu_row = support_nu_table[radial_index].copy()
+            jacobian_row = support_jacobian_table[radial_index].copy()
+            nu_row[-1] = nu_row[0]
+            jacobian_row[-1] = jacobian_row[0]
+            support_nu_magnetic[radial_index] = CubicSpline(
                 theta_row,
-                np.asarray(nutable[radial_index], dtype=np.float64),
-            )
-            jacobian_magnetic[radial_index] = np.interp(
-                magnetic_theta,
+                nu_row,
+                bc_type="periodic",
+            )(magnetic_theta)
+            support_jacobian_magnetic[radial_index] = CubicSpline(
                 theta_row,
-                np.asarray(jac[radial_index], dtype=np.float64),
+                jacobian_row,
+                bc_type="periodic",
+            )(magnetic_theta)
+            support_nu_magnetic[radial_index, -1] = (
+                support_nu_magnetic[radial_index, 0]
             )
-            nu_magnetic[radial_index, -1] = nu_magnetic[radial_index, 0]
-            jacobian_magnetic[radial_index, -1] = jacobian_magnetic[
-                radial_index,
-                0,
-            ]
+            support_jacobian_magnetic[radial_index, -1] = (
+                support_jacobian_magnetic[radial_index, 0]
+            )
 
+        R_axis_val = float(self.geometry.R_axis.values)
+        z_axis_val = float(self.geometry.z_axis.values)
         coordinate_map = SpectralCoordinateMap(
-            psi=psigrid,
+            psi=support_psi,
             theta=magnetic_theta,
-            R=Rtransform,
-            z=ztransform,
-            nu=nu_magnetic,
+            R=support_R,
+            z=support_z,
+            nu=support_nu_magnetic,
             psi_axis=float(
                 self.geometry.attrs.get('psi_ax', self._psi_ax_init)
             ),
@@ -2004,6 +2212,94 @@ class equilibrium:
             R_axis=R_axis_val,
             z_axis=z_axis_val,
             max_mode=spectral_max_mode,
+        )
+
+        # Everything public remains on the exact requested core grid. The
+        # private coordinate map above retains hidden support on both sides.
+        psigrid = support_psi[core_selection]
+        thtable = support_theta_table[core_selection]
+        nutable = support_nu_table[core_selection]
+        jac = support_jacobian_table[core_selection]
+        Rtransform = support_R[core_selection]
+        ztransform = support_z[core_selection]
+        qprof = support_q[core_selection]
+        Fprof = support_F[core_selection]
+        Iprof = support_I[core_selection]
+        nu_magnetic = support_nu_magnetic[core_selection]
+        jacobian_magnetic = support_jacobian_magnetic[core_selection]
+
+        # Build coordinate grids (using geometry for axis)
+        grr, gzz = np.meshgrid(R_fine, z_fine, indexing='ij')
+        thetageom = np.arctan2(gzz - z_axis_val,
+                               grr - R_axis_val)
+        thetageom = np.mod(thetageom + 2*np.pi, 2*np.pi)
+        if coordinate_psi_field is None:
+            psirz = self.flux.psi.interp(
+                R=R_fine,
+                z=z_fine,
+                method='cubic',
+            )
+        else:
+            coordinate_psi_values = np.asarray(
+                coordinate_psi_field,
+                dtype=np.float64,
+            )
+            expected_psi_shape = (R_fine.size, z_fine.size)
+            if coordinate_psi_values.shape != expected_psi_shape:
+                raise ValueError(
+                    "coordinate_psi_field has shape "
+                    f"{coordinate_psi_values.shape}; expected "
+                    f"{expected_psi_shape}."
+                )
+            psirz = xr.DataArray(
+                coordinate_psi_values,
+                dims=("R", "z"),
+                coords={"R": R_fine, "z": z_fine},
+            )
+
+        # Add padding to theta grid.
+        thetagrid = np.linspace(0, 2*np.pi, ltheta)
+        dtheta = thetagrid[1] - thetagrid[0]
+        thetagrid = np.linspace(-ntht_pad*dtheta,
+                                2*np.pi + ntht_pad*dtheta,
+                                ltheta + 2*ntht_pad)
+        thtable_padded = thtable.copy()
+        thtable_padded[:, -1] = 2*np.pi
+        thtable_padded[:, 0] = 0.0
+        leftside = thtable_padded[:, -(ntht_pad + 1):-1] - 2*np.pi
+        rightside = thtable_padded[:, 1:ntht_pad + 1] + 2*np.pi
+        thtable_padded = np.concatenate(
+            (leftside, thtable_padded, rightside),
+            axis=1,
+        )
+        thtable_da = xr.DataArray(
+            thtable_padded,
+            coords={'psi0': psigrid, 'thetageom': thetagrid},
+            dims=('psi0', 'thetageom'),
+        )
+
+        leftside = nutable[:, -(ntht_pad + 1):-1]
+        rightside = nutable[:, 1:ntht_pad + 1]
+        nutable_padded = np.concatenate(
+            (leftside, nutable, rightside),
+            axis=1,
+        )
+        nutable_da = xr.DataArray(
+            nutable_padded,
+            coords={'psi0': psigrid, 'thetageom': thetagrid},
+            dims=('psi0', 'thetageom'),
+        )
+        leftside = Rtransform[:, -(ntht_pad + 1):-1]
+        rightside = Rtransform[:, 1:ntht_pad + 1]
+        Rtransform_padded = np.concatenate(
+            (leftside, Rtransform, rightside),
+            axis=1,
+        )
+        leftside = ztransform[:, -(ntht_pad + 1):-1]
+        rightside = ztransform[:, 1:ntht_pad + 1]
+        ztransform_padded = np.concatenate(
+            (leftside, ztransform, rightside),
+            axis=1,
         )
 
         # The equilibrium flux remains authoritative outside the fitted
@@ -2049,15 +2345,15 @@ class equilibrium:
         initial_theta = thetageom.ravel()
         chunk_size = 20_000
         for chunk_start in range(0, flat_indices.size, chunk_size):
-            selected = flat_indices[chunk_start:chunk_start + chunk_size]
-            psi_chunk = flat_psi[selected]
-            R_chunk = flat_R[selected]
-            z_chunk = flat_z[selected]
+            chunk_indices = flat_indices[chunk_start:chunk_start + chunk_size]
+            psi_chunk = flat_psi[chunk_indices]
+            R_chunk = flat_R[chunk_indices]
+            z_chunk = flat_z[chunk_indices]
             theta_chunk = coordinate_map.solve_theta(
                 psi=psi_chunk,
                 R=R_chunk,
                 z=z_chunk,
-                initial_theta=initial_theta[selected],
+                initial_theta=initial_theta[chunk_indices],
                 tolerance=5.0e-11,
                 max_iterations=30,
             )
@@ -2078,8 +2374,8 @@ class equilibrium:
             # their determinant remain exactly reciprocal.
             direct[:, 1, :] *= (R_chunk / map_radius)[:, None]
             direct[:, 1, 2] = R_chunk
-            grad_R = equilibrium_dPsi_dr.ravel()[selected]
-            grad_z = equilibrium_dPsi_dz.ravel()[selected]
+            grad_R = equilibrium_dPsi_dr.ravel()[chunk_indices]
+            grad_z = equilibrium_dPsi_dz.ravel()[chunk_indices]
             grad_squared = grad_R**2 + grad_z**2
             if np.any(grad_squared <= np.finfo(np.float64).tiny):
                 raise ValueError(
@@ -2106,41 +2402,41 @@ class equilibrium:
                 )
             inverse = np.linalg.inv(direct)
 
-            theta_Rz.ravel()[selected] = theta_chunk
-            nu_Rz.ravel()[selected] = differential.values['nu']
-            jac_Rz.ravel()[selected] = jacobian_chunk
+            theta_Rz.ravel()[chunk_indices] = theta_chunk
+            nu_Rz.ravel()[chunk_indices] = differential.values['nu']
+            jac_Rz.ravel()[chunk_indices] = jacobian_chunk
 
-            map_derivatives['dR_dpsi'].ravel()[selected] = direct[:, 0, 0]
-            map_derivatives['dR_dtheta'].ravel()[selected] = direct[:, 0, 1]
-            map_derivatives['dR_dzeta'].ravel()[selected] = direct[:, 0, 2]
-            map_derivatives['dz_dpsi'].ravel()[selected] = direct[:, 2, 0]
-            map_derivatives['dz_dtheta'].ravel()[selected] = direct[:, 2, 1]
-            map_derivatives['dz_dzeta'].ravel()[selected] = direct[:, 2, 2]
-            map_derivatives['dphi_dpsi'].ravel()[selected] = (
+            map_derivatives['dR_dpsi'].ravel()[chunk_indices] = direct[:, 0, 0]
+            map_derivatives['dR_dtheta'].ravel()[chunk_indices] = direct[:, 0, 1]
+            map_derivatives['dR_dzeta'].ravel()[chunk_indices] = direct[:, 0, 2]
+            map_derivatives['dz_dpsi'].ravel()[chunk_indices] = direct[:, 2, 0]
+            map_derivatives['dz_dtheta'].ravel()[chunk_indices] = direct[:, 2, 1]
+            map_derivatives['dz_dzeta'].ravel()[chunk_indices] = direct[:, 2, 2]
+            map_derivatives['dphi_dpsi'].ravel()[chunk_indices] = (
                 direct[:, 1, 0] / R_chunk
             )
-            map_derivatives['dphi_dtheta'].ravel()[selected] = (
+            map_derivatives['dphi_dtheta'].ravel()[chunk_indices] = (
                 direct[:, 1, 1] / R_chunk
             )
-            map_derivatives['dphi_dzeta'].ravel()[selected] = (
+            map_derivatives['dphi_dzeta'].ravel()[chunk_indices] = (
                 direct[:, 1, 2] / R_chunk
             )
-            map_derivatives['dPsi_dr'].ravel()[selected] = inverse[:, 0, 0]
-            map_derivatives['dPsi_dphi'].ravel()[selected] = (
+            map_derivatives['dPsi_dr'].ravel()[chunk_indices] = inverse[:, 0, 0]
+            map_derivatives['dPsi_dphi'].ravel()[chunk_indices] = (
                 R_chunk * inverse[:, 0, 1]
             )
-            map_derivatives['dPsi_dz'].ravel()[selected] = inverse[:, 0, 2]
-            map_derivatives['dTheta_dr'].ravel()[selected] = inverse[:, 1, 0]
-            map_derivatives['dTheta_dphi'].ravel()[selected] = (
+            map_derivatives['dPsi_dz'].ravel()[chunk_indices] = inverse[:, 0, 2]
+            map_derivatives['dTheta_dr'].ravel()[chunk_indices] = inverse[:, 1, 0]
+            map_derivatives['dTheta_dphi'].ravel()[chunk_indices] = (
                 R_chunk * inverse[:, 1, 1]
             )
-            map_derivatives['dTheta_dz'].ravel()[selected] = inverse[:, 1, 2]
-            map_derivatives['dzeta_dr'].ravel()[selected] = inverse[:, 2, 0]
-            map_derivatives['dzeta_dphi'].ravel()[selected] = (
+            map_derivatives['dTheta_dz'].ravel()[chunk_indices] = inverse[:, 1, 2]
+            map_derivatives['dzeta_dr'].ravel()[chunk_indices] = inverse[:, 2, 0]
+            map_derivatives['dzeta_dphi'].ravel()[chunk_indices] = (
                 R_chunk * inverse[:, 2, 1]
             )
-            map_derivatives['dzeta_dz'].ravel()[selected] = inverse[:, 2, 2]
-            map_derivatives['direct_det_Rz'].ravel()[selected] = (
+            map_derivatives['dzeta_dz'].ravel()[chunk_indices] = inverse[:, 2, 2]
+            map_derivatives['direct_det_Rz'].ravel()[chunk_indices] = (
                 inverse[:, 0, 0] * inverse[:, 1, 2]
                 - inverse[:, 0, 2] * inverse[:, 1, 0]
             )
@@ -2202,8 +2498,86 @@ class equilibrium:
             flux_per_angle_units = "Wb/rad"
             direct_det_units = "Wb*rad/m**2"
 
+        support_metadata = dict(radial_support_metadata or {})
+        support_metadata.update({
+            "support_nsurface": int(support_nsurface),
+            "core_nsurface": int(core_selection.size),
+            "support_psi_min": float(support_psi[0]),
+            "support_psi_max": float(support_psi[-1]),
+            "core_psi_min": float(psigrid[0]),
+            "core_psi_max": float(psigrid[-1]),
+        })
+        map_symmetry_audit = coordinate_map.up_down_symmetry_audit
+        if symmetry_projection_audit is None:
+            symmetry_audit = map_symmetry_audit
+        else:
+            symmetry_audit = dict(symmetry_projection_audit)
+            symmetry_audit["coordinate_map_geometry_residual"] = np.asarray(
+                map_symmetry_audit["geometry_residual"],
+                dtype=np.float64,
+            )
+            symmetry_audit["coordinate_map_field_residuals"] = (
+                map_symmetry_audit["field_residuals"]
+            )
+            # The map has already been constructed from projected physical
+            # contours and fields. Preserve the source audit on the map so
+            # downstream bridge users see what was changed, not merely the
+            # round-off-level residual after projection.
+            coordinate_map.up_down_symmetry_audit = symmetry_audit
+        symmetry_geometry_max = float(
+            np.max(symmetry_audit["geometry_residual"])
+        )
+
         # Build coordinate dataset
-        magcoords = xr.Dataset()
+        magcoords = xr.Dataset(attrs={
+            "radial_support_family": str(
+                support_metadata.get("family", "unspecified")
+            ),
+            "radial_guard_surfaces_requested": int(
+                support_metadata.get("requested_guard_surfaces", 0)
+            ),
+            "radial_support_nsurface": int(
+                support_metadata["support_nsurface"]
+            ),
+            "radial_core_nsurface": int(
+                support_metadata["core_nsurface"]
+            ),
+            "radial_inner_guard_surfaces": int(
+                support_metadata.get("inner_guard_surfaces", 0)
+            ),
+            "radial_outer_guard_surfaces": int(
+                support_metadata.get("outer_guard_surfaces", 0)
+            ),
+            "radial_support_psi_min": float(
+                support_metadata["support_psi_min"]
+            ),
+            "radial_support_psi_max": float(
+                support_metadata["support_psi_max"]
+            ),
+            "radial_core_psi_min": float(support_metadata["core_psi_min"]),
+            "radial_core_psi_max": float(support_metadata["core_psi_max"]),
+            "up_down_symmetry_projection_applied": int(
+                symmetry_audit["applied"]
+            ),
+            "up_down_symmetry_projected_equilibrium": int(
+                coordinate_psi_field is not None
+                and symmetry_audit["applied"]
+            ),
+            "up_down_symmetry_input_geometry_residual": (
+                symmetry_geometry_max
+            ),
+            "up_down_symmetry_projected_flux_residual": float(
+                np.max(
+                    np.asarray(
+                        symmetry_audit.get(
+                            "projected_flux_residual",
+                            np.asarray([0.0]),
+                        ),
+                        dtype=np.float64,
+                    )
+                )
+            ),
+        })
         magcoords['psi'] = xr.DataArray(psirz, dims=('R', 'z'),
                                         coords={'R': R_fine, 'z': z_fine},
                                         attrs={'name': 'psi', 'units': self.flux_normalization,
@@ -2427,6 +2801,8 @@ class equilibrium:
         ) / target_scale
         mag_coords_obj._coordinate_diagnostics = {
             'jacobian_relative_residual': jacobian_relative_residual,
+            'radial_support': support_metadata,
+            'up_down_symmetry': symmetry_audit,
         }
         mag_coords_obj.deriv['jacobian'].attrs.update({
             'construction': 'determinant of the common Fourier-spline map',

@@ -72,6 +72,15 @@ def test_supernova_required_coordinate_and_derivative_schema(monkeypatch, tmp_pa
         equilibrium.geometry.attrs["psi_bdy"]
     )
     assert magnetic.coords["nu"].attrs["gauge_relation"] == "zeta = phi + nu"
+    np.testing.assert_allclose(
+        magnetic.coords["theta"].values,
+        np.broadcast_to(
+            magnetic.coords["thetageom"].values,
+            magnetic.coords["theta"].shape,
+        ),
+        rtol=0.0,
+        atol=2.0e-14,
+    )
 
     required_profiles = {"q", "F", "I", "h"}
     required_rz_fields = {
