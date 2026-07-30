@@ -111,6 +111,8 @@ class SpectralCoordinateMap:
         psi_boundary: Optional[float] = None,
         R_axis: Optional[float] = None,
         z_axis: Optional[float] = None,
+        enforce_up_down_symmetry: bool = False,
+        symmetry_tolerance: Optional[float] = None,
     ) -> None:
         radial = np.asarray(psi, dtype=np.float64)
         if radial.ndim != 1 or radial.size < 2:
@@ -132,6 +134,94 @@ class SpectralCoordinateMap:
                 )
             if not np.all(np.isfinite(array)):
                 raise ValueError(f"{name} contains non-finite values.")
+
+        if not isinstance(enforce_up_down_symmetry, (bool, np.bool_)):
+            raise TypeError("enforce_up_down_symmetry must be boolean.")
+        if symmetry_tolerance is not None:
+            symmetry_tolerance = float(symmetry_tolerance)
+            if not np.isfinite(symmetry_tolerance) or symmetry_tolerance <= 0.0:
+                raise ValueError("symmetry_tolerance must be finite and positive.")
+        if enforce_up_down_symmetry and symmetry_tolerance is None:
+            raise ValueError(
+                "symmetry_tolerance is required when up-down projection is enabled"
+            )
+        if (R_axis is None) != (z_axis is None):
+            raise ValueError(
+                "R_axis and z_axis must either both be supplied or both be omitted."
+            )
+        if R_axis is None:
+            center_R = np.mean(arrays["R"], axis=1)
+            center_z = np.mean(arrays["z"], axis=1)
+        else:
+            center_R = np.full(radial.size, float(R_axis))
+            center_z = np.full(radial.size, float(z_axis))
+
+        reflection_indices = np.concatenate(
+            ([0], np.arange(angle.size - 1, 0, -1))
+        )
+        centered_fields = {
+            "R": arrays["R"] - center_R[:, None],
+            "z": arrays["z"] - center_z[:, None],
+            "nu": arrays["nu"],
+        }
+        expected_parity = {"R": 1.0, "z": -1.0, "nu": -1.0}
+        field_residuals: Dict[str, np.ndarray] = {}
+        field_changes: Dict[str, np.ndarray] = {}
+        projected_fields: Dict[str, np.ndarray] = {}
+        geometry_scale = np.maximum(
+            np.maximum(
+                np.ptp(arrays["R"], axis=1),
+                np.ptp(arrays["z"], axis=1),
+            ),
+            np.finfo(np.float64).tiny,
+        )
+        for name, values in centered_fields.items():
+            reflected = np.take(values, reflection_indices, axis=1)
+            parity = expected_parity[name]
+            scale = (
+                geometry_scale
+                if name in {"R", "z"}
+                else np.maximum(
+                    np.max(np.abs(values), axis=1),
+                    np.finfo(np.float64).tiny,
+                )
+            )
+            field_residuals[name] = (
+                np.max(np.abs(values - parity * reflected), axis=1) / scale
+            )
+            projected = 0.5 * (values + parity * reflected)
+            projected_fields[name] = projected
+            field_changes[name] = (
+                np.max(np.abs(projected - values), axis=1) / scale
+            )
+
+        geometry_residual = np.maximum(
+            field_residuals["R"],
+            field_residuals["z"],
+        )
+        if (
+            enforce_up_down_symmetry
+            and symmetry_tolerance is not None
+            and float(np.max(geometry_residual)) > symmetry_tolerance
+        ):
+            raise ValueError(
+                "coordinate map is not sufficiently up-down symmetric for "
+                "explicit projection: "
+                f"residual={float(np.max(geometry_residual)):.3e}, "
+                f"tolerance={symmetry_tolerance:.3e}"
+            )
+        if enforce_up_down_symmetry:
+            arrays["R"] = projected_fields["R"] + center_R[:, None]
+            arrays["z"] = projected_fields["z"] + center_z[:, None]
+            arrays["nu"] = projected_fields["nu"]
+
+        self.up_down_symmetry_audit = {
+            "applied": bool(enforce_up_down_symmetry),
+            "tolerance": symmetry_tolerance,
+            "geometry_residual": geometry_residual,
+            "field_residuals": field_residuals,
+            "field_relative_changes": field_changes,
+        }
 
         ntheta = angle.size
         if max_mode is None:
@@ -162,16 +252,6 @@ class SpectralCoordinateMap:
                 "Cannot determine the poloidal orientation of the coordinate map."
             )
         self.angular_orientation = orientation
-        if (R_axis is None) != (z_axis is None):
-            raise ValueError(
-                "R_axis and z_axis must either both be supplied or both be omitted."
-            )
-        if R_axis is None:
-            center_R = np.mean(arrays["R"], axis=1)
-            center_z = np.mean(arrays["z"], axis=1)
-        else:
-            center_R = np.full(radial.size, float(R_axis))
-            center_z = np.full(radial.size, float(z_axis))
         origin_phase = np.arctan2(
             arrays["z"][:, 0] - center_z,
             arrays["R"][:, 0] - center_R,

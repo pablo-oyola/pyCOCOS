@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pycocos.coordinates.coordinate_map import SpectralCoordinateMap
 
@@ -80,6 +81,120 @@ def test_spectral_map_preserves_asymmetric_values_and_derivatives():
         rtol=1.0e-10,
         atol=1.0e-11,
     )
+
+
+def test_explicit_up_down_projection_rebuilds_one_symmetric_map():
+    psi = np.linspace(0.04, 0.81, 13)
+    theta = np.linspace(0.0, 2.0 * np.pi, 129)
+    rho = np.sqrt(psi)[:, None]
+    angle = theta[None, :]
+    R = (
+        2.1
+        + rho * np.cos(angle)
+        + 2.0e-4 * rho * np.sin(2.0 * angle)
+    )
+    z = (
+        1.3 * rho * np.sin(angle)
+        + 3.0e-4 * rho * np.cos(2.0 * angle)
+    )
+    nu = (
+        0.03 * rho * np.sin(angle)
+        + 1.0e-4 * rho * np.cos(angle)
+    )
+    coordinate_map = SpectralCoordinateMap(
+        psi=psi,
+        theta=theta,
+        R=R,
+        z=z,
+        nu=nu,
+        R_axis=2.1,
+        z_axis=0.0,
+        enforce_up_down_symmetry=True,
+        symmetry_tolerance=1.0e-3,
+    )
+
+    sample_theta = theta[:-1]
+    sample_psi, sample_angle = np.meshgrid(
+        psi[[2, 6, 10]],
+        sample_theta,
+        indexing="ij",
+    )
+    reflection = np.concatenate(
+        ([0], np.arange(sample_theta.size - 1, 0, -1))
+    )
+    for field, parity in (("R", 1.0), ("z", -1.0), ("nu", -1.0)):
+        values = coordinate_map.evaluate(field, sample_psi, sample_angle)
+        reflected = np.take(values, reflection, axis=1)
+        offset = 2.1 if field == "R" else 0.0
+        np.testing.assert_allclose(
+            values - offset,
+            parity * (reflected - offset),
+            rtol=0.0,
+            atol=2.0e-13,
+        )
+        radial_derivative = coordinate_map.evaluate(
+            field,
+            sample_psi,
+            sample_angle,
+            dpsi=1,
+        )
+        np.testing.assert_allclose(
+            radial_derivative,
+            parity * np.take(radial_derivative, reflection, axis=1),
+            rtol=0.0,
+            atol=2.0e-12,
+        )
+        angular_derivative = coordinate_map.evaluate(
+            field,
+            sample_psi,
+            sample_angle,
+            dtheta=1,
+        )
+        np.testing.assert_allclose(
+            angular_derivative,
+            -parity * np.take(angular_derivative, reflection, axis=1),
+            rtol=0.0,
+            atol=2.0e-12,
+        )
+
+    assert coordinate_map.up_down_symmetry_audit["applied"]
+    assert (
+        np.max(
+            coordinate_map.up_down_symmetry_audit["geometry_residual"]
+        )
+        < 1.0e-3
+    )
+
+
+def test_explicit_up_down_projection_rejects_asymmetric_map():
+    psi, theta, R, z, nu = _asymmetric_map()
+    with pytest.raises(ValueError, match="not sufficiently up-down symmetric"):
+        SpectralCoordinateMap(
+            psi=psi,
+            theta=theta,
+            R=R,
+            z=z,
+            nu=nu,
+            R_axis=2.1,
+            z_axis=0.0,
+            enforce_up_down_symmetry=True,
+            symmetry_tolerance=1.0e-4,
+        )
+
+
+def test_explicit_up_down_projection_requires_finite_gate():
+    psi, theta, R, z, nu = _asymmetric_map()
+    with pytest.raises(ValueError, match="symmetry_tolerance is required"):
+        SpectralCoordinateMap(
+            psi=psi,
+            theta=theta,
+            R=R,
+            z=z,
+            nu=nu,
+            R_axis=2.1,
+            z_axis=0.0,
+            enforce_up_down_symmetry=True,
+        )
 
 
 def test_spectral_map_metrics_are_exact_reciprocals():

@@ -90,10 +90,16 @@ def compute_theta_span(
     """
     span = 0.0
     for i in range(jacobian.size):
-        denom = abs(jacobian[i]) * grad_psi[i]
-        if denom < EPS:
-            denom = EPS
-        span += (R[i] / denom) * dlp[i]
+        j = (i + 1) % jacobian.size
+        left_denom = abs(jacobian[i]) * grad_psi[i]
+        right_denom = abs(jacobian[j]) * grad_psi[j]
+        if left_denom < EPS:
+            left_denom = EPS
+        if right_denom < EPS:
+            right_denom = EPS
+        left = R[i] / left_denom
+        right = R[j] / right_denom
+        span += 0.5 * (left + right) * dlp[i]
     return span
 
 
@@ -106,4 +112,3 @@ def apply_scalar_scale(values: np.ndarray, scale: float) -> np.ndarray:
     for i in range(values.size):
         out[i] = values[i] * scale
     return out
-

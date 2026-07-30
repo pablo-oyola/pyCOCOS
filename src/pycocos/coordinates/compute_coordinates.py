@@ -2,15 +2,21 @@
 
 Flux surfaces are traced independently, optionally projected back onto the
 requested physical poloidal flux, and then reparameterized by a registered
-Jacobian.  No radial smoothing or symmetry projection is performed.
+Jacobian. Optional up-down projection symmetrizes the equilibrium flux and
+magnetic field before retracing and rebuilding every coordinate quantity.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, MutableMapping, Optional, Tuple
 
 import numpy as np
-from scipy.interpolate import RectBivariateSpline, RegularGridInterpolator
+from scipy.interpolate import (
+    CubicSpline,
+    PchipInterpolator,
+    RectBivariateSpline,
+    RegularGridInterpolator,
+)
 
 from .field_lines import integrate_pol_field_line
 from .jacobian_builders import (
@@ -30,6 +36,176 @@ from .surfaces import (
 _TWO_PI = 2.0 * np.pi
 _DEFAULT_SPECTRAL_MAX_FOURIER_MODE = 16
 _THETA_GEOM_POINTS = 7200
+
+
+def _centered_segment_integrals(
+    values: np.ndarray,
+    segment_lengths: np.ndarray,
+) -> np.ndarray:
+    """Integrate periodic vertex data over each following contour segment."""
+    vertex_values = np.asarray(values, dtype=np.float64)
+    lengths = np.asarray(segment_lengths, dtype=np.float64)
+    if vertex_values.ndim != 1 or lengths.shape != vertex_values.shape:
+        raise ValueError(
+            "periodic segment quadrature requires matching one-dimensional arrays"
+        )
+    return 0.5 * (vertex_values + np.roll(vertex_values, -1)) * lengths
+
+
+def _up_down_surface_projection(
+    R: np.ndarray,
+    z: np.ndarray,
+    *,
+    zaxis: float,
+    applied: bool,
+    tolerance: Optional[float],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], np.ndarray]:
+    """Audit and optionally project endpoint-exclusive surface geometry."""
+    radial = np.asarray(R, dtype=np.float64)
+    vertical = np.asarray(z, dtype=np.float64)
+    if radial.ndim != 2 or vertical.shape != radial.shape:
+        raise ValueError(
+            "up-down projection requires matching (surface, angle) geometry"
+        )
+    reflection = np.concatenate(
+        ([0], np.arange(radial.shape[1] - 1, 0, -1))
+    )
+    reflected_R = radial[:, reflection]
+    vertical_offset = vertical - float(zaxis)
+    reflected_z = vertical_offset[:, reflection]
+    geometry_scale = np.maximum(
+        np.maximum(
+            np.ptp(radial, axis=1),
+            np.ptp(vertical, axis=1),
+        ),
+        np.finfo(np.float64).tiny,
+    )
+    R_residual = (
+        np.max(np.abs(radial - reflected_R), axis=1) / geometry_scale
+    )
+    z_residual = (
+        np.max(np.abs(vertical_offset + reflected_z), axis=1)
+        / geometry_scale
+    )
+    geometry_residual = np.maximum(R_residual, z_residual)
+    projected_R = 0.5 * (radial + reflected_R)
+    projected_z_offset = 0.5 * (vertical_offset - reflected_z)
+    projected_z = projected_z_offset + float(zaxis)
+    field_changes = {
+        "R": (
+            np.max(np.abs(projected_R - radial), axis=1) / geometry_scale
+        ),
+        "z": (
+            np.max(np.abs(projected_z - vertical), axis=1) / geometry_scale
+        ),
+    }
+    if applied:
+        if tolerance is None:
+            raise ValueError(
+                "symmetry_tolerance is required when up-down projection is enabled"
+            )
+        if float(np.max(geometry_residual)) > tolerance:
+            raise ValueError(
+                "flux surfaces are not sufficiently up-down symmetric for "
+                "explicit projection: "
+                f"residual={float(np.max(geometry_residual)):.3e}, "
+                f"tolerance={tolerance:.3e}"
+            )
+    audit: dict[str, Any] = {
+        "applied": bool(applied),
+        "tolerance": tolerance,
+        "geometry_residual": geometry_residual,
+        "field_residuals": {
+            "R": R_residual,
+            "z": z_residual,
+        },
+        "field_relative_changes": field_changes,
+    }
+    if applied:
+        return projected_R, projected_z, audit, reflection
+    return radial, vertical, audit, reflection
+
+
+def _project_periodic_field(
+    values: np.ndarray,
+    *,
+    reflection: np.ndarray,
+    parity: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project one endpoint-exclusive surface field onto a parity sector."""
+    data = np.asarray(values, dtype=np.float64)
+    reflected = data[:, reflection]
+    scale = np.maximum(
+        np.max(np.abs(data), axis=1),
+        np.finfo(np.float64).tiny,
+    )
+    residual = (
+        np.max(np.abs(data - parity * reflected), axis=1) / scale
+    )
+    projected = 0.5 * (data + parity * reflected)
+    relative_change = (
+        np.max(np.abs(projected - data), axis=1) / scale
+    )
+    return projected, residual, relative_change
+
+
+def _symmetrize_equilibrium_grid(
+    *,
+    Rgrid: np.ndarray,
+    zgrid: np.ndarray,
+    zaxis: float,
+    Br: np.ndarray,
+    Bz: np.ndarray,
+    Bphi: np.ndarray,
+    psi_field: Optional[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Return one internally consistent up-down projected equilibrium grid."""
+    radial_grid = np.asarray(Rgrid, dtype=np.float64)
+    vertical_grid = np.asarray(zgrid, dtype=np.float64)
+    reflected_z = 2.0 * float(zaxis) - vertical_grid
+    RR, ZZ_reflected = np.meshgrid(
+        radial_grid,
+        reflected_z,
+        indexing="ij",
+    )
+    # Only the intersection of the original and reflected rectangular domains
+    # is physically constrained. Keep exterior-only columns untouched; fitted
+    # closed surfaces must remain inside the common domain.
+    common_columns = (
+        (reflected_z >= vertical_grid[0])
+        & (reflected_z <= vertical_grid[-1])
+    )
+
+    def project(values: np.ndarray, parity: float) -> np.ndarray:
+        data = np.asarray(values, dtype=np.float64)
+        spline = RectBivariateSpline(
+            radial_grid,
+            vertical_grid,
+            data,
+            kx=min(3, radial_grid.size - 1),
+            ky=min(3, vertical_grid.size - 1),
+            s=0.0,
+        )
+        reflected = spline.ev(
+            RR.ravel(),
+            ZZ_reflected.ravel(),
+        ).reshape(data.shape)
+        output = data.copy()
+        output[:, common_columns] = 0.5 * (
+            data[:, common_columns]
+            + parity * reflected[:, common_columns]
+        )
+        return output
+
+    projected_psi = (
+        None if psi_field is None else project(psi_field, 1.0)
+    )
+    return (
+        project(Br, -1.0),
+        project(Bz, 1.0),
+        project(Bphi, 1.0),
+        projected_psi,
+    )
 
 
 def _validate_spectral_max_mode(spectral_max_mode: int) -> int:
@@ -250,22 +426,28 @@ def _compute_surface_coordinate_row(
         raise ValueError("Poloidal magnetic field vanishes on a retained surface.")
     B = np.sqrt(Bpol**2 + bphi_vals**2)
 
-    field_aligned_increment = (dR * br_vals + dz * bz_vals) / Bpol
+    br_segment = 0.5 * (br_vals + np.roll(br_vals, -1))
+    bz_segment = 0.5 * (bz_vals + np.roll(bz_vals, -1))
+    bpol_segment = np.hypot(br_segment, bz_segment)
+    field_aligned_increment = (dR * br_segment + dz * bz_segment) / bpol_segment
     orientation = float(np.sign(np.sum(field_aligned_increment)))
     if orientation == 0.0:
         raise ValueError("Unable to determine the poloidal surface orientation.")
     signed_dlp = orientation * dlp
 
-    Iprof = float(np.sum(Bpol * signed_dlp) / _TWO_PI)
+    Iprof = float(
+        np.sum(_centered_segment_integrals(Bpol, signed_dlp))
+        / _TWO_PI
+    )
     vertex_weight = 0.5 * (np.roll(dlp, 1) + dlp)
     Fprof = float(
         np.sum(radial * bphi_vals * vertex_weight)
         / np.sum(vertex_weight)
     )
+    toroidal_rate = 1.0 / (radial**2 * Bpol)
     qprof = float(
-        np.sum(
-            signed_dlp * Fprof / (radial**2 * Bpol)
-        )
+        Fprof
+        * np.sum(_centered_segment_integrals(toroidal_rate, signed_dlp))
         / _TWO_PI
     )
 
@@ -298,7 +480,11 @@ def _compute_surface_coordinate_row(
         if np.sign(jacobian[0]) != orientation:
             jacobian = -jacobian
 
-    theta_increment = signed_dlp / (jacobian * Bpol)
+    theta_rate = 1.0 / (jacobian * Bpol)
+    theta_increment = _centered_segment_integrals(
+        theta_rate,
+        signed_dlp,
+    )
     if np.any(theta_increment <= 0.0):
         raise ValueError("Magnetic angle is not monotonic around the surface.")
     theta_closed = np.concatenate(([0.0], np.cumsum(theta_increment)))
@@ -312,9 +498,16 @@ def _compute_surface_coordinate_row(
     theta_closed *= _TWO_PI / theta_span
     theta_closed[-1] = _TWO_PI
 
-    toroidal_integrand = signed_dlp / (radial**2 * Bpol)
     toroidal_primitive = np.concatenate(
-        ([0.0], np.cumsum(toroidal_integrand))
+        (
+            [0.0],
+            np.cumsum(
+                _centered_segment_integrals(
+                    toroidal_rate,
+                    signed_dlp,
+                )
+            ),
+        )
     )
     nu_closed = -Fprof * toroidal_primitive + qprof * theta_closed
     nu_closed[-1] = nu_closed[0]
@@ -324,19 +517,76 @@ def _compute_surface_coordinate_row(
         _TWO_PI,
         radial.size + 1,
     )
-    theta_direct = np.interp(thgeogrid, surface_parameter, theta_closed)
+    theta_correction = theta_closed - surface_parameter
+    theta_correction[-1] = theta_correction[0]
+    theta_direct = thgeogrid + CubicSpline(
+        surface_parameter,
+        theta_correction,
+        bc_type="periodic",
+    )(thgeogrid)
+    theta_direct[0] = 0.0
+    theta_direct[-1] = _TWO_PI
+    if np.any(np.diff(theta_direct) <= 0.0):
+        # The source primitive is strictly increasing, but an unconstrained
+        # periodic cubic can overshoot for a strongly varying yet valid
+        # registered Jacobian. Preserve the periodic cubic for smooth maps and
+        # fall back to a shape-preserving lifted-angle interpolation only when
+        # that overshoot occurs.
+        theta_direct = PchipInterpolator(
+            surface_parameter,
+            theta_closed,
+        )(thgeogrid)
+        theta_direct[0] = 0.0
+        theta_direct[-1] = _TWO_PI
+        if np.any(np.diff(theta_direct) <= 0.0):
+            raise ValueError(
+                "Magnetic-angle interpolation is not monotonic."
+            )
 
     closed_R = np.append(radial, radial[0])
     closed_z = np.append(vertical, vertical[0])
-    R_inverse = np.interp(thmaggrid, theta_closed, closed_R)
-    z_inverse = np.interp(thmaggrid, theta_closed, closed_z)
+    R_inverse = CubicSpline(
+        theta_closed,
+        closed_R,
+        bc_type="periodic",
+    )(thmaggrid)
+    z_inverse = CubicSpline(
+        theta_closed,
+        closed_z,
+        bc_type="periodic",
+    )(thmaggrid)
     closed_jacobian = np.append(jacobian, jacobian[0])
-    jacobian_direct = np.interp(
-        thgeogrid,
+    jacobian_sign = float(np.sign(closed_jacobian[0]))
+    log_abs_jacobian = np.log(np.abs(closed_jacobian))
+    with np.errstate(over="ignore", invalid="ignore"):
+        jacobian_direct = jacobian_sign * np.exp(CubicSpline(
+            surface_parameter,
+            log_abs_jacobian,
+            bc_type="periodic",
+        )(thgeogrid))
+    if (
+        np.any(~np.isfinite(jacobian_direct))
+        or np.any(np.sign(jacobian_direct) != jacobian_sign)
+    ):
+        jacobian_direct = jacobian_sign * np.exp(PchipInterpolator(
+            surface_parameter,
+            log_abs_jacobian,
+        )(thgeogrid))
+    if (
+        np.any(~np.isfinite(jacobian_direct))
+        or np.any(np.sign(jacobian_direct) != jacobian_sign)
+    ):
+        raise ValueError(
+            "Sign-preserving Jacobian interpolation produced invalid values."
+        )
+    nu_direct = CubicSpline(
         surface_parameter,
-        closed_jacobian,
-    )
-    nu_direct = np.interp(thgeogrid, surface_parameter, nu_closed)
+        nu_closed,
+        bc_type="periodic",
+    )(thgeogrid)
+    R_inverse[-1] = R_inverse[0]
+    z_inverse[-1] = z_inverse[0]
+    jacobian_direct[-1] = jacobian_direct[0]
     nu_direct[-1] = nu_direct[0]
 
     return (
@@ -370,6 +620,9 @@ def compute_magnetic_coordinates(
     n_theta_geom: Optional[int] = None,
     psi_field: Optional[np.ndarray] = None,
     flux_scale: Optional[float] = None,
+    enforce_up_down_symmetry: bool = False,
+    symmetry_tolerance: Optional[float] = None,
+    diagnostics: Optional[MutableMapping[str, Any]] = None,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -405,6 +658,16 @@ def compute_magnetic_coordinates(
     if ltheta < 4:
         raise ValueError("ltheta must be at least four.")
     spectral_max_mode = _validate_spectral_max_mode(spectral_max_mode)
+    if not isinstance(enforce_up_down_symmetry, (bool, np.bool_)):
+        raise TypeError("enforce_up_down_symmetry must be boolean.")
+    if symmetry_tolerance is not None:
+        symmetry_tolerance = float(symmetry_tolerance)
+        if not np.isfinite(symmetry_tolerance) or symmetry_tolerance <= 0.0:
+            raise ValueError("symmetry_tolerance must be finite and positive.")
+    if enforce_up_down_symmetry and symmetry_tolerance is None:
+        raise ValueError(
+            "symmetry_tolerance is required when up-down projection is enabled"
+        )
     if jacobian_func is None:
         jacobian_func = compute_boozer_jacobian
 
@@ -456,13 +719,18 @@ def compute_magnetic_coordinates(
     )
     raw_R, raw_z, raw_Br, raw_Bz, raw_Bphi = raw
 
-    if psi_field is not None:
+    input_psi_field = (
+        None
+        if psi_field is None
+        else np.asarray(psi_field, dtype=np.float64)
+    )
+    if input_psi_field is not None:
         if flux_scale is None:
             flux_scale = float(np.ptp(radial_flux))
         surfaces = build_flux_constrained_surfaces(
             Rgrid=radial_grid,
             zgrid=vertical_grid,
-            psi_field=np.asarray(psi_field, dtype=np.float64),
+            psi_field=input_psi_field,
             psigrid=radial_flux,
             R_raw=raw_R,
             z_raw=raw_z,
@@ -482,6 +750,173 @@ def compute_magnetic_coordinates(
         surface_Bz = raw_Bz
         surface_Bphi = raw_Bphi
 
+    (
+        _,
+        _,
+        symmetry_audit,
+        source_reflection,
+    ) = _up_down_surface_projection(
+        surface_R,
+        surface_z,
+        zaxis=zaxis,
+        applied=bool(enforce_up_down_symmetry),
+        tolerance=symmetry_tolerance,
+    )
+    source_field_splines = tuple(
+        RectBivariateSpline(
+            radial_grid,
+            vertical_grid,
+            values,
+            kx=min(3, radial_grid.size - 1),
+            ky=min(3, vertical_grid.size - 1),
+            s=0.0,
+        )
+        for values in (Br, Bz, Bphi)
+    )
+    source_field_parity = {
+        "Br": -1.0,
+        "Bz": 1.0,
+        "Bphi": 1.0,
+    }
+    for name, spline in zip(source_field_parity, source_field_splines):
+        source_values = spline.ev(
+            surface_R.ravel(),
+            surface_z.ravel(),
+        ).reshape(surface_R.shape)
+        _, residual, relative_change = _project_periodic_field(
+            source_values,
+            reflection=source_reflection,
+            parity=source_field_parity[name],
+        )
+        symmetry_audit["field_residuals"][name] = residual
+        symmetry_audit["field_relative_changes"][name] = relative_change
+    if enforce_up_down_symmetry:
+        source_field_residual = max(
+            float(np.max(np.asarray(values, dtype=np.float64)))
+            for name, values in symmetry_audit["field_residuals"].items()
+            if name in source_field_parity
+        )
+        if source_field_residual > float(symmetry_tolerance):
+            raise ValueError(
+                "magnetic field is not sufficiently up-down symmetric for "
+                "explicit projection: "
+                f"residual={source_field_residual:.3e}, "
+                f"tolerance={float(symmetry_tolerance):.3e}"
+            )
+
+    working_Br = Br
+    working_Bz = Bz
+    working_Bphi = Bphi
+    working_psi_field = input_psi_field
+    if enforce_up_down_symmetry:
+        (
+            working_Br,
+            working_Bz,
+            working_Bphi,
+            working_psi_field,
+        ) = _symmetrize_equilibrium_grid(
+            Rgrid=radial_grid,
+            zgrid=vertical_grid,
+            zaxis=zaxis,
+            Br=Br,
+            Bz=Bz,
+            Bphi=Bphi,
+            psi_field=input_psi_field,
+        )
+        projected_bz_seed = float(
+            RegularGridInterpolator(
+                (radial_grid, vertical_grid),
+                working_Bz,
+                bounds_error=False,
+                fill_value=None,
+            )((seeds[0], zaxis))
+        )
+        projected_integration_sign = np.sign(projected_bz_seed)
+        if not phiclockwise:
+            projected_integration_sign *= -1.0
+        if projected_integration_sign == 0.0:
+            raise ValueError(
+                "Cannot determine projected field-line orientation at the "
+                "first retained outboard flux-surface seed."
+            )
+        projected_raw = _trace_flux_surfaces(
+            Rgrid=radial_grid,
+            zgrid=vertical_grid,
+            br=working_Br,
+            bz=working_Bz,
+            bphi=working_Bphi,
+            R_at_psi=seeds,
+            zaxis=zaxis,
+            ntheta=n_theta_geom,
+            integration_sign=projected_integration_sign,
+        )
+        projected_raw_R, projected_raw_z, *_ = projected_raw
+        if working_psi_field is not None:
+            projected_surfaces = build_flux_constrained_surfaces(
+                Rgrid=radial_grid,
+                zgrid=vertical_grid,
+                psi_field=working_psi_field,
+                psigrid=radial_flux,
+                R_raw=projected_raw_R,
+                z_raw=projected_raw_z,
+                ntheta=n_theta_geom,
+                spectral_max_mode=spectral_max_mode,
+                flux_scale=float(flux_scale),
+                validate_nesting=True,
+                gauge_z=zaxis,
+            )
+            projected_surface_R = projected_surfaces.R
+            projected_surface_z = projected_surfaces.z
+        else:
+            projected_surface_R = projected_raw_R
+            projected_surface_z = projected_raw_z
+        (
+            surface_R,
+            surface_z,
+            final_symmetry_audit,
+            reflection,
+        ) = _up_down_surface_projection(
+            projected_surface_R,
+            projected_surface_z,
+            zaxis=zaxis,
+            applied=True,
+            tolerance=symmetry_tolerance,
+        )
+        symmetry_audit["projected_geometry_residual"] = (
+            final_symmetry_audit["geometry_residual"]
+        )
+        if working_psi_field is not None:
+            projected_psi_spline = RectBivariateSpline(
+                radial_grid,
+                vertical_grid,
+                working_psi_field,
+                kx=min(3, radial_grid.size - 1),
+                ky=min(3, vertical_grid.size - 1),
+                s=0.0,
+            )
+            projected_flux_residual = np.max(
+                np.abs(
+                    projected_psi_spline.ev(
+                        surface_R.ravel(),
+                        surface_z.ravel(),
+                    ).reshape(surface_R.shape)
+                    - radial_flux[:, None]
+                ),
+                axis=1,
+            ) / max(
+                abs(float(flux_scale)),
+                np.finfo(np.float64).tiny,
+            )
+            symmetry_audit["projected_flux_residual"] = (
+                projected_flux_residual
+            )
+            if float(np.max(projected_flux_residual)) > 1.0e-8:
+                raise ValueError(
+                    "up-down projected surfaces no longer match their "
+                    "projected physical-flux labels: "
+                    f"residual={float(np.max(projected_flux_residual)):.3e}"
+                )
+
     spline_orders = (
         min(3, radial_grid.size - 1),
         min(3, vertical_grid.size - 1),
@@ -495,8 +930,40 @@ def compute_magnetic_coordinates(
             ky=spline_orders[1],
             s=0.0,
         )
-        for values in (Br, Bz, Bphi)
+        for values in (working_Br, working_Bz, working_Bphi)
     )
+
+    if enforce_up_down_symmetry:
+        sampled_fields = [
+            spline.ev(surface_R.ravel(), surface_z.ravel()).reshape(
+                surface_R.shape
+            )
+            for spline in field_splines
+        ]
+        parity_by_name = {
+            "Br": -1.0,
+            "Bz": 1.0,
+            "Bphi": 1.0,
+        }
+        projected_fields: list[np.ndarray] = []
+        symmetry_audit["projected_field_residuals"] = {}
+        symmetry_audit["projected_field_relative_changes"] = {}
+        for name, values in zip(parity_by_name, sampled_fields):
+            projected, residual, relative_change = _project_periodic_field(
+                values,
+                reflection=reflection,
+                parity=parity_by_name[name],
+            )
+            projected_fields.append(projected)
+            symmetry_audit["projected_field_residuals"][name] = residual
+            symmetry_audit["projected_field_relative_changes"][name] = (
+                relative_change
+            )
+        surface_Br, surface_Bz, surface_Bphi = projected_fields
+    if diagnostics is not None:
+        diagnostics["up_down_symmetry"] = symmetry_audit
+        if working_psi_field is not None:
+            diagnostics["coordinate_psi_field"] = working_psi_field
 
     theta_surface = np.linspace(0.0, _TWO_PI, n_theta_geom, endpoint=False)
     theta_surface_closed = np.linspace(0.0, _TWO_PI, n_theta_geom + 1)
