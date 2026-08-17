@@ -4,6 +4,8 @@ from scipy.interpolate import RectBivariateSpline
 
 from pycocos.coordinates.compute_coordinates import (
     _compute_surface_coordinate_row,
+    _normalize_magnetic_angle_closure,
+    _trace_flux_surfaces,
     compute_magnetic_coordinates,
 )
 from pycocos.coordinates.field_lines import get_field_line, integrate_pol_field_line
@@ -65,6 +67,56 @@ def test_field_line_closes_after_full_turn_for_both_orientations(
     # ``npoints`` is a count, not the final zero-based index: slicing through
     # it includes the interpolated closure point and excludes unused storage.
     assert output[0][npoints] == 0.0
+
+
+@pytest.mark.parametrize("integration_sign", [-1, 1])
+def test_surface_tracing_refines_underresolved_near_axis_contour(
+    integration_sign,
+):
+    R, z, Br, Bz, Bphi = _circular_axisymmetric_field()
+    radius = 1.0e-3
+
+    traced = _trace_flux_surfaces(
+        Rgrid=R,
+        zgrid=z,
+        br=Br,
+        bz=Bz,
+        bphi=Bphi,
+        R_at_psi=np.array([R_AXIS + radius]),
+        zaxis=Z_AXIS,
+        ntheta=64,
+        integration_sign=integration_sign,
+        minimum_points=36,
+    )
+
+    R_surface, z_surface = traced[:2]
+    assert R_surface.shape == (1, 64)
+    assert z_surface.shape == (1, 64)
+    assert np.all(np.isfinite(R_surface))
+    assert np.all(np.isfinite(z_surface))
+    reconstructed_radius = np.hypot(
+        R_surface[0] - R_AXIS,
+        z_surface[0] - Z_AXIS,
+    )
+    np.testing.assert_allclose(
+        reconstructed_radius,
+        radius,
+        rtol=1.0e-2,
+        atol=2.0e-6,
+    )
+
+
+def test_magnetic_angle_closure_normalizes_only_small_quadrature_drift():
+    theta = np.linspace(0.0, 2.0 * np.pi * (1.0 + 5.0e-6), 65)
+    normalized = _normalize_magnetic_angle_closure(theta)
+
+    assert normalized[0] == 0.0
+    assert normalized[-1] == pytest.approx(2.0 * np.pi)
+    assert np.all(np.diff(normalized) > 0.0)
+
+    invalid = np.linspace(0.0, 2.0 * np.pi * (1.0 + 5.0e-4), 65)
+    with pytest.raises(ValueError, match="does not close"):
+        _normalize_magnetic_angle_closure(invalid)
 
 
 def _analytic_boozer_jacobian(context):

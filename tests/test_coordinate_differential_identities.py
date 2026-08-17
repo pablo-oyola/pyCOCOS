@@ -136,6 +136,63 @@ def test_builder_keeps_hidden_radial_support_private():
     )
 
 
+def test_hidden_radial_support_extends_rz_differential_domain():
+    core_indices = np.arange(3, 14, dtype=np.int64)
+    magnetic = _builder_result(core_indices=core_indices)
+
+    R_grid = np.asarray(magnetic.coords.R, dtype=np.float64)
+    z_grid = np.asarray(magnetic.coords.z, dtype=np.float64)
+    RR, ZZ = np.meshgrid(R_grid, z_grid, indexing="ij")
+    cylindrical = np.stack((RR - _R_AXIS, ZZ - _Z_AXIS), axis=-1)
+    polar = np.einsum("ij,...j->...i", _SHAPE_INVERSE, cylindrical)
+    psi_Rz = np.linalg.norm(polar, axis=-1)
+
+    support_min = magnetic.coords.attrs["radial_support_psi_min"]
+    support_max = magnetic.coords.attrs["radial_support_psi_max"]
+    core_min = magnetic.coords.attrs["radial_core_psi_min"]
+    core_max = magnetic.coords.attrs["radial_core_psi_max"]
+    expected_support = (
+        np.isfinite(psi_Rz)
+        & (psi_Rz >= support_min)
+        & (psi_Rz <= support_max)
+    )
+    expected_core = (
+        np.isfinite(psi_Rz)
+        & (psi_Rz >= core_min)
+        & (psi_Rz <= core_max)
+    )
+    actual = np.asarray(
+        magnetic.coords["inside_coordinate_domain"],
+        dtype=bool,
+    )
+
+    np.testing.assert_array_equal(actual, expected_support)
+    assert np.any(actual & ~expected_core)
+    assert np.all(
+        np.isfinite(
+            np.asarray(magnetic.deriv["dTheta_dr"])[actual]
+        )
+    )
+    for first, second in (
+        ("psi", "theta"),
+        ("psi", "zeta"),
+        ("theta", "theta"),
+    ):
+        projected = magnetic.metric(
+            first,
+            second,
+            tensor="contravariant",
+            return_in="magnetic_coordinates",
+        )
+        assert np.all(np.isfinite(np.asarray(projected)[[0, -1]]))
+    projected_jacobian = magnetic.jacobian(
+        return_in="magnetic_coordinates",
+    )
+    assert np.all(
+        np.isfinite(np.asarray(projected_jacobian)[[0, -1]])
+    )
+
+
 def _public_basis_matrices(magnetic):
     radius = np.broadcast_to(
         magnetic.coords.R.values[:, None],

@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.interpolate import RectBivariateSpline
 
 from pycocos.coordinates.surfaces import build_flux_constrained_surfaces
 
@@ -116,3 +117,55 @@ def test_flux_surface_builder_uses_one_horizontal_gauge_for_asymmetric_surfaces(
     np.testing.assert_allclose(surfaces.z[:, 0], 0.0, atol=2.0e-10)
     assert np.all(surfaces.R[:, 0] > 2.0)
     assert np.all(surfaces.normalized_flux_residual < 1.0e-10)
+
+
+def test_reflection_paired_surfaces_preserve_parity_and_flux_labels():
+    Rgrid, zgrid, psi_field = _asymmetric_flux_grid()
+    psigrid = np.linspace(0.04, 0.49, 7)
+    R_raw, z_raw = _raw_asymmetric_surfaces(psigrid)
+    reflection_z = 0.037
+
+    surfaces = build_flux_constrained_surfaces(
+        Rgrid=Rgrid,
+        zgrid=zgrid,
+        psi_field=psi_field,
+        psigrid=psigrid,
+        R_raw=R_raw,
+        z_raw=z_raw,
+        ntheta=192,
+        spectral_max_mode=10,
+        flux_scale=1.0,
+        gauge_z=reflection_z,
+        reflection_z=reflection_z,
+    )
+
+    reflection = np.concatenate(
+        ([0], np.arange(surfaces.theta.size - 1, 0, -1))
+    )
+    scale = max(float(np.ptp(surfaces.R)), float(np.ptp(surfaces.z)))
+    np.testing.assert_allclose(
+        surfaces.R,
+        surfaces.R[:, reflection],
+        rtol=0.0,
+        atol=8.0 * np.finfo(np.float64).eps * scale,
+    )
+    np.testing.assert_allclose(
+        surfaces.z - reflection_z,
+        -(surfaces.z[:, reflection] - reflection_z),
+        rtol=0.0,
+        atol=8.0 * np.finfo(np.float64).eps * scale,
+    )
+
+    spline = RectBivariateSpline(Rgrid, zgrid, psi_field, s=0.0)
+    reflected_z = 2.0 * reflection_z - surfaces.z
+    paired_flux = 0.5 * (
+        spline.ev(surfaces.R.ravel(), surfaces.z.ravel())
+        + spline.ev(surfaces.R.ravel(), reflected_z.ravel())
+    ).reshape(surfaces.R.shape)
+    np.testing.assert_allclose(
+        paired_flux,
+        np.broadcast_to(psigrid[:, None], paired_flux.shape),
+        rtol=0.0,
+        atol=1.0e-10,
+    )
+    assert np.all(surfaces.normalized_flux_residual <= 1.0e-10)

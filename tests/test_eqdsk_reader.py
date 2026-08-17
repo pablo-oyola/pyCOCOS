@@ -1,4 +1,5 @@
 import inspect
+import warnings
 import numpy as np
 import pytest
 import xarray as xr
@@ -356,6 +357,7 @@ def _make_fake_eq_instance(
     tmp_path,
     cocos_input=1,
     cocos_internal=1,
+    include_boundary=True,
 ):
     nx = 64
     ny = 64
@@ -417,6 +419,9 @@ def _make_fake_eq_instance(
         "flux_normalization_input": input_descriptor.flux_normalization,
         "flux_normalization_internal": internal_descriptor.flux_normalization,
     }
+    if not include_boundary:
+        fake_gdata.pop("r_bdy")
+        fake_gdata.pop("z_bdy")
     fake_bfield = {
         "br": np.zeros((nx, ny)),
         "bz": np.zeros((nx, ny)),
@@ -442,7 +447,46 @@ def test_eqdsk_class_init_boundary_property_regression(monkeypatch, tmp_path):
     eq = _make_fake_eq_instance(monkeypatch, tmp_path)
     assert "R" in eq.boundary
     assert "z" in eq.boundary
-    assert eq.boundary.R.size > 10
+    assert eq.boundary.attrs["source"] == "supplied"
+    np.testing.assert_array_equal(eq.boundary.R, eq._gdata["r_bdy"])
+    np.testing.assert_array_equal(eq.boundary.z, eq._gdata["z_bdy"])
+    np.testing.assert_array_equal(eq.geometry.R_boundary, eq._gdata["r_bdy"])
+    np.testing.assert_array_equal(eq.geometry.z_boundary, eq._gdata["z_bdy"])
+
+
+def test_eqdsk_supplied_boundary_bypasses_private_flux_contour_selection(
+    monkeypatch,
+    tmp_path,
+):
+    def _unexpected_contour_reconstruction(*_args, **_kwargs):
+        raise AssertionError(
+            "EQDSK construction must not replace its supplied plasma boundary."
+        )
+
+    monkeypatch.setattr(
+        equilibrium_mod.equilibrium,
+        "rhopol2rz",
+        _unexpected_contour_reconstruction,
+    )
+
+    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+
+    assert eq.boundary.attrs["source"] == "supplied"
+    assert float(eq.geometry.R_boundary.max()) > float(eq.geometry.R_axis)
+
+
+def test_eqdsk_without_supplied_boundary_retains_flux_contour_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    eq = _make_fake_eq_instance(
+        monkeypatch,
+        tmp_path,
+        include_boundary=False,
+    )
+
+    assert eq.boundary.attrs["source"] == "rhopol_contour"
+    assert float(eq.geometry.R_boundary.max()) > float(eq.geometry.R_axis)
 
 
 def test_eqdsk_class_preserves_input_and_internal_convention_metadata(
@@ -1062,6 +1106,26 @@ def test_compute_coordinates_rhopol_window_maps_to_expected_psi(monkeypatch, tmp
     eq = _make_fake_eq_instance(monkeypatch, tmp_path)
     captured = {}
 
+    real_spline = equilibrium_mod.RectBivariateSpline
+
+    class _LengthOneScalarSpline:
+        def __init__(self, *args, **kwargs):
+            self._spline = real_spline(*args, **kwargs)
+
+        def ev(self, *args, **kwargs):
+            value = np.atleast_1d(self._spline.ev(*args, **kwargs))
+            captured["axis_spline_shape"] = value.shape
+            return value
+
+        def __call__(self, *args, **kwargs):
+            return self._spline(*args, **kwargs)
+
+    monkeypatch.setattr(
+        equilibrium_mod,
+        "RectBivariateSpline",
+        _LengthOneScalarSpline,
+    )
+
     def _fake_compute_magnetic_coordinates(*args, **kwargs):
         psigrid = np.asarray(kwargs["psigrid"], dtype=float)
         ltheta = int(kwargs["ltheta"])
@@ -1100,15 +1164,22 @@ def test_compute_coordinates_rhopol_window_maps_to_expected_psi(monkeypatch, tmp
 
     monkeypatch.setattr(eq, "_build_magnetic_coordinates_dataset", _capture_builder)
 
-    out = eq.compute_coordinates(
-        coordinate_system="boozer",
-        lpsi=9,
-        ltheta=24,
-        rhopol_min=0.2,
-        rhopol_max=0.8,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "error",
+            message="Conversion of an array with ndim > 0 to a scalar",
+            category=DeprecationWarning,
+        )
+        out = eq.compute_coordinates(
+            coordinate_system="boozer",
+            lpsi=9,
+            ltheta=24,
+            rhopol_min=0.2,
+            rhopol_max=0.8,
+        )
 
     assert getattr(out, "dummy", False)
+    assert captured["axis_spline_shape"] == (1,)
     psi_axis = float(eq.geometry.attrs["psi_ax"])
     psi_edge = float(eq.geometry.attrs["psi_bdy"])
     expected_psi_start = psi_axis + (0.2**2) * (psi_edge - psi_axis)
@@ -1144,6 +1215,50 @@ def test_radial_support_preserves_endpoint_inclusive_core():
 
     np.testing.assert_array_equal(support, core)
     np.testing.assert_array_equal(core_indices, np.arange(core.size))
+
+
+@pytest.mark.parametrize("orientation", [1.0, -1.0])
+def test_radial_support_skips_flux_below_interpolated_axis_floor(orientation):
+    normalized_floor = equilibrium_mod._normalized_resolvable_axis_flux(  # noqa: SLF001
+        orientation * 4.6565e-6,
+        psi_axis=0.0,
+        psi_boundary=orientation,
+    )
+    assert normalized_floor == pytest.approx(4.6565e-6)
+
+    core = np.linspace(0.005, 0.995, 511)
+    support, core_indices = equilibrium_mod._extend_radial_support(  # noqa: SLF001
+        core,
+        lower_bound=np.sqrt(normalized_floor),
+        upper_bound=1.0,
+        guard_surfaces=3,
+    )
+
+    assert support[0] > np.sqrt(normalized_floor)
+    assert support[0] < core[0]
+    np.testing.assert_array_equal(support[core_indices], core)
+
+
+@pytest.mark.parametrize("orientation", [1.0, -1.0])
+def test_outboard_midplane_seed_inverse_is_bounded_and_monotone(orientation):
+    radial = np.linspace(1.7, 2.0, 7)
+    normalized_flux = np.array(
+        [4.0e-6, 0.03, 0.025, 0.18, 0.42, 0.72, 1.05]
+    )
+    targets = np.array([0.003, 0.1, 0.5, 0.9])
+
+    seeds = equilibrium_mod._outboard_midplane_seeds(  # noqa: SLF001
+        radial,
+        orientation * normalized_flux,
+        targets,
+        psi_axis=0.0,
+        psi_boundary=orientation,
+    )
+
+    assert np.all(np.isfinite(seeds))
+    assert np.all(np.diff(seeds) > 0.0)
+    assert seeds[0] >= radial[0]
+    assert seeds[-1] <= radial[-1]
 
 
 def test_compute_coordinates_keeps_descending_physical_flux_spline_sorted(
