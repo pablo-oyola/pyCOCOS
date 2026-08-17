@@ -16,8 +16,19 @@ import numpy as np
 from scipy.interpolate import RectBivariateSpline, make_interp_spline
 from scipy.optimize import brentq
 
+try:
+    from numba import config as _numba_config
+
+    from .coordinate_map_numba import axisymmetric_differential_kernel
+except ImportError:  # pragma: no cover - NumPy fallback supports minimal installs.
+    _numba_config = None
+    axisymmetric_differential_kernel = None
+
 
 _TWO_PI = 2.0 * np.pi
+# The vectorized NumPy algebra is faster for ordinary interactive batches;
+# amortize parallel dispatch and JIT costs only for materialization-scale grids.
+_COMPILED_DIFFERENTIAL_MINIMUM_POINTS = 100_000
 
 
 def _endpoint_exclusive_periodic_data(
@@ -76,6 +87,20 @@ def _endpoint_exclusive_periodic_data(
 
 
 @dataclass(frozen=True)
+class CoordinateTangents:
+    """Mapped values and the direct cylindrical coordinate basis only.
+
+    ``direct[..., component, coordinate]`` uses orthonormal cylindrical
+    components ``(e_R, e_phi, e_z)`` and coordinate columns
+    ``(psi, theta, zeta)``.  No inverse, metric tensor, or determinant is
+    constructed.
+    """
+
+    values: Mapping[str, np.ndarray]
+    direct: np.ndarray
+
+
+@dataclass(frozen=True)
 class CoordinateDifferentials:
     """Coordinate values, basis matrices, metrics, and Jacobian."""
 
@@ -98,6 +123,7 @@ class SpectralCoordinateMap:
     """
 
     field_names = ("R", "z", "nu")
+    state_format_version = 1
 
     def __init__(
         self,
@@ -142,6 +168,15 @@ class SpectralCoordinateMap:
             if not np.all(np.isfinite(array)):
                 raise ValueError(f"{name} contains non-finite values.")
 
+        # Keep the normalized constructor inputs, rather than SciPy spline
+        # objects, as the durable representation used by ``to_state``.  This
+        # is intentionally captured before an optional symmetry projection so
+        # restoring the map also restores the same projection audit.
+        self._state_input_fields = {
+            name: np.array(array, dtype=np.float64, copy=True)
+            for name, array in arrays.items()
+        }
+
         if not isinstance(enforce_up_down_symmetry, (bool, np.bool_)):
             raise TypeError("enforce_up_down_symmetry must be boolean.")
         if symmetry_tolerance is not None:
@@ -156,6 +191,10 @@ class SpectralCoordinateMap:
             raise ValueError(
                 "R_axis and z_axis must either both be supplied or both be omitted."
             )
+        self._state_R_axis = None if R_axis is None else float(R_axis)
+        self._state_z_axis = None if z_axis is None else float(z_axis)
+        self._state_enforce_up_down_symmetry = bool(enforce_up_down_symmetry)
+        self._state_symmetry_tolerance = symmetry_tolerance
         if R_axis is None:
             center_R = np.mean(arrays["R"], axis=1)
             center_z = np.mean(arrays["z"], axis=1)
@@ -293,16 +332,28 @@ class SpectralCoordinateMap:
         radial_degree = 5 if radial.size >= 6 else (3 if radial.size >= 4 else 1)
         self.radial_degree = radial_degree
         self._splines: Dict[str, object] = {}
+        spectral_coefficients = []
 
         for name, array in arrays.items():
             coefficients = np.fft.fft(array, axis=1) / ntheta
             coefficients = coefficients[:, retained]
+            spectral_coefficients.append(coefficients)
             self._splines[name] = make_interp_spline(
                 radial_parameter,
                 coefficients,
                 k=radial_degree,
                 axis=0,
             )
+        # Internal coordinate operations almost always need R, z, and nu
+        # together.  A single vector-valued spline lets those operations share
+        # radial interval lookup and basis evaluation; the individual splines
+        # above retain the inexpensive public single-field path.
+        self._field_spline = make_interp_spline(
+            radial_parameter,
+            np.stack(spectral_coefficients, axis=1),
+            k=radial_degree,
+            axis=0,
+        )
 
         constraint_arrays = (
             flux_constraint_R,
@@ -428,9 +479,203 @@ class SpectralCoordinateMap:
                 "validation_bounded_root_fallback_iterations": validation[
                     "bounded_root_fallback_iterations"
                 ],
+                "validation_newton_point_count": validation[
+                    "newton_point_count"
+                ],
+                "validation_newton_active_evaluations": validation[
+                    "newton_active_evaluations"
+                ],
+                "validation_newton_full_batch_equivalent_evaluations": validation[
+                    "newton_full_batch_equivalent_evaluations"
+                ],
+                "validation_newton_evaluation_rounds": validation[
+                    "newton_evaluation_rounds"
+                ],
                 "radial_grid_size": int(self.flux_constraint_R.size),
                 "vertical_grid_size": int(self.flux_constraint_z.size),
             }
+
+    def to_state(self) -> Dict[str, np.ndarray | np.generic]:
+        """Return a deterministic, non-pickle serialization state.
+
+        Every value is a NumPy scalar or numeric array, so the returned
+        mapping can be passed directly to ``numpy.savez`` and restored with
+        ``allow_pickle=False``.  SciPy spline objects and transient Newton
+        caches are deliberately excluded; ``from_state`` rebuilds them from
+        the normalized constructor data.
+        """
+        has_flux_normalization = self.psi_axis is not None
+        has_fixed_axis = self._state_R_axis is not None
+        has_symmetry_tolerance = self._state_symmetry_tolerance is not None
+        has_flux_constraint = self._flux_constraint_spline is not None
+        return {
+            "state_format_version": np.int64(self.state_format_version),
+            "psi": np.array(self.psi, dtype=np.float64, copy=True),
+            "theta": np.array(self.theta, dtype=np.float64, copy=True),
+            "R": self._state_input_fields["R"].copy(),
+            "z": self._state_input_fields["z"].copy(),
+            "nu": self._state_input_fields["nu"].copy(),
+            "max_mode": np.int64(self.max_mode),
+            "has_flux_normalization": np.bool_(has_flux_normalization),
+            "psi_axis": np.float64(
+                self.psi_axis if has_flux_normalization else np.nan
+            ),
+            "psi_boundary": np.float64(
+                self.psi_boundary if has_flux_normalization else np.nan
+            ),
+            "has_fixed_axis": np.bool_(has_fixed_axis),
+            "R_axis": np.float64(
+                self._state_R_axis if has_fixed_axis else np.nan
+            ),
+            "z_axis": np.float64(
+                self._state_z_axis if has_fixed_axis else np.nan
+            ),
+            "enforce_up_down_symmetry": np.bool_(
+                self._state_enforce_up_down_symmetry
+            ),
+            "has_symmetry_tolerance": np.bool_(has_symmetry_tolerance),
+            "symmetry_tolerance": np.float64(
+                self._state_symmetry_tolerance
+                if has_symmetry_tolerance
+                else np.nan
+            ),
+            "has_flux_constraint": np.bool_(has_flux_constraint),
+            "flux_constraint_R": (
+                self.flux_constraint_R.copy()
+                if has_flux_constraint
+                else np.empty(0, dtype=np.float64)
+            ),
+            "flux_constraint_z": (
+                self.flux_constraint_z.copy()
+                if has_flux_constraint
+                else np.empty(0, dtype=np.float64)
+            ),
+            "flux_constraint_psi": (
+                self.flux_constraint_psi.copy()
+                if has_flux_constraint
+                else np.empty((0, 0), dtype=np.float64)
+            ),
+            "flux_constraint_tolerance": np.float64(
+                self.flux_constraint_tolerance
+            ),
+            "flux_constraint_max_iterations": np.int64(
+                self.flux_constraint_max_iterations
+            ),
+            "flux_constraint_minimum_radial_derivative": np.float64(
+                self.flux_constraint_minimum_radial_derivative
+            ),
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: Mapping[str, object],
+    ) -> "SpectralCoordinateMap":
+        """Rebuild a coordinate map from :meth:`to_state` output."""
+        required = {
+            "state_format_version",
+            "psi",
+            "theta",
+            "R",
+            "z",
+            "nu",
+            "max_mode",
+            "has_flux_normalization",
+            "psi_axis",
+            "psi_boundary",
+            "has_fixed_axis",
+            "R_axis",
+            "z_axis",
+            "enforce_up_down_symmetry",
+            "has_symmetry_tolerance",
+            "symmetry_tolerance",
+            "has_flux_constraint",
+            "flux_constraint_R",
+            "flux_constraint_z",
+            "flux_constraint_psi",
+            "flux_constraint_tolerance",
+            "flux_constraint_max_iterations",
+            "flux_constraint_minimum_radial_derivative",
+        }
+        missing = sorted(required.difference(state.keys()))
+        if missing:
+            raise ValueError(
+                "Coordinate-map state is missing required entries: "
+                + ", ".join(missing)
+            )
+
+        def scalar(name: str):
+            value = np.asarray(state[name])
+            if value.ndim != 0:
+                raise ValueError(
+                    f"Coordinate-map state entry '{name}' must be scalar."
+                )
+            return value.item()
+
+        version = int(scalar("state_format_version"))
+        if version != cls.state_format_version:
+            raise ValueError(
+                "Unsupported coordinate-map state format version "
+                f"{version}; expected {cls.state_format_version}."
+            )
+        has_flux_normalization = bool(scalar("has_flux_normalization"))
+        has_fixed_axis = bool(scalar("has_fixed_axis"))
+        has_symmetry_tolerance = bool(scalar("has_symmetry_tolerance"))
+        has_flux_constraint = bool(scalar("has_flux_constraint"))
+
+        constraint_R = (
+            np.asarray(state["flux_constraint_R"], dtype=np.float64).copy()
+            if has_flux_constraint
+            else None
+        )
+        constraint_z = (
+            np.asarray(state["flux_constraint_z"], dtype=np.float64).copy()
+            if has_flux_constraint
+            else None
+        )
+        constraint_psi = (
+            np.asarray(state["flux_constraint_psi"], dtype=np.float64).copy()
+            if has_flux_constraint
+            else None
+        )
+        return cls(
+            psi=np.asarray(state["psi"], dtype=np.float64).copy(),
+            theta=np.asarray(state["theta"], dtype=np.float64).copy(),
+            R=np.asarray(state["R"], dtype=np.float64).copy(),
+            z=np.asarray(state["z"], dtype=np.float64).copy(),
+            nu=np.asarray(state["nu"], dtype=np.float64).copy(),
+            max_mode=int(scalar("max_mode")),
+            psi_axis=(
+                float(scalar("psi_axis")) if has_flux_normalization else None
+            ),
+            psi_boundary=(
+                float(scalar("psi_boundary"))
+                if has_flux_normalization
+                else None
+            ),
+            R_axis=float(scalar("R_axis")) if has_fixed_axis else None,
+            z_axis=float(scalar("z_axis")) if has_fixed_axis else None,
+            enforce_up_down_symmetry=bool(
+                scalar("enforce_up_down_symmetry")
+            ),
+            symmetry_tolerance=(
+                float(scalar("symmetry_tolerance"))
+                if has_symmetry_tolerance
+                else None
+            ),
+            flux_constraint_R=constraint_R,
+            flux_constraint_z=constraint_z,
+            flux_constraint_psi=constraint_psi,
+            flux_constraint_tolerance=float(
+                scalar("flux_constraint_tolerance")
+            ),
+            flux_constraint_max_iterations=int(
+                scalar("flux_constraint_max_iterations")
+            ),
+            flux_constraint_minimum_radial_derivative=float(
+                scalar("flux_constraint_minimum_radial_derivative")
+            ),
+        )
 
     def _radial_parameter(
         self,
@@ -516,16 +761,105 @@ class SpectralCoordinateMap:
             result = np.real(result)
         return np.asarray(result, dtype=np.float64).reshape(radial.shape)
 
-    def _constraint_geometry(
+    def _base_field_bundle(
         self,
-        sigma: np.ndarray,
+        psi: np.ndarray,
         theta: np.ndarray,
+        *,
+        derivative_orders: tuple[tuple[int, int], ...] = ((0, 0),),
+    ) -> Dict[tuple[int, int], Dict[str, np.ndarray]]:
+        """Evaluate all mapped fields while sharing spline/Fourier work.
+
+        ``derivative_orders`` contains ``(dpsi, dtheta)`` pairs.  The return
+        value is indexed first by that pair and then by ``R``, ``z``, or
+        ``nu``.  Coordinate assembly uses this fused path; ``evaluate`` keeps
+        the individual-field path so isolated public evaluations do not pay
+        for fields they did not request.
+        """
+        if not derivative_orders:
+            return {}
+        unique_orders = tuple(dict.fromkeys(derivative_orders))
+        for dpsi, dtheta in unique_orders:
+            if dpsi < 0 or dtheta < 0:
+                raise ValueError("Derivative orders must be non-negative.")
+            if dpsi > 1 and self.psi_axis is not None:
+                raise ValueError(
+                    "Only first physical-flux derivatives are implemented for "
+                    "the sqrt-normalized radial fit coordinate."
+                )
+
+        radial, angle = np.broadcast_arrays(
+            np.asarray(psi, dtype=np.float64),
+            np.asarray(theta, dtype=np.float64),
+        )
+        flat_psi = radial.ravel()
+        flat_theta = angle.ravel()
+        radial_parameter, parameter_psi = self._radial_parameter(flat_psi)
+        if any(order[0] > 0 for order in unique_orders) and np.any(
+            ~np.isfinite(parameter_psi)
+        ):
+            raise ValueError(
+                "Physical-flux derivatives of the coordinate map are "
+                "singular at the magnetic axis."
+            )
+
+        phase = np.exp(
+            1j
+            * np.outer(
+                flat_theta - self.theta_origin,
+                self.modes,
+            )
+        )
+        coefficient_cache: Dict[int, np.ndarray] = {}
+        output: Dict[tuple[int, int], Dict[str, np.ndarray]] = {}
+        for dpsi, dtheta in unique_orders:
+            coefficients = coefficient_cache.get(dpsi)
+            if coefficients is None:
+                coefficients = self._field_spline(radial_parameter, nu=dpsi)
+                if dpsi == 1:
+                    coefficients = coefficients * parameter_psi[:, None, None]
+                coefficient_cache[dpsi] = coefficients
+            angular_phase = phase * ((1j * self.modes) ** dtheta)[None, :]
+            result = np.einsum(
+                "nfm,nm->nf",
+                coefficients,
+                angular_phase,
+                optimize=True,
+            )
+            result = np.real_if_close(result, tol=1000)
+            if np.iscomplexobj(result):
+                imaginary_scale = np.max(np.abs(np.imag(result)), axis=0)
+                real_scale = np.maximum(
+                    1.0,
+                    np.max(np.abs(np.real(result)), axis=0),
+                )
+                bad = imaginary_scale > 1.0e-10 * real_scale
+                if np.any(bad):
+                    fields = ", ".join(
+                        name
+                        for name, invalid in zip(self.field_names, bad)
+                        if invalid
+                    )
+                    raise ValueError(
+                        "Fused spectral evaluation acquired a non-real "
+                        f"component for {fields}."
+                    )
+                result = np.real(result)
+            real_result = np.asarray(result, dtype=np.float64)
+            output[(dpsi, dtheta)] = {
+                name: real_result[:, field_index].reshape(radial.shape)
+                for field_index, name in enumerate(self.field_names)
+            }
+        return output
+
+    def _physical_flux_geometry(
+        self,
+        R: np.ndarray,
+        z: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return base geometry and the physical-flux gradient on it."""
+        """Evaluate authoritative flux and its gradient on mapped geometry."""
         if self._flux_constraint_spline is None:
             raise RuntimeError("No authoritative flux constraint is configured.")
-        R = self._base_evaluate("R", sigma, theta)
-        z = self._base_evaluate("z", sigma, theta)
         radial_tolerance = 64.0 * np.finfo(np.float64).eps * max(
             1.0,
             float(np.max(np.abs(self.flux_constraint_R))),
@@ -544,31 +878,42 @@ class SpectralCoordinateMap:
                 "Flux-constrained coordinate-map geometry leaves its "
                 "authoritative R-z grid."
             )
-        R = np.clip(
+        clipped_R = np.clip(
             R,
             self.flux_constraint_R[0],
             self.flux_constraint_R[-1],
         )
-        z = np.clip(
+        clipped_z = np.clip(
             z,
             self.flux_constraint_z[0],
             self.flux_constraint_z[-1],
         )
         physical_psi = self._flux_constraint_spline.ev(
-            R.ravel(),
-            z.ravel(),
+            clipped_R.ravel(),
+            clipped_z.ravel(),
         ).reshape(R.shape)
         physical_psi_R = self._flux_constraint_spline.ev(
-            R.ravel(),
-            z.ravel(),
+            clipped_R.ravel(),
+            clipped_z.ravel(),
             dx=1,
         ).reshape(R.shape)
         physical_psi_z = self._flux_constraint_spline.ev(
-            R.ravel(),
-            z.ravel(),
+            clipped_R.ravel(),
+            clipped_z.ravel(),
             dy=1,
         ).reshape(R.shape)
-        return R, z, physical_psi, physical_psi_R, physical_psi_z
+        return clipped_R, clipped_z, physical_psi, physical_psi_R, physical_psi_z
+
+    def _constraint_geometry(
+        self,
+        sigma: np.ndarray,
+        theta: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return base geometry and the physical-flux gradient on it."""
+        if self._flux_constraint_spline is None:
+            raise RuntimeError("No authoritative flux constraint is configured.")
+        base = self._base_field_bundle(sigma, theta)[(0, 0)]
+        return self._physical_flux_geometry(base["R"], base["z"])
 
     def _solve_flux_constraint(
         self,
@@ -590,54 +935,101 @@ class SpectralCoordinateMap:
             and np.array_equal(target, cached[0])
             and np.array_equal(angle, cached[1])
         ):
+            self.last_flux_constraint_solve_audit = dict(
+                cached[3],
+                cache_hit=1,
+            )
             return cached[2], dict(cached[3])
-        sigma = target.copy()
+
+        flat_target = target.reshape(-1)
+        flat_angle = angle.reshape(-1)
+        flat_sigma = target.copy().reshape(-1)
+        flat_error = np.full(flat_sigma.shape, np.inf, dtype=np.float64)
+        flat_F_sigma = np.full(flat_sigma.shape, np.nan, dtype=np.float64)
+        active = np.ones(flat_sigma.shape, dtype=bool)
+        tolerance_absolute = (
+            self.flux_constraint_tolerance * self.flux_constraint_scale
+        )
         normalized_residual = np.inf
         minimum_abs_F_sigma = np.inf
         iterations = 0
         converged = False
-        for iterations in range(1, self.flux_constraint_max_iterations + 1):
+        newton_active_evaluations = 0
+        newton_evaluation_rounds = 0
+        newton_peak_active_points = int(flat_sigma.size)
+
+        def evaluate_active(
+            flat_indices: np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray]:
+            nonlocal newton_active_evaluations, newton_evaluation_rounds
+            active_sigma = flat_sigma[flat_indices]
+            active_angle = flat_angle[flat_indices]
             (
-                R,
-                z,
+                _,
+                _,
                 physical_psi,
                 physical_psi_R,
                 physical_psi_z,
-            ) = self._constraint_geometry(sigma, angle)
-            R_sigma = self._base_evaluate("R", sigma, angle, dpsi=1)
-            z_sigma = self._base_evaluate("z", sigma, angle, dpsi=1)
-            F_sigma = (
-                physical_psi_R * R_sigma
-                + physical_psi_z * z_sigma
+            ) = self._constraint_geometry(active_sigma, active_angle)
+            radial_bundle = self._base_field_bundle(
+                active_sigma,
+                active_angle,
+                derivative_orders=((1, 0),),
+            )[(1, 0)]
+            F_sigma_active = (
+                physical_psi_R * radial_bundle["R"]
+                + physical_psi_z * radial_bundle["z"]
             )
-            if not np.all(np.isfinite(F_sigma)):
+            if not np.all(np.isfinite(F_sigma_active)):
                 raise ValueError(
                     "Flux-constrained radial relabelling produced a non-finite "
                     "physical-flux derivative."
                 )
-            minimum_abs_F_sigma = float(np.min(np.abs(F_sigma)))
+            minimum_active = float(np.min(np.abs(F_sigma_active)))
             if (
-                minimum_abs_F_sigma
+                minimum_active
                 <= self.flux_constraint_minimum_radial_derivative
             ):
                 raise ValueError(
                     "Flux-constrained radial relabelling is singular: "
-                    f"min|F_sigma|={minimum_abs_F_sigma:.3e}."
+                    f"min|F_sigma|={minimum_active:.3e}."
                 )
-            error = physical_psi - target
-            normalized_residual = float(
-                np.max(np.abs(error)) / self.flux_constraint_scale
-            )
-            if normalized_residual <= self.flux_constraint_tolerance:
+            newton_active_evaluations += int(flat_indices.size)
+            newton_evaluation_rounds += 1
+            return physical_psi - flat_target[flat_indices], F_sigma_active
+
+        for iterations in range(1, self.flux_constraint_max_iterations + 1):
+            active_indices = np.flatnonzero(active)
+            if active_indices.size == 0:
                 converged = True
                 break
-            update = error / F_sigma
-            if not np.all(np.isfinite(update)):
+            error_active, F_sigma_active = evaluate_active(active_indices)
+            flat_error[active_indices] = error_active
+            flat_F_sigma[active_indices] = F_sigma_active
+            converged_active = np.abs(error_active) <= tolerance_absolute
+            active[active_indices[converged_active]] = False
+            remaining_indices = active_indices[~converged_active]
+            if remaining_indices.size == 0:
+                converged = True
+                break
+            update_active = (
+                error_active[~converged_active]
+                / F_sigma_active[~converged_active]
+            )
+            if not np.all(np.isfinite(update_active)):
                 raise ValueError(
                     "Flux-constrained radial relabelling produced a non-finite "
                     "Newton update."
                 )
-            sigma = sigma - update
+            flat_sigma[remaining_indices] -= update_active
+
+        sigma = flat_sigma.reshape(target.shape)
+        error = flat_error.reshape(target.shape)
+        F_sigma = flat_F_sigma.reshape(target.shape)
+        minimum_abs_F_sigma = float(np.min(np.abs(flat_F_sigma)))
+        normalized_residual = float(
+            np.max(np.abs(flat_error)) / self.flux_constraint_scale
+        )
         bounded_root_fallback_count = 0
         bounded_root_fallback_iterations = 0
         if not converged:
@@ -648,15 +1040,7 @@ class SpectralCoordinateMap:
             # regular and monotone.  Resolve only those points with a bracketed
             # scalar solve; the same authoritative flux spline and unchanged
             # residual tolerance remain the acceptance criterion.
-            failed = (
-                np.abs(error)
-                > self.flux_constraint_tolerance * self.flux_constraint_scale
-            )
-            flat_sigma = sigma.reshape(-1)
-            flat_target = target.reshape(-1)
-            flat_angle = angle.reshape(-1)
-            flat_error = error.reshape(-1)
-            flat_F_sigma = F_sigma.reshape(-1)
+            failed = active.reshape(target.shape)
             radial_span = max(
                 float(np.ptp(self.psi)),
                 self.flux_constraint_scale,
@@ -732,22 +1116,15 @@ class SpectralCoordinateMap:
                 bounded_root_fallback_count += 1
                 bounded_root_fallback_iterations += root_iterations
 
-            (
-                _,
-                _,
-                physical_psi,
-                physical_psi_R,
-                physical_psi_z,
-            ) = self._constraint_geometry(sigma, angle)
-            R_sigma = self._base_evaluate("R", sigma, angle, dpsi=1)
-            z_sigma = self._base_evaluate("z", sigma, angle, dpsi=1)
-            F_sigma = physical_psi_R * R_sigma + physical_psi_z * z_sigma
-            if not np.all(np.isfinite(F_sigma)):
-                raise ValueError(
-                    "Flux-constrained bounded roots produced a non-finite "
-                    "physical-flux derivative."
-                )
-            minimum_abs_F_sigma = float(np.min(np.abs(F_sigma)))
+            failed_indices = np.flatnonzero(failed.reshape(-1))
+            final_error, final_F_sigma = evaluate_active(failed_indices)
+            flat_error[failed_indices] = final_error
+            flat_F_sigma[failed_indices] = final_F_sigma
+            active[failed_indices] = np.abs(final_error) > tolerance_absolute
+            sigma = flat_sigma.reshape(target.shape)
+            error = flat_error.reshape(target.shape)
+            F_sigma = flat_F_sigma.reshape(target.shape)
+            minimum_abs_F_sigma = float(np.min(np.abs(flat_F_sigma)))
             if (
                 minimum_abs_F_sigma
                 <= self.flux_constraint_minimum_radial_derivative
@@ -757,8 +1134,7 @@ class SpectralCoordinateMap:
                     f"min|F_sigma|={minimum_abs_F_sigma:.3e}."
                 )
             normalized_residual = float(
-                np.max(np.abs(physical_psi - target))
-                / self.flux_constraint_scale
+                np.max(np.abs(flat_error)) / self.flux_constraint_scale
             )
             if normalized_residual > self.flux_constraint_tolerance:
                 raise ValueError(
@@ -776,6 +1152,14 @@ class SpectralCoordinateMap:
             "bounded_root_fallback_iterations": (
                 bounded_root_fallback_iterations
             ),
+            "newton_point_count": int(flat_sigma.size),
+            "newton_active_evaluations": int(newton_active_evaluations),
+            "newton_full_batch_equivalent_evaluations": int(
+                flat_sigma.size * max(newton_evaluation_rounds, 1)
+            ),
+            "newton_evaluation_rounds": int(newton_evaluation_rounds),
+            "newton_peak_active_points": newton_peak_active_points,
+            "newton_final_active_points": int(np.count_nonzero(active)),
         }
         cache_target = target.copy()
         cache_angle = angle.copy()
@@ -789,6 +1173,7 @@ class SpectralCoordinateMap:
             cache_sigma,
             dict(audit),
         )
+        self.last_flux_constraint_solve_audit = dict(audit, cache_hit=0)
         return cache_sigma, audit
 
     def _constraint_chain_rule(
@@ -797,17 +1182,35 @@ class SpectralCoordinateMap:
         theta: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return d(sigma)/d(psi) and d(sigma)/d(theta)|psi."""
+        bundle = self._base_field_bundle(
+            sigma,
+            theta,
+            derivative_orders=((0, 0), (1, 0), (0, 1)),
+        )
+        return self._constraint_chain_rule_from_base(
+            bundle[(0, 0)],
+            bundle[(1, 0)],
+            bundle[(0, 1)],
+        )
+
+    def _constraint_chain_rule_from_base(
+        self,
+        values: Mapping[str, np.ndarray],
+        sigma_derivatives: Mapping[str, np.ndarray],
+        theta_derivatives: Mapping[str, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Apply the exact flux-constraint chain rule to a fused base bundle."""
         (
             _,
             _,
             _,
             physical_psi_R,
             physical_psi_z,
-        ) = self._constraint_geometry(sigma, theta)
-        R_sigma = self._base_evaluate("R", sigma, theta, dpsi=1)
-        z_sigma = self._base_evaluate("z", sigma, theta, dpsi=1)
-        R_theta = self._base_evaluate("R", sigma, theta, dtheta=1)
-        z_theta = self._base_evaluate("z", sigma, theta, dtheta=1)
+        ) = self._physical_flux_geometry(values["R"], values["z"])
+        R_sigma = sigma_derivatives["R"]
+        z_sigma = sigma_derivatives["z"]
+        R_theta = theta_derivatives["R"]
+        z_theta = theta_derivatives["z"]
         F_sigma = physical_psi_R * R_sigma + physical_psi_z * z_sigma
         minimum = float(np.min(np.abs(F_sigma)))
         if (
@@ -848,28 +1251,15 @@ class SpectralCoordinateMap:
             np.asarray(psi, dtype=np.float64),
             np.asarray(theta, dtype=np.float64),
         )
-        sigma, _ = self._solve_flux_constraint(radial, angle)
         if dpsi == 0 and dtheta == 0:
+            sigma, _ = self._solve_flux_constraint(radial, angle)
             return self._base_evaluate(field, sigma, angle)
-        sigma_psi, sigma_theta = self._constraint_chain_rule(
-            sigma,
-            angle,
-        )
-        field_sigma = self._base_evaluate(
-            field,
-            sigma,
-            angle,
-            dpsi=1,
+        _, psi_derivatives, theta_derivatives = (
+            self._constrained_field_bundle(radial, angle)
         )
         if dpsi == 1:
-            return field_sigma * sigma_psi
-        field_theta = self._base_evaluate(
-            field,
-            sigma,
-            angle,
-            dtheta=1,
-        )
-        return field_theta + field_sigma * sigma_theta
+            return psi_derivatives[field]
+        return theta_derivatives[field]
 
     def values(
         self,
@@ -883,14 +1273,8 @@ class SpectralCoordinateMap:
                 np.asarray(theta, dtype=np.float64),
             )
             sigma, _ = self._solve_flux_constraint(radial, angle)
-            return {
-                name: self._base_evaluate(name, sigma, angle)
-                for name in self.field_names
-            }
-        return {
-            name: self.evaluate(name, psi, theta)
-            for name in self.field_names
-        }
+            return self._base_field_bundle(sigma, angle)[(0, 0)]
+        return self._base_field_bundle(psi, theta)[(0, 0)]
 
     def _constrained_field_bundle(
         self,
@@ -907,29 +1291,75 @@ class SpectralCoordinateMap:
             np.asarray(theta, dtype=np.float64),
         )
         sigma, _ = self._solve_flux_constraint(radial, angle)
-        sigma_psi, sigma_theta = self._constraint_chain_rule(sigma, angle)
-        values: Dict[str, np.ndarray] = {}
+        base = self._base_field_bundle(
+            sigma,
+            angle,
+            derivative_orders=((0, 0), (1, 0), (0, 1)),
+        )
+        values = base[(0, 0)]
+        sigma_derivatives = base[(1, 0)]
+        base_theta_derivatives = base[(0, 1)]
+        sigma_psi, sigma_theta = self._constraint_chain_rule_from_base(
+            values,
+            sigma_derivatives,
+            base_theta_derivatives,
+        )
         psi_derivatives: Dict[str, np.ndarray] = {}
         theta_derivatives: Dict[str, np.ndarray] = {}
         for name in self.field_names:
-            values[name] = self._base_evaluate(name, sigma, angle)
-            field_sigma = self._base_evaluate(
-                name,
-                sigma,
-                angle,
-                dpsi=1,
-            )
-            field_theta = self._base_evaluate(
-                name,
-                sigma,
-                angle,
-                dtheta=1,
-            )
+            field_sigma = sigma_derivatives[name]
+            field_theta = base_theta_derivatives[name]
             psi_derivatives[name] = field_sigma * sigma_psi
             theta_derivatives[name] = (
                 field_theta + field_sigma * sigma_theta
             )
         return values, psi_derivatives, theta_derivatives
+
+    def _first_field_derivatives(
+        self,
+        psi: np.ndarray,
+        theta: np.ndarray,
+    ) -> tuple[
+        Dict[str, np.ndarray],
+        Dict[str, np.ndarray],
+        Dict[str, np.ndarray],
+    ]:
+        """Evaluate values and first map derivatives through one shared path."""
+        if self._flux_constraint_spline is not None:
+            return self._constrained_field_bundle(psi, theta)
+        base = self._base_field_bundle(
+            psi,
+            theta,
+            derivative_orders=((0, 0), (1, 0), (0, 1)),
+        )
+        return base[(0, 0)], base[(1, 0)], base[(0, 1)]
+
+    def direct_differentials(
+        self,
+        psi: np.ndarray,
+        theta: np.ndarray,
+    ) -> CoordinateTangents:
+        """Evaluate mapped values and coordinate tangents, but no reciprocals.
+
+        This is the low-allocation path for callers that will modify or invert
+        the direct basis themselves.  It is numerically identical to the
+        ``values`` and ``direct`` members returned by :meth:`differentials`.
+        """
+        values, psi_derivatives, theta_derivatives = (
+            self._first_field_derivatives(psi, theta)
+        )
+        R = values["R"]
+        direct = np.zeros(R.shape + (3, 3), dtype=np.float64)
+        # Rows are orthonormal cylindrical components (e_R, e_phi, e_z);
+        # columns are the coordinate tangents (psi, theta, zeta).
+        direct[..., 0, 0] = psi_derivatives["R"]
+        direct[..., 0, 1] = theta_derivatives["R"]
+        direct[..., 1, 0] = -R * psi_derivatives["nu"]
+        direct[..., 1, 1] = -R * theta_derivatives["nu"]
+        direct[..., 1, 2] = R
+        direct[..., 2, 0] = psi_derivatives["z"]
+        direct[..., 2, 1] = theta_derivatives["z"]
+        return CoordinateTangents(values=values, direct=direct)
 
     def differentials(
         self,
@@ -937,28 +1367,56 @@ class SpectralCoordinateMap:
         theta: np.ndarray,
     ) -> CoordinateDifferentials:
         """Evaluate the coordinate basis and reciprocal metric tensors."""
-        if self._flux_constraint_spline is None:
-            values = self.values(psi, theta)
-            R = values["R"]
-            R_psi = self.evaluate("R", psi, theta, dpsi=1)
-            R_theta = self.evaluate("R", psi, theta, dtheta=1)
-            z_psi = self.evaluate("z", psi, theta, dpsi=1)
-            z_theta = self.evaluate("z", psi, theta, dtheta=1)
-            nu_psi = self.evaluate("nu", psi, theta, dpsi=1)
-            nu_theta = self.evaluate("nu", psi, theta, dtheta=1)
-        else:
-            values, psi_derivatives, theta_derivatives = (
-                self._constrained_field_bundle(psi, theta)
-            )
-            R = values["R"]
-            R_psi = psi_derivatives["R"]
-            R_theta = theta_derivatives["R"]
-            z_psi = psi_derivatives["z"]
-            z_theta = theta_derivatives["z"]
-            nu_psi = psi_derivatives["nu"]
-            nu_theta = theta_derivatives["nu"]
+        values, psi_derivatives, theta_derivatives = (
+            self._first_field_derivatives(psi, theta)
+        )
+        R = values["R"]
+        R_psi = psi_derivatives["R"]
+        R_theta = theta_derivatives["R"]
+        z_psi = psi_derivatives["z"]
+        z_theta = theta_derivatives["z"]
+        nu_psi = psi_derivatives["nu"]
+        nu_theta = theta_derivatives["nu"]
 
         shape = R.shape
+        use_compiled_differentials = (
+            axisymmetric_differential_kernel is not None
+            and _numba_config is not None
+            and not _numba_config.DISABLE_JIT
+            and R.size >= _COMPILED_DIFFERENTIAL_MINIMUM_POINTS
+        )
+        if use_compiled_differentials:
+            compiled = axisymmetric_differential_kernel(
+                np.ascontiguousarray(R.reshape(-1)),
+                np.ascontiguousarray(R_psi.reshape(-1)),
+                np.ascontiguousarray(R_theta.reshape(-1)),
+                np.ascontiguousarray(z_psi.reshape(-1)),
+                np.ascontiguousarray(z_theta.reshape(-1)),
+                np.ascontiguousarray(nu_psi.reshape(-1)),
+                np.ascontiguousarray(nu_theta.reshape(-1)),
+            )
+            direct = compiled[0].reshape(shape + (3, 3))
+            inverse = compiled[1].reshape(shape + (3, 3))
+            metric_covariant = compiled[2].reshape(shape + (3, 3))
+            metric_contravariant = compiled[3].reshape(shape + (3, 3))
+            jacobian = compiled[4].reshape(shape)
+            if np.any(~np.isfinite(jacobian)) or np.any(
+                np.isclose(jacobian, 0.0)
+            ):
+                raise ValueError(
+                    "Coordinate map has a singular or non-finite Jacobian."
+                )
+            self.last_differential_backend = "numba"
+            return CoordinateDifferentials(
+                values=values,
+                direct=direct,
+                inverse=inverse,
+                metric_covariant=metric_covariant,
+                metric_contravariant=metric_contravariant,
+                jacobian=jacobian,
+            )
+
+        self.last_differential_backend = "numpy"
         direct = np.zeros(shape + (3, 3), dtype=np.float64)
         # Rows are orthonormal cylindrical components (e_R, e_phi, e_z);
         # columns are the coordinate tangents (psi, theta, zeta).
@@ -970,15 +1428,90 @@ class SpectralCoordinateMap:
         direct[..., 2, 0] = z_psi
         direct[..., 2, 1] = z_theta
 
-        jacobian = np.linalg.det(direct)
+        # For an axisymmetric map the direct matrix has the exact sparsity
+        #
+        #   [[R_psi,       R_theta,       0],
+        #    [-R nu_psi,  -R nu_theta,    R],
+        #    [z_psi,       z_theta,       0]].
+        #
+        # Exploit it explicitly instead of launching one dense 3x3 determinant
+        # and inverse per sample.  Besides being faster, these expressions
+        # ensure the inverse and both metrics come from the same poloidal
+        # determinant rather than independent factorizations.
+        poloidal_determinant = R_psi * z_theta - R_theta * z_psi
+        jacobian = -R * poloidal_determinant
         if np.any(~np.isfinite(jacobian)) or np.any(np.isclose(jacobian, 0.0)):
             raise ValueError("Coordinate map has a singular or non-finite Jacobian.")
-        inverse = np.linalg.inv(direct)
-        metric_covariant = np.einsum("...ai,...aj->...ij", direct, direct)
-        metric_contravariant = np.einsum(
-            "...ia,...ja->...ij",
-            inverse,
-            inverse,
+
+        reciprocal_poloidal = 1.0 / poloidal_determinant
+        inverse = np.zeros_like(direct)
+        inverse[..., 0, 0] = z_theta * reciprocal_poloidal
+        inverse[..., 0, 2] = -R_theta * reciprocal_poloidal
+        inverse[..., 1, 0] = -z_psi * reciprocal_poloidal
+        inverse[..., 1, 2] = R_psi * reciprocal_poloidal
+        inverse[..., 2, 0] = (
+            nu_psi * z_theta - nu_theta * z_psi
+        ) * reciprocal_poloidal
+        inverse[..., 2, 1] = 1.0 / R
+        inverse[..., 2, 2] = (
+            nu_theta * R_psi - nu_psi * R_theta
+        ) * reciprocal_poloidal
+
+        R_squared = R * R
+        metric_covariant = np.empty_like(direct)
+        metric_covariant[..., 0, 0] = (
+            R_psi * R_psi + z_psi * z_psi + R_squared * nu_psi * nu_psi
+        )
+        metric_covariant[..., 0, 1] = (
+            R_psi * R_theta
+            + z_psi * z_theta
+            + R_squared * nu_psi * nu_theta
+        )
+        metric_covariant[..., 1, 0] = metric_covariant[..., 0, 1]
+        metric_covariant[..., 0, 2] = -R_squared * nu_psi
+        metric_covariant[..., 2, 0] = metric_covariant[..., 0, 2]
+        metric_covariant[..., 1, 1] = (
+            R_theta * R_theta
+            + z_theta * z_theta
+            + R_squared * nu_theta * nu_theta
+        )
+        metric_covariant[..., 1, 2] = -R_squared * nu_theta
+        metric_covariant[..., 2, 1] = metric_covariant[..., 1, 2]
+        metric_covariant[..., 2, 2] = R_squared
+
+        metric_contravariant = np.empty_like(direct)
+        gradient_psi_R = inverse[..., 0, 0]
+        gradient_psi_z = inverse[..., 0, 2]
+        gradient_theta_R = inverse[..., 1, 0]
+        gradient_theta_z = inverse[..., 1, 2]
+        gradient_zeta_R = inverse[..., 2, 0]
+        gradient_zeta_phi = inverse[..., 2, 1]
+        gradient_zeta_z = inverse[..., 2, 2]
+        metric_contravariant[..., 0, 0] = (
+            gradient_psi_R**2 + gradient_psi_z**2
+        )
+        metric_contravariant[..., 0, 1] = (
+            gradient_psi_R * gradient_theta_R
+            + gradient_psi_z * gradient_theta_z
+        )
+        metric_contravariant[..., 1, 0] = metric_contravariant[..., 0, 1]
+        metric_contravariant[..., 0, 2] = (
+            gradient_psi_R * gradient_zeta_R
+            + gradient_psi_z * gradient_zeta_z
+        )
+        metric_contravariant[..., 2, 0] = metric_contravariant[..., 0, 2]
+        metric_contravariant[..., 1, 1] = (
+            gradient_theta_R**2 + gradient_theta_z**2
+        )
+        metric_contravariant[..., 1, 2] = (
+            gradient_theta_R * gradient_zeta_R
+            + gradient_theta_z * gradient_zeta_z
+        )
+        metric_contravariant[..., 2, 1] = metric_contravariant[..., 1, 2]
+        metric_contravariant[..., 2, 2] = (
+            gradient_zeta_R**2
+            + gradient_zeta_phi**2
+            + gradient_zeta_z**2
         )
         return CoordinateDifferentials(
             values=values,
@@ -1016,44 +1549,83 @@ class SpectralCoordinateMap:
         )
         angle = np.mod(angle - self.theta_origin, _TWO_PI) + self.theta_origin
         maximum_step = 0.25 * np.pi
+        theta_newton_active_evaluations = 0
+        theta_newton_full_batch_equivalent_evaluations = 0
+        theta_newton_evaluation_rounds = 0
+        theta_newton_passes = 0
+        coarse_reseed_count = 0
+        bounded_root_fallback_count = 0
 
         def newton_pass(
             current: np.ndarray,
             iteration_limit: int = max_iterations,
+            initial_converged: Optional[np.ndarray] = None,
+            initial_update: Optional[np.ndarray] = None,
         ):
-            converged = np.zeros(current.shape, dtype=bool)
-            update = np.full(current.shape, np.inf, dtype=np.float64)
+            nonlocal theta_newton_active_evaluations
+            nonlocal theta_newton_full_batch_equivalent_evaluations
+            nonlocal theta_newton_evaluation_rounds, theta_newton_passes
+            current_shape = current.shape
+            current_flat = np.array(current, copy=True).reshape(-1)
+            if initial_converged is None:
+                converged_flat = np.zeros(current_flat.shape, dtype=bool)
+            else:
+                converged_flat = np.asarray(
+                    initial_converged,
+                    dtype=bool,
+                ).copy().reshape(-1)
+            if initial_update is None:
+                update_flat = np.full(
+                    current_flat.shape,
+                    np.inf,
+                    dtype=np.float64,
+                )
+            else:
+                update_flat = np.asarray(
+                    initial_update,
+                    dtype=np.float64,
+                ).copy().reshape(-1)
+            radial_flat = radial.reshape(-1)
+            target_R_flat = target_R.reshape(-1)
+            target_z_flat = target_z.reshape(-1)
+            pass_point_count = int(np.count_nonzero(~converged_flat))
+            theta_newton_passes += 1
             for _ in range(iteration_limit):
+                active_indices = np.flatnonzero(~converged_flat)
+                if active_indices.size == 0:
+                    break
+                active_radial = radial_flat[active_indices]
+                active_angle = current_flat[active_indices]
                 if self._flux_constraint_spline is None:
-                    mapped_R = self.evaluate("R", radial, current)
-                    mapped_z = self.evaluate("z", radial, current)
-                    R_theta = self.evaluate(
-                        "R", radial, current, dtheta=1
+                    base = self._base_field_bundle(
+                        active_radial,
+                        active_angle,
+                        derivative_orders=((0, 0), (0, 1), (0, 2)),
                     )
-                    z_theta = self.evaluate(
-                        "z", radial, current, dtheta=1
-                    )
+                    mapped_R = base[(0, 0)]["R"]
+                    mapped_z = base[(0, 0)]["z"]
+                    R_theta = base[(0, 1)]["R"]
+                    z_theta = base[(0, 1)]["z"]
                 else:
                     (
                         constrained_values,
                         _,
                         constrained_theta_derivatives,
-                    ) = self._constrained_field_bundle(radial, current)
+                    ) = self._constrained_field_bundle(
+                        active_radial,
+                        active_angle,
+                    )
                     mapped_R = constrained_values["R"]
                     mapped_z = constrained_values["z"]
                     R_theta = constrained_theta_derivatives["R"]
                     z_theta = constrained_theta_derivatives["z"]
 
-                delta_R = mapped_R - target_R
-                delta_z = mapped_z - target_z
+                delta_R = mapped_R - target_R_flat[active_indices]
+                delta_z = mapped_z - target_z_flat[active_indices]
                 residual = delta_R * R_theta + delta_z * z_theta
                 if self._flux_constraint_spline is None:
-                    R_theta2 = self.evaluate(
-                        "R", radial, current, dtheta=2
-                    )
-                    z_theta2 = self.evaluate(
-                        "z", radial, current, dtheta=2
-                    )
+                    R_theta2 = base[(0, 2)]["R"]
+                    z_theta2 = base[(0, 2)]["z"]
                     derivative = (
                         R_theta**2
                         + z_theta**2
@@ -1071,22 +1643,36 @@ class SpectralCoordinateMap:
                     & np.isfinite(derivative)
                     & (derivative > 1.0e-15)
                 )
-                update = np.full(current.shape, np.inf, dtype=np.float64)
-                update[safe] = residual[safe] / derivative[safe]
-                step = np.zeros(current.shape, dtype=np.float64)
+                active_update = np.full(
+                    active_indices.shape,
+                    np.inf,
+                    dtype=np.float64,
+                )
+                active_update[safe] = residual[safe] / derivative[safe]
+                step = np.zeros(active_indices.shape, dtype=np.float64)
                 step[safe] = np.clip(
-                    update[safe],
+                    active_update[safe],
                     -maximum_step,
                     maximum_step,
                 )
-                current = np.mod(
-                    current - step - self.theta_origin,
+                current_flat[active_indices] = np.mod(
+                    active_angle - step - self.theta_origin,
                     _TWO_PI,
                 ) + self.theta_origin
-                converged = safe & (np.abs(update) <= tolerance)
-                if np.all(converged):
+                update_flat[active_indices] = active_update
+                converged_flat[active_indices] = safe & (
+                    np.abs(active_update) <= tolerance
+                )
+                theta_newton_active_evaluations += int(active_indices.size)
+                theta_newton_full_batch_equivalent_evaluations += pass_point_count
+                theta_newton_evaluation_rounds += 1
+                if np.all(converged_flat):
                     break
-            return current, converged, update
+            return (
+                current_flat.reshape(current_shape),
+                converged_flat.reshape(current_shape),
+                update_flat.reshape(current_shape),
+            )
 
         angle, converged, update = newton_pass(angle)
 
@@ -1096,6 +1682,7 @@ class SpectralCoordinateMap:
             # failed points from a bounded full-turn distance scan, then
             # retain the same high-accuracy Newton convergence criterion.
             failed = np.flatnonzero(~converged.ravel())
+            coarse_reseed_count = int(failed.size)
             coarse_theta = self.theta_origin + np.linspace(
                 0.0,
                 _TWO_PI,
@@ -1106,16 +1693,12 @@ class SpectralCoordinateMap:
             target_R_failed = target_R.ravel()[failed]
             target_z_failed = target_z.ravel()[failed]
             if self._flux_constraint_spline is None:
-                mapped_R = self.evaluate(
-                    "R",
+                coarse_values = self._base_field_bundle(
                     radial_failed[:, None],
                     coarse_theta[None, :],
-                )
-                mapped_z = self.evaluate(
-                    "z",
-                    radial_failed[:, None],
-                    coarse_theta[None, :],
-                )
+                )[(0, 0)]
+                mapped_R = coarse_values["R"]
+                mapped_z = coarse_values["z"]
             else:
                 # Newton above follows the exact-flux constrained geometry.
                 # Seed its retry from that same map; choosing a basin on the
@@ -1135,7 +1718,11 @@ class SpectralCoordinateMap:
             angle_flat = angle.ravel()
             angle_flat[failed] = coarse_theta[best]
             angle = angle_flat.reshape(angle.shape)
-            angle, converged, update = newton_pass(angle)
+            angle, converged, update = newton_pass(
+                angle,
+                initial_converged=converged,
+                initial_update=update,
+            )
 
         if not np.all(converged):
             # Gauss--Newton may still miss a narrow basin on strongly shaped
@@ -1152,12 +1739,12 @@ class SpectralCoordinateMap:
             target_R_failed = target_R.ravel()[failed]
             target_z_failed = target_z.ravel()[failed]
             if self._flux_constraint_spline is None:
-                mapped_R = self.evaluate(
-                    "R", radial_failed[:, None], coarse_theta[None, :]
-                )
-                mapped_z = self.evaluate(
-                    "z", radial_failed[:, None], coarse_theta[None, :]
-                )
+                coarse_values = self._base_field_bundle(
+                    radial_failed[:, None],
+                    coarse_theta[None, :],
+                )[(0, 0)]
+                mapped_R = coarse_values["R"]
+                mapped_z = coarse_values["z"]
             else:
                 constrained_values, _, _ = self._constrained_field_bundle(
                     radial_failed[:, None], coarse_theta[None, :]
@@ -1180,18 +1767,15 @@ class SpectralCoordinateMap:
 
                 def scalar_stationarity(angle_value: float) -> tuple[float, float]:
                     if self._flux_constraint_spline is None:
-                        mapped_R_value = self.evaluate(
-                            "R", radial_value, angle_value
+                        scalar_bundle = self._base_field_bundle(
+                            np.asarray(radial_value),
+                            np.asarray(angle_value),
+                            derivative_orders=((0, 0), (0, 1)),
                         )
-                        mapped_z_value = self.evaluate(
-                            "z", radial_value, angle_value
-                        )
-                        R_theta_value = self.evaluate(
-                            "R", radial_value, angle_value, dtheta=1
-                        )
-                        z_theta_value = self.evaluate(
-                            "z", radial_value, angle_value, dtheta=1
-                        )
+                        mapped_R_value = scalar_bundle[(0, 0)]["R"]
+                        mapped_z_value = scalar_bundle[(0, 0)]["z"]
+                        R_theta_value = scalar_bundle[(0, 1)]["R"]
+                        z_theta_value = scalar_bundle[(0, 1)]["z"]
                     else:
                         constrained_value, _, constrained_theta = (
                             self._constrained_field_bundle(
@@ -1257,6 +1841,7 @@ class SpectralCoordinateMap:
                 converged_flat[flat_index] = (
                     root_safe and abs(root_update) <= tolerance
                 )
+                bounded_root_fallback_count += 1
             angle = np.mod(
                 angle_flat.reshape(angle.shape) - self.theta_origin,
                 _TWO_PI,
@@ -1264,6 +1849,22 @@ class SpectralCoordinateMap:
             converged = converged_flat.reshape(converged.shape)
             update = update_flat.reshape(update.shape)
 
+        self.theta_inversion_audit = {
+            "point_count": int(radial.size),
+            "tolerance": float(tolerance),
+            "max_iterations": int(max_iterations),
+            "newton_passes": int(theta_newton_passes),
+            "newton_evaluation_rounds": int(theta_newton_evaluation_rounds),
+            "newton_active_evaluations": int(theta_newton_active_evaluations),
+            "newton_full_batch_equivalent_evaluations": int(
+                theta_newton_full_batch_equivalent_evaluations
+            ),
+            "coarse_reseed_count": int(coarse_reseed_count),
+            "bounded_root_fallback_count": int(
+                bounded_root_fallback_count
+            ),
+            "failed_count": int(np.count_nonzero(~converged)),
+        }
         if not np.all(converged):
             worst = float(np.max(np.abs(update[~converged])))
             raise ValueError(

@@ -2,6 +2,9 @@ import numpy as np
 import pytest
 
 from pycocos.coordinates.coordinate_map import SpectralCoordinateMap
+from pycocos.coordinates.coordinate_map_numba import (
+    axisymmetric_differential_kernel,
+)
 
 
 def _asymmetric_map():
@@ -681,3 +684,262 @@ def test_omitted_flux_constraint_preserves_default_map_bitwise():
             )
     assert baseline.flux_constraint_audit == {"applied": False}
     assert explicit_default.flux_constraint_audit == {"applied": False}
+
+
+def test_fused_field_bundle_matches_individual_spectral_evaluations():
+    psi, theta, R, z, nu = _asymmetric_map()
+    coordinate_map = SpectralCoordinateMap(
+        psi=psi,
+        theta=theta,
+        R=R,
+        z=z,
+        nu=nu,
+    )
+    radial = np.linspace(0.07, 0.77, 31)
+    angle = np.linspace(0.11, 6.01, 31)
+    orders = ((0, 0), (1, 0), (0, 1), (0, 2))
+
+    bundle = coordinate_map._base_field_bundle(
+        radial,
+        angle,
+        derivative_orders=orders,
+    )
+
+    for dpsi, dtheta in orders:
+        for field in coordinate_map.field_names:
+            np.testing.assert_allclose(
+                bundle[(dpsi, dtheta)][field],
+                coordinate_map._base_evaluate(
+                    field,
+                    radial,
+                    angle,
+                    dpsi=dpsi,
+                    dtheta=dtheta,
+                ),
+                rtol=2.0e-14,
+                atol=2.0e-14,
+            )
+
+
+def test_axisymmetric_differential_algebra_matches_dense_reference():
+    psi, theta, R, z, nu = _asymmetric_map()
+    coordinate_map = SpectralCoordinateMap(
+        psi=psi,
+        theta=theta,
+        R=R,
+        z=z,
+        nu=nu,
+    )
+    radial, angle = np.meshgrid(
+        psi[2:-2],
+        theta[3:-4:11],
+        indexing="ij",
+    )
+    differential = coordinate_map.differentials(radial, angle)
+
+    dense_inverse = np.linalg.inv(differential.direct)
+    dense_covariant = np.einsum(
+        "...ai,...aj->...ij",
+        differential.direct,
+        differential.direct,
+    )
+    dense_contravariant = np.einsum(
+        "...ia,...ja->...ij",
+        dense_inverse,
+        dense_inverse,
+    )
+    np.testing.assert_allclose(
+        differential.jacobian,
+        np.linalg.det(differential.direct),
+        rtol=3.0e-15,
+        atol=3.0e-15,
+    )
+    np.testing.assert_allclose(
+        differential.inverse,
+        dense_inverse,
+        rtol=3.0e-14,
+        atol=3.0e-14,
+    )
+    np.testing.assert_allclose(
+        differential.metric_covariant,
+        dense_covariant,
+        rtol=3.0e-15,
+        atol=3.0e-15,
+    )
+    np.testing.assert_allclose(
+        differential.metric_contravariant,
+        dense_contravariant,
+        rtol=5.0e-14,
+        atol=5.0e-14,
+    )
+
+
+@pytest.mark.parametrize("constrained", [False, True])
+def test_direct_differentials_match_full_coordinate_tangents(constrained):
+    if constrained:
+        coordinate_map, *_ = _flux_constrained_elliptical_map()
+    else:
+        psi, theta, R, z, nu = _asymmetric_map()
+        coordinate_map = SpectralCoordinateMap(
+            psi=psi,
+            theta=theta,
+            R=R,
+            z=z,
+            nu=nu,
+        )
+    radial = np.linspace(0.07, 0.76, 47)
+    angle = np.linspace(0.13, 6.03, 47)
+
+    tangents = coordinate_map.direct_differentials(radial, angle)
+    full = coordinate_map.differentials(radial, angle)
+
+    assert not hasattr(tangents, "inverse")
+    assert not hasattr(tangents, "metric_covariant")
+    assert not hasattr(tangents, "jacobian")
+    for field in coordinate_map.field_names:
+        np.testing.assert_allclose(
+            tangents.values[field],
+            full.values[field],
+            rtol=2.0e-14,
+            atol=2.0e-14,
+        )
+    np.testing.assert_allclose(
+        tangents.direct,
+        full.direct,
+        rtol=2.0e-14,
+        atol=2.0e-14,
+    )
+
+
+def test_compiled_axisymmetric_kernel_matches_numpy_path():
+    psi, theta, R, z, nu = _asymmetric_map()
+    coordinate_map = SpectralCoordinateMap(
+        psi=psi,
+        theta=theta,
+        R=R,
+        z=z,
+        nu=nu,
+    )
+    radial, angle = np.meshgrid(
+        psi[2:-2],
+        theta[3:-4:11],
+        indexing="ij",
+    )
+    reference = coordinate_map.differentials(radial, angle)
+    radius = reference.values["R"].reshape(-1)
+    direct = reference.direct.reshape((-1, 3, 3))
+
+    compiled = axisymmetric_differential_kernel(
+        radius,
+        direct[:, 0, 0],
+        direct[:, 0, 1],
+        direct[:, 2, 0],
+        direct[:, 2, 1],
+        -direct[:, 1, 0] / radius,
+        -direct[:, 1, 1] / radius,
+    )
+    expected = (
+        reference.direct,
+        reference.inverse,
+        reference.metric_covariant,
+        reference.metric_contravariant,
+        reference.jacobian,
+    )
+    for actual, target in zip(compiled, expected):
+        np.testing.assert_allclose(
+            actual.reshape(target.shape),
+            target,
+            rtol=5.0e-14,
+            atol=5.0e-14,
+        )
+
+
+def test_flux_constraint_newton_stops_evaluating_converged_points():
+    coordinate_map, *_ = _flux_constrained_elliptical_map()
+    audit = coordinate_map.flux_constraint_audit
+
+    assert audit["validation_newton_evaluation_rounds"] >= 2
+    assert (
+        audit["validation_newton_active_evaluations"]
+        < audit["validation_newton_full_batch_equivalent_evaluations"]
+    )
+
+
+def test_theta_newton_stops_evaluating_converged_points(monkeypatch):
+    coordinate_map, *_ = _flux_constrained_elliptical_map()
+    radial = np.linspace(0.07, 0.76, 40)
+    expected_theta = np.linspace(0.17, 5.97, radial.size)
+    values = coordinate_map.values(radial, expected_theta)
+    initial_theta = expected_theta.copy()
+    initial_theta[radial.size // 2 :] += 0.2
+    evaluated_sizes = []
+    original = coordinate_map._constrained_field_bundle
+
+    def recorded_bundle(psi, theta):
+        evaluated_sizes.append(
+            int(np.prod(np.broadcast_shapes(np.shape(psi), np.shape(theta))))
+        )
+        return original(psi, theta)
+
+    monkeypatch.setattr(
+        coordinate_map,
+        "_constrained_field_bundle",
+        recorded_bundle,
+    )
+    recovered = coordinate_map.solve_theta(
+        psi=radial,
+        R=values["R"],
+        z=values["z"],
+        initial_theta=initial_theta,
+    )
+
+    error = np.angle(np.exp(1j * (recovered - expected_theta)))
+    np.testing.assert_allclose(error, 0.0, atol=2.0e-11)
+    assert evaluated_sizes[0] == radial.size
+    assert any(0 < size < radial.size for size in evaluated_sizes[1:])
+    audit = coordinate_map.theta_inversion_audit
+    assert (
+        audit["newton_active_evaluations"]
+        < audit["newton_full_batch_equivalent_evaluations"]
+    )
+    assert audit["failed_count"] == 0
+
+
+def test_coordinate_map_state_round_trip_uses_only_non_object_arrays(tmp_path):
+    coordinate_map, *_ = _flux_constrained_elliptical_map()
+    state = coordinate_map.to_state()
+    assert all(np.asarray(value).dtype != object for value in state.values())
+
+    checkpoint = tmp_path / "coordinate_map_state.npz"
+    np.savez(checkpoint, **state)
+    with np.load(checkpoint, allow_pickle=False) as loaded:
+        restored = SpectralCoordinateMap.from_state(loaded)
+
+    radial = np.linspace(0.07, 0.76, 23)
+    angle = np.linspace(0.13, 6.03, 23)
+    original = coordinate_map.differentials(radial, angle)
+    rebuilt = restored.differentials(radial, angle)
+    for field in coordinate_map.field_names:
+        np.testing.assert_allclose(
+            rebuilt.values[field],
+            original.values[field],
+            rtol=2.0e-14,
+            atol=2.0e-14,
+        )
+    np.testing.assert_allclose(
+        rebuilt.direct,
+        original.direct,
+        rtol=2.0e-14,
+        atol=2.0e-14,
+    )
+    np.testing.assert_allclose(
+        rebuilt.inverse,
+        original.inverse,
+        rtol=2.0e-14,
+        atol=2.0e-14,
+    )
+    assert restored.max_mode == coordinate_map.max_mode
+    assert (
+        restored.flux_constraint_tolerance
+        == coordinate_map.flux_constraint_tolerance
+    )
