@@ -102,6 +102,45 @@ defined on the complete finite R-z grid, as does the pure flux metric
 `g^{psi psi}`. Magnetic-angle derivatives and mixed/angular metrics are masked
 outside the fitted annulus.
 
+Coordinate construction uses an explicit accuracy budget. The default
+``CoordinateAccuracy.standard()`` accepts interpolation-limited projected-flux
+bridge residuals up to ``1e-5`` while keeping surface and constrained-map
+flux residuals at ``1e-7`` and the angle solve at ``1e-8`` radians. Use
+``coordinate_accuracy="strict"`` for reference comparisons with the former
+stopping criteria. Topology, nesting, orientation, periodic closure, and
+algebraic reciprocal-basis identities are never relaxed by either profile.
+
+The surface quadrature now scales with the requested workload instead of
+always using 7,200 points. Pass ``n_theta_geom=7200`` for a legacy-resolution
+comparison. Expensive derived products can also be staged explicitly:
+
+```python
+product = eq.compute_coordinates(
+    "boozer",
+    materialize_rz=False,
+    checkpoint_dir="coordinate-checkpoints",
+)
+# R, z, nu and their exact differentials are already available spectrally.
+values = product.values(psi, theta)
+# product.jacobian is the fitted-map determinant; product.target_jacobian
+# retains the independently constructed target table for fit diagnostics.
+
+# Build the traditional R-z datasets later, without tracing surfaces again.
+mag_coords = product.materialize_rz(build_metric_cache=False)
+```
+
+``checkpoint_dir`` stores a content-addressed, integrity-checked construction
+checkpoint. Reuse requires exact matches of the equilibrium source arrays,
+coordinate configuration, accuracy budget, and algorithm version. On a full
+``MagneticCoordinates`` result, the default ``build_metric_cache=False``
+defers the Lamé and metric tensors until first access; repeated cylindrical-to-magnetic scalar
+transforms reuse their shared sampling map.
+
+Custom registered coordinate systems must supply an application-owned
+``cache_version`` to ``register_coordinate_system`` before persistent
+checkpoints are enabled. Bump that token whenever the Jacobian implementation
+or any closure/global state affecting it changes.
+
 ## Numba Runtime Notes
 
 - `pycocos` treats Numba as mandatory for Jacobian hot paths; there is no silent
