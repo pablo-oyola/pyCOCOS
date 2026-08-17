@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 from scipy.interpolate import RectBivariateSpline
 
+from pycocos.coordinates import compute_coordinates as compute_coordinates_mod
 from pycocos.coordinates.compute_coordinates import (
     _compute_surface_coordinate_row,
     _normalize_magnetic_angle_closure,
@@ -227,14 +228,29 @@ def test_strong_registered_jacobian_keeps_interpolated_angle_monotonic():
     assert np.all(jacobian > 0.0)
 
 
-def test_up_down_projection_precedes_coordinate_and_jacobian_construction():
+def test_up_down_projection_precedes_coordinate_and_jacobian_construction(
+    monkeypatch,
+):
     R, z, Br, Bz, Bphi = _circular_axisymmetric_field()
     RR, ZZ = np.meshgrid(R, z, indexing="ij")
     psi = 0.5 * ((RR - R_AXIS) ** 2 + ZZ**2) + 1.0e-3 * ZZ
     target_psi = np.asarray([0.045, 0.08, 0.125])
     diagnostics = {}
+    trace_calls = 0
+    original_trace = compute_coordinates_mod._trace_flux_surfaces
 
-    rows = compute_magnetic_coordinates(
+    def counted_trace(**kwargs):
+        nonlocal trace_calls
+        trace_calls += 1
+        return original_trace(**kwargs)
+
+    monkeypatch.setattr(
+        compute_coordinates_mod,
+        "_trace_flux_surfaces",
+        counted_trace,
+    )
+
+    rows = compute_coordinates_mod.compute_magnetic_coordinates(
         Rgrid=R,
         zgrid=z,
         br=Br,
@@ -278,6 +294,12 @@ def test_up_down_projection_precedes_coordinate_and_jacobian_construction():
     )
     audit = diagnostics["up_down_symmetry"]
     assert audit["applied"]
+    assert trace_calls == 1
+    assert diagnostics["surface_construction"]["trace_passes"] == 1
+    assert (
+        diagnostics["surface_construction"]["flux_surface_build_passes"]
+        == 1
+    )
     assert 1.0e-5 < np.max(audit["geometry_residual"]) < 2.0e-2
     assert np.max(audit["projected_flux_residual"]) < 1.0e-8
     projected_psi = RectBivariateSpline(

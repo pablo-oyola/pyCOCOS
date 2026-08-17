@@ -3,7 +3,8 @@
 Flux surfaces are traced independently, optionally projected back onto the
 requested physical poloidal flux, and then reparameterized by a registered
 Jacobian. Optional up-down projection symmetrizes the equilibrium flux and
-magnetic field before retracing and rebuilding every coordinate quantity.
+magnetic field before rebuilding every coordinate quantity from the original
+traced contours as warm starts.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from scipy.interpolate import (
     RegularGridInterpolator,
 )
 
+from .accuracy import CoordinateAccuracy
 from .field_lines import integrate_pol_field_line
 from .jacobian_builders import (
     boozer_consistency_residual,
@@ -29,13 +31,19 @@ from .jacobians import compute_boozer_jacobian
 from .surfaces import (
     build_flux_constrained_surfaces,
     canonicalize_contour_samples,
+    project_contours_to_flux,
     resample_closed_contour_by_arclength,
 )
 
 
 _TWO_PI = 2.0 * np.pi
 _DEFAULT_SPECTRAL_MAX_FOURIER_MODE = 16
-_THETA_GEOM_POINTS = 7200
+_DEFAULT_MIN_THETA_GEOM_POINTS = 512
+_THETA_POINTS_PER_OUTPUT_SAMPLE = 4
+_THETA_POINTS_PER_SPECTRAL_MODE = 8
+_DEFAULT_SURFACE_PROJECTION_TOLERANCE = (
+    CoordinateAccuracy.standard().surface_flux_tolerance
+)
 _DEFAULT_TRACE_STEP = 1.0e-3
 _MAX_TRACE_REFINEMENTS = 8
 _ANGLE_CLOSURE_RTOL = 1.0e-5
@@ -242,6 +250,40 @@ def _validate_spectral_max_mode(spectral_max_mode: int) -> int:
     if result < 1:
         raise ValueError("spectral_max_mode must be >= 1.")
     return result
+
+
+def _resolve_theta_geometry_points(
+    *,
+    ltheta: int,
+    spectral_max_mode: int,
+    n_theta_geom: Optional[int],
+) -> tuple[int, bool, int]:
+    """Resolve a workload-scaled periodic quadrature instead of a fixed grid."""
+    minimum = max(4 * int(ltheta), 2 * int(spectral_max_mode) + 4, 64)
+    if n_theta_geom is not None:
+        if isinstance(n_theta_geom, bool) or not isinstance(
+            n_theta_geom,
+            (int, np.integer),
+        ):
+            raise TypeError("n_theta_geom must be an integer or None.")
+        resolved = int(n_theta_geom)
+        if resolved < minimum:
+            raise ValueError(
+                f"n_theta_geom must be at least {minimum}; got {resolved}."
+            )
+        return resolved, False, minimum
+
+    target = max(
+        minimum,
+        _DEFAULT_MIN_THETA_GEOM_POINTS,
+        _THETA_POINTS_PER_OUTPUT_SAMPLE * int(ltheta),
+        _THETA_POINTS_PER_SPECTRAL_MODE * int(spectral_max_mode),
+    )
+    # FFTs and the reflection pairing used below are cheapest and simplest on
+    # an even power-of-two grid. The target still scales with both the public
+    # angular table and the retained surface spectrum.
+    resolved = 1 << (int(target) - 1).bit_length()
+    return resolved, True, minimum
 
 
 def _resample_trace_values(
@@ -652,6 +694,7 @@ def compute_magnetic_coordinates(
     enforce_up_down_symmetry: bool = False,
     symmetry_tolerance: Optional[float] = None,
     diagnostics: Optional[MutableMapping[str, Any]] = None,
+    surface_projection_tolerance: float = _DEFAULT_SURFACE_PROJECTION_TOLERANCE,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -668,6 +711,11 @@ def compute_magnetic_coordinates(
     interpolation and differentiation now use the supplied physical
     ``psigrid``.  When ``psi_field`` is supplied by :class:`Equilibrium`, each
     filtered contour is projected back to its requested physical flux.
+    ``n_theta_geom=None`` selects a power-of-two surface quadrature that scales
+    with ``ltheta`` and ``spectral_max_mode``; an explicit integer preserves a
+    caller-selected quadrature. ``surface_projection_tolerance`` is normalized
+    by ``flux_scale`` and does not relax topology, orientation, or Jacobian
+    consistency checks.
     """
     del rho_at_psi
     radial_grid = np.asarray(Rgrid, dtype=np.float64)
@@ -700,13 +748,22 @@ def compute_magnetic_coordinates(
     if jacobian_func is None:
         jacobian_func = compute_boozer_jacobian
 
-    if n_theta_geom is None:
-        n_theta_geom = _THETA_GEOM_POINTS
-    n_theta_geom = int(n_theta_geom)
-    minimum_theta = max(4 * int(ltheta), 2 * spectral_max_mode + 4, 64)
-    if n_theta_geom < minimum_theta:
+    (
+        n_theta_geom,
+        automatic_theta_resolution,
+        minimum_theta,
+    ) = _resolve_theta_geometry_points(
+        ltheta=ltheta,
+        spectral_max_mode=spectral_max_mode,
+        n_theta_geom=n_theta_geom,
+    )
+    surface_projection_tolerance = float(surface_projection_tolerance)
+    if (
+        not np.isfinite(surface_projection_tolerance)
+        or surface_projection_tolerance <= 0.0
+    ):
         raise ValueError(
-            f"n_theta_geom must be at least {minimum_theta}; got {n_theta_geom}."
+            "surface_projection_tolerance must be finite and positive."
         )
 
     if R_at_psi is None:
@@ -755,31 +812,60 @@ def compute_magnetic_coordinates(
         if psi_field is None
         else np.asarray(psi_field, dtype=np.float64)
     )
+    if input_psi_field is not None and input_psi_field.shape != expected_shape:
+        raise ValueError("psi_field shape must match (Rgrid, zgrid).")
+    if input_psi_field is not None and flux_scale is None:
+        flux_scale = float(np.ptp(radial_flux))
+
+    # Audit the unprojected equilibrium on its traced surfaces before changing
+    # any field. For the symmetry path this deliberately avoids building a full
+    # flux-constrained surface set only to discard it after grid projection.
+    source_audit_R = raw_R
+    source_audit_z = raw_z
+    source_surfaces = None
     if input_psi_field is not None:
-        if flux_scale is None:
-            flux_scale = float(np.ptp(radial_flux))
-        surfaces = build_flux_constrained_surfaces(
-            Rgrid=radial_grid,
-            zgrid=vertical_grid,
-            psi_field=input_psi_field,
-            psigrid=radial_flux,
-            R_raw=raw_R,
-            z_raw=raw_z,
-            ntheta=n_theta_geom,
-            spectral_max_mode=spectral_max_mode,
-            flux_scale=float(flux_scale),
-            validate_nesting=True,
-            gauge_z=zaxis,
-        )
-        surface_R = surfaces.R
-        surface_z = surfaces.z
-        surface_Br = surface_Bz = surface_Bphi = None
-    else:
-        surface_R = raw_R
-        surface_z = raw_z
-        surface_Br = raw_Br
-        surface_Bz = raw_Bz
-        surface_Bphi = raw_Bphi
+        if enforce_up_down_symmetry:
+            # A single batched Newton projection recovers the source physical
+            # surface geometry needed by the symmetry audit. It intentionally
+            # skips the filtering/canonicalization passes of the retained
+            # surface builder, which would otherwise be thrown away.
+            source_psi_spline = RectBivariateSpline(
+                radial_grid,
+                vertical_grid,
+                input_psi_field,
+                kx=min(3, radial_grid.size - 1),
+                ky=min(3, vertical_grid.size - 1),
+                s=0.0,
+            )
+            source_audit_R, source_audit_z, _ = project_contours_to_flux(
+                R=raw_R,
+                z=raw_z,
+                target_psi=radial_flux,
+                psi_value=lambda R, z: source_psi_spline.ev(R, z),
+                psi_gradient=lambda R, z: (
+                    source_psi_spline.ev(R, z, dx=1),
+                    source_psi_spline.ev(R, z, dy=1),
+                ),
+                flux_scale=float(flux_scale),
+                tolerance=surface_projection_tolerance,
+            )
+        else:
+            source_surfaces = build_flux_constrained_surfaces(
+                Rgrid=radial_grid,
+                zgrid=vertical_grid,
+                psi_field=input_psi_field,
+                psigrid=radial_flux,
+                R_raw=raw_R,
+                z_raw=raw_z,
+                ntheta=n_theta_geom,
+                spectral_max_mode=spectral_max_mode,
+                flux_scale=float(flux_scale),
+                projection_tolerance=surface_projection_tolerance,
+                validate_nesting=True,
+                gauge_z=zaxis,
+            )
+            source_audit_R = source_surfaces.R
+            source_audit_z = source_surfaces.z
 
     (
         _,
@@ -787,8 +873,8 @@ def compute_magnetic_coordinates(
         symmetry_audit,
         source_reflection,
     ) = _up_down_surface_projection(
-        surface_R,
-        surface_z,
+        source_audit_R,
+        source_audit_z,
         zaxis=zaxis,
         applied=bool(enforce_up_down_symmetry),
         tolerance=symmetry_tolerance,
@@ -811,9 +897,9 @@ def compute_magnetic_coordinates(
     }
     for name, spline in zip(source_field_parity, source_field_splines):
         source_values = spline.ev(
-            surface_R.ravel(),
-            surface_z.ravel(),
-        ).reshape(surface_R.shape)
+            source_audit_R.ravel(),
+            source_audit_z.ravel(),
+        ).reshape(source_audit_R.shape)
         _, residual, relative_change = _project_periodic_field(
             source_values,
             reflection=source_reflection,
@@ -839,6 +925,12 @@ def compute_magnetic_coordinates(
     working_Bz = Bz
     working_Bphi = Bphi
     working_psi_field = input_psi_field
+    construction_raw_R = raw_R
+    construction_raw_z = raw_z
+    construction_raw_Br = raw_Br
+    construction_raw_Bz = raw_Bz
+    construction_raw_Bphi = raw_Bphi
+    trace_passes = 1
     if enforce_up_down_symmetry:
         (
             working_Br,
@@ -854,63 +946,91 @@ def compute_magnetic_coordinates(
             Bphi=Bphi,
             psi_field=input_psi_field,
         )
-        projected_bz_seed = float(
-            RegularGridInterpolator(
-                (radial_grid, vertical_grid),
-                working_Bz,
-                bounds_error=False,
-                fill_value=None,
-            )((seeds[0], zaxis))
-        )
-        projected_integration_sign = np.sign(projected_bz_seed)
-        if not phiclockwise:
-            projected_integration_sign *= -1.0
-        if projected_integration_sign == 0.0:
-            raise ValueError(
-                "Cannot determine projected field-line orientation at the "
-                "first retained outboard flux-surface seed."
+        if working_psi_field is None:
+            # Without an authoritative flux field there is no Newton
+            # projection that can make the original contours field-aligned
+            # after grid symmetrization. Preserve the general low-level API by
+            # retracing only this fallback path; normal Equilibrium builds pass
+            # psi_field and use the single-trace warm-start path below.
+            projected_bz_seed = float(
+                RegularGridInterpolator(
+                    (radial_grid, vertical_grid),
+                    working_Bz,
+                    bounds_error=False,
+                    fill_value=None,
+                )((seeds[0], zaxis))
             )
-        projected_raw = _trace_flux_surfaces(
-            Rgrid=radial_grid,
-            zgrid=vertical_grid,
-            br=working_Br,
-            bz=working_Bz,
-            bphi=working_Bphi,
-            R_at_psi=seeds,
-            zaxis=zaxis,
-            ntheta=n_theta_geom,
-            integration_sign=projected_integration_sign,
-            minimum_points=minimum_trace_points,
-        )
-        projected_raw_R, projected_raw_z, *_ = projected_raw
-        if working_psi_field is not None:
-            projected_surfaces = build_flux_constrained_surfaces(
+            projected_integration_sign = np.sign(projected_bz_seed)
+            if not phiclockwise:
+                projected_integration_sign *= -1.0
+            if projected_integration_sign == 0.0:
+                raise ValueError(
+                    "Cannot determine projected field-line orientation at "
+                    "the first retained outboard flux-surface seed."
+                )
+            (
+                construction_raw_R,
+                construction_raw_z,
+                construction_raw_Br,
+                construction_raw_Bz,
+                construction_raw_Bphi,
+            ) = _trace_flux_surfaces(
+                Rgrid=radial_grid,
+                zgrid=vertical_grid,
+                br=working_Br,
+                bz=working_Bz,
+                bphi=working_Bphi,
+                R_at_psi=seeds,
+                zaxis=zaxis,
+                ntheta=n_theta_geom,
+                integration_sign=projected_integration_sign,
+                minimum_points=minimum_trace_points,
+            )
+            trace_passes = 2
+
+    # Construct the retained surfaces exactly once. Under explicit symmetry,
+    # the traced source contours are warm starts for the projected flux field;
+    # paired Newton projection puts them on the projected labels without a
+    # second field-line trace or a throwaway pre-projection surface build.
+    if working_psi_field is not None:
+        surfaces = (
+            source_surfaces
+            if not enforce_up_down_symmetry
+            else build_flux_constrained_surfaces(
                 Rgrid=radial_grid,
                 zgrid=vertical_grid,
                 psi_field=working_psi_field,
                 psigrid=radial_flux,
-                R_raw=projected_raw_R,
-                z_raw=projected_raw_z,
+                R_raw=construction_raw_R,
+                z_raw=construction_raw_z,
                 ntheta=n_theta_geom,
                 spectral_max_mode=spectral_max_mode,
                 flux_scale=float(flux_scale),
+                projection_tolerance=surface_projection_tolerance,
                 validate_nesting=True,
                 gauge_z=zaxis,
                 reflection_z=zaxis,
             )
-            projected_surface_R = projected_surfaces.R
-            projected_surface_z = projected_surfaces.z
-        else:
-            projected_surface_R = projected_raw_R
-            projected_surface_z = projected_raw_z
+        )
+        surface_R = surfaces.R
+        surface_z = surfaces.z
+        surface_Br = surface_Bz = surface_Bphi = None
+    else:
+        surface_R = construction_raw_R
+        surface_z = construction_raw_z
+        surface_Br = construction_raw_Br
+        surface_Bz = construction_raw_Bz
+        surface_Bphi = construction_raw_Bphi
+
+    if enforce_up_down_symmetry:
         (
             surface_R,
             surface_z,
             final_symmetry_audit,
             reflection,
         ) = _up_down_surface_projection(
-            projected_surface_R,
-            projected_surface_z,
+            surface_R,
+            surface_z,
             zaxis=zaxis,
             applied=True,
             tolerance=symmetry_tolerance,
@@ -920,17 +1040,21 @@ def compute_magnetic_coordinates(
         )
         if working_psi_field is not None:
             projected_flux_residual = np.asarray(
-                projected_surfaces.normalized_flux_residual,
+                surfaces.normalized_flux_residual,
                 dtype=np.float64,
             )
             symmetry_audit["projected_flux_residual"] = (
                 projected_flux_residual
             )
-            if float(np.max(projected_flux_residual)) > 1.0e-8:
+            if (
+                float(np.max(projected_flux_residual))
+                > surface_projection_tolerance
+            ):
                 raise ValueError(
                     "up-down projected surfaces no longer match their "
                     "projected physical-flux labels: "
-                    f"residual={float(np.max(projected_flux_residual)):.3e}"
+                    f"residual={float(np.max(projected_flux_residual)):.3e}, "
+                    f"tolerance={surface_projection_tolerance:.3e}"
                 )
 
     spline_orders = (
@@ -949,13 +1073,16 @@ def compute_magnetic_coordinates(
         for values in (working_Br, working_Bz, working_Bphi)
     )
 
-    if enforce_up_down_symmetry:
+    if surface_Br is None or enforce_up_down_symmetry:
         sampled_fields = [
             spline.ev(surface_R.ravel(), surface_z.ravel()).reshape(
                 surface_R.shape
             )
             for spline in field_splines
         ]
+        if not enforce_up_down_symmetry:
+            surface_Br, surface_Bz, surface_Bphi = sampled_fields
+    if enforce_up_down_symmetry:
         parity_by_name = {
             "Br": -1.0,
             "Bz": 1.0,
@@ -978,6 +1105,18 @@ def compute_magnetic_coordinates(
         surface_Br, surface_Bz, surface_Bphi = projected_fields
     if diagnostics is not None:
         diagnostics["up_down_symmetry"] = symmetry_audit
+        diagnostics["surface_construction"] = {
+            "n_theta_geom": int(n_theta_geom),
+            "minimum_n_theta_geom": int(minimum_theta),
+            "automatic_n_theta_geom": bool(automatic_theta_resolution),
+            "automatic_rule": (
+                "next_power_of_two(max(512, 4*ltheta, "
+                "8*spectral_max_mode))"
+            ),
+            "projection_tolerance": float(surface_projection_tolerance),
+            "trace_passes": int(trace_passes),
+            "flux_surface_build_passes": int(working_psi_field is not None),
+        }
         if working_psi_field is not None:
             diagnostics["coordinate_psi_field"] = working_psi_field
 

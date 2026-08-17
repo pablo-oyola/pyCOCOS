@@ -8,8 +8,13 @@ from typing import Callable, Tuple
 import numpy as np
 from scipy.interpolate import RectBivariateSpline
 
+from .accuracy import CoordinateAccuracy
+
 
 _TWO_PI = 2.0 * np.pi
+_DEFAULT_PROJECTION_TOLERANCE = (
+    CoordinateAccuracy.standard().surface_flux_tolerance
+)
 
 
 @dataclass(frozen=True)
@@ -75,10 +80,14 @@ def resample_closed_contour_by_arclength(
 
 
 def _fourier_filter(values: np.ndarray, max_mode: int) -> np.ndarray:
-    coefficients = np.fft.rfft(np.asarray(values, dtype=np.float64))
-    retained = min(int(max_mode), coefficients.size - 1)
-    coefficients[retained + 1 :] = 0.0
-    return np.fft.irfft(coefficients, n=values.size)
+    """Filter one or more contours in one batched real FFT."""
+    data = np.asarray(values, dtype=np.float64)
+    if data.ndim < 1 or data.shape[-1] < 2:
+        raise ValueError("Periodic contour data must have at least two samples.")
+    coefficients = np.fft.rfft(data, axis=-1)
+    retained = min(int(max_mode), coefficients.shape[-1] - 1)
+    coefficients[..., retained + 1 :] = 0.0
+    return np.fft.irfft(coefficients, n=data.shape[-1], axis=-1)
 
 
 def _pair_contour_about_midplane(
@@ -89,13 +98,16 @@ def _pair_contour_about_midplane(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Project periodic contour samples onto exact up-down parity."""
     radial = np.asarray(R, dtype=np.float64)
-    vertical_offset = np.asarray(z, dtype=np.float64) - float(reflection_z)
+    vertical = np.asarray(z, dtype=np.float64)
+    if radial.ndim < 1 or vertical.shape != radial.shape:
+        raise ValueError("Reflection pairing requires matching contour arrays.")
+    vertical_offset = vertical - float(reflection_z)
     reflection = np.concatenate(
-        ([0], np.arange(radial.size - 1, 0, -1))
+        ([0], np.arange(radial.shape[-1] - 1, 0, -1))
     )
-    paired_R = 0.5 * (radial + radial[reflection])
+    paired_R = 0.5 * (radial + radial[..., reflection])
     paired_z_offset = 0.5 * (
-        vertical_offset - vertical_offset[reflection]
+        vertical_offset - vertical_offset[..., reflection]
     )
     return paired_R, paired_z_offset + float(reflection_z)
 
@@ -260,35 +272,98 @@ def project_contour_to_flux(
         Tuple[np.ndarray, np.ndarray],
     ],
     flux_scale: float,
-    tolerance: float = 1.0e-10,
+    tolerance: float = _DEFAULT_PROJECTION_TOLERANCE,
     max_iterations: int = 20,
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     """Newton-project contour points along ``grad(psi)``."""
+    radial = np.asarray(R, dtype=np.float64)
+    vertical = np.asarray(z, dtype=np.float64)
+    if radial.ndim != 1 or vertical.shape != radial.shape:
+        raise ValueError("A projected contour must be matching one-dimensional arrays.")
+    projected_R, projected_z, residual = project_contours_to_flux(
+        R=radial[None, :],
+        z=vertical[None, :],
+        target_psi=np.asarray([target_psi], dtype=np.float64),
+        psi_value=psi_value,
+        psi_gradient=psi_gradient,
+        flux_scale=flux_scale,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+    )
+    return projected_R[0], projected_z[0], float(residual[0])
+
+
+def project_contours_to_flux(
+    *,
+    R: np.ndarray,
+    z: np.ndarray,
+    target_psi: np.ndarray,
+    psi_value: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    psi_gradient: Callable[
+        [np.ndarray, np.ndarray],
+        Tuple[np.ndarray, np.ndarray],
+    ],
+    flux_scale: float,
+    tolerance: float,
+    max_iterations: int = 20,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project a batch of contours, updating only unconverged vertices."""
     radial = np.asarray(R, dtype=np.float64).copy()
     vertical = np.asarray(z, dtype=np.float64).copy()
-    scale = max(abs(float(flux_scale)), np.finfo(np.float64).tiny)
+    targets = np.asarray(target_psi, dtype=np.float64).reshape(-1)
+    if radial.ndim != 2 or vertical.shape != radial.shape:
+        raise ValueError("Projected contours must have shape (surface, angle).")
+    if targets.shape != (radial.shape[0],):
+        raise ValueError("target_psi must contain one value per contour.")
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("Projection tolerance must be finite and positive.")
+    if int(max_iterations) != max_iterations or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer.")
 
-    for _ in range(max_iterations):
-        error = np.asarray(psi_value(radial, vertical)) - float(target_psi)
-        residual = float(np.max(np.abs(error)) / scale)
-        if residual <= tolerance:
+    scale = max(abs(float(flux_scale)), np.finfo(np.float64).tiny)
+    target_grid = np.broadcast_to(targets[:, None], radial.shape)
+    active = np.ones(radial.shape, dtype=bool)
+    error = np.empty(radial.shape, dtype=np.float64)
+
+    for _ in range(int(max_iterations)):
+        active_R = radial[active]
+        active_z = vertical[active]
+        active_error = (
+            np.asarray(psi_value(active_R, active_z), dtype=np.float64)
+            - target_grid[active]
+        )
+        if not np.all(np.isfinite(active_error)):
+            raise ValueError(
+                "Cannot project a contour with non-finite psi values."
+            )
+        error[active] = active_error
+        active = np.abs(error) / scale > tolerance
+        if not np.any(active):
+            residual = np.max(np.abs(error), axis=1) / scale
             return radial, vertical, residual
-        dpsi_dR, dpsi_dz = psi_gradient(radial, vertical)
+        dpsi_dR, dpsi_dz = psi_gradient(radial[active], vertical[active])
+        dpsi_dR = np.asarray(dpsi_dR, dtype=np.float64)
+        dpsi_dz = np.asarray(dpsi_dz, dtype=np.float64)
         gradient_squared = dpsi_dR**2 + dpsi_dz**2
         if np.any(~np.isfinite(gradient_squared)) or np.any(
             gradient_squared <= np.finfo(np.float64).tiny
         ):
             raise ValueError("Cannot project a contour where |grad(psi)| vanishes.")
-        radial -= error * dpsi_dR / gradient_squared
-        vertical -= error * dpsi_dz / gradient_squared
+        radial[active] -= error[active] * dpsi_dR / gradient_squared
+        vertical[active] -= error[active] * dpsi_dz / gradient_squared
         if not np.all(np.isfinite(radial)) or not np.all(np.isfinite(vertical)):
             raise ValueError("Flux-surface projection left the finite coordinate domain.")
 
-    error = np.asarray(psi_value(radial, vertical)) - float(target_psi)
-    residual = float(np.max(np.abs(error)) / scale)
+    error = (
+        np.asarray(psi_value(radial, vertical), dtype=np.float64)
+        - target_grid
+    )
+    residual = np.max(np.abs(error), axis=1) / scale
     raise ValueError(
-        "Flux-surface projection did not converge: "
-        f"normalized residual={residual:.3e}, tolerance={tolerance:.3e}."
+        "Flux-surface projection did not converge for all contours: "
+        f"maximum normalized residual={float(np.max(residual)):.3e}, "
+        f"tolerance={tolerance:.3e}."
     )
 
 
@@ -303,7 +378,7 @@ def build_flux_constrained_surfaces(
     ntheta: int,
     spectral_max_mode: int,
     flux_scale: float,
-    projection_tolerance: float = 1.0e-10,
+    projection_tolerance: float = _DEFAULT_PROJECTION_TOLERANCE,
     validate_nesting: bool = True,
     gauge_z: float | None = None,
     reflection_z: float | None = None,
@@ -330,6 +405,9 @@ def build_flux_constrained_surfaces(
         raise ValueError(
             "spectral_max_mode must satisfy 1 <= mode < ntheta/2."
         )
+    projection_tolerance = float(projection_tolerance)
+    if not np.isfinite(projection_tolerance) or projection_tolerance <= 0.0:
+        raise ValueError("projection_tolerance must be finite and positive.")
 
     spline = RectBivariateSpline(
         R_axis,
@@ -366,22 +444,20 @@ def build_flux_constrained_surfaces(
             0.5 * (dpsi_dz - spline.ev(R, reflected_z, dy=1)),
         )
 
-    def project_surface(
+    def project_surfaces(
         radial: np.ndarray,
         vertical: np.ndarray,
-        *,
-        target: float,
-    ) -> Tuple[np.ndarray, np.ndarray, float]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if reflection_z is not None:
             radial, vertical = _pair_contour_about_midplane(
                 radial,
                 vertical,
                 reflection_z=reflection_z,
             )
-        radial, vertical, residual = project_contour_to_flux(
+        radial, vertical, residual = project_contours_to_flux(
             R=radial,
             z=vertical,
-            target_psi=target,
+            target_psi=radial_flux,
             psi_value=psi_value,
             psi_gradient=psi_gradient,
             flux_scale=flux_scale,
@@ -393,63 +469,70 @@ def build_flux_constrained_surfaces(
                 vertical,
                 reflection_z=reflection_z,
             )
-            residual = float(
-                np.max(np.abs(psi_value(radial, vertical) - target))
+            residual = (
+                np.max(
+                    np.abs(
+                        psi_value(radial, vertical)
+                        - radial_flux[:, None]
+                    ),
+                    axis=1,
+                )
                 / max(abs(float(flux_scale)), np.finfo(np.float64).tiny)
             )
-            if residual > projection_tolerance:
+            if float(np.max(residual)) > projection_tolerance:
                 raise ValueError(
                     "Reflection-paired flux-surface projection did not "
                     "converge: "
-                    f"normalized residual={residual:.3e}, "
+                    f"maximum normalized residual={float(np.max(residual)):.3e}, "
                     f"tolerance={projection_tolerance:.3e}."
                 )
         return radial, vertical, residual
 
     surfaces_R = np.empty((radial_flux.size, ntheta), dtype=np.float64)
     surfaces_z = np.empty_like(surfaces_R)
-    residuals = np.empty(radial_flux.size, dtype=np.float64)
     areas = np.empty(radial_flux.size, dtype=np.float64)
     theta = np.linspace(0.0, _TWO_PI, ntheta, endpoint=False)
 
-    for index, target in enumerate(radial_flux):
-        radial, vertical = resample_closed_contour_by_arclength(
+    for index in range(radial_flux.size):
+        surfaces_R[index], surfaces_z[index] = resample_closed_contour_by_arclength(
             raw_R[index],
             raw_z[index],
             ntheta,
         )
-        # Alternating spectral filtering and exact-flux projection removes
-        # tracing noise without allowing radial smoothing to relabel a surface.
-        for _ in range(2):
-            radial = _fourier_filter(radial, spectral_max_mode)
-            vertical = _fourier_filter(vertical, spectral_max_mode)
-            radial, vertical, _ = project_surface(
-                radial,
-                vertical,
-                target=float(target),
-            )
-        radial, vertical, residual = project_surface(
-            radial,
-            vertical,
-            target=float(target),
+
+    # Filter every surface in one FFT batch. Alternating filtering and exact-
+    # flux projection removes tracing noise without relabeling a surface.
+    for _ in range(2):
+        surfaces_R = _fourier_filter(surfaces_R, spectral_max_mode)
+        surfaces_z = _fourier_filter(surfaces_z, spectral_max_mode)
+        surfaces_R, surfaces_z, _ = project_surfaces(
+            surfaces_R,
+            surfaces_z,
         )
-        radial, vertical = canonicalize_contour_origin(
-            radial,
-            vertical,
+
+    # The second filter pass already ends in an exact-flux projection. The old
+    # immediate third projection repeated the same Newton residual evaluation
+    # without changing the contour.
+    for index in range(radial_flux.size):
+        surfaces_R[index], surfaces_z[index] = canonicalize_contour_origin(
+            surfaces_R[index],
+            surfaces_z[index],
             gauge_z=gauge_z,
         )
-        radial, vertical, residual = project_surface(
-            radial,
-            vertical,
-            target=float(target),
+    surfaces_R, surfaces_z, residuals = project_surfaces(
+        surfaces_R,
+        surfaces_z,
+    )
+
+    for index in range(radial_flux.size):
+        area = _signed_polygon_area(surfaces_R[index], surfaces_z[index])
+        scale = max(
+            float(np.ptp(surfaces_R[index])),
+            float(np.ptp(surfaces_z[index])),
+            1.0,
         )
-        area = _signed_polygon_area(radial, vertical)
-        scale = max(float(np.ptp(radial)), float(np.ptp(vertical)), 1.0)
         if abs(area) <= 1.0e-12 * scale**2:
             raise ValueError(f"Flux surface {index} has a degenerate signed area.")
-        surfaces_R[index] = radial
-        surfaces_z[index] = vertical
-        residuals[index] = residual
         areas[index] = area
 
     orientation = np.sign(areas)
