@@ -9,6 +9,9 @@ Public surface
   - ``Equilibrium`` -- equilibrium wrapper around an EQDSK + flux/field data.
   - ``MagneticCoordinates`` -- magnetic-coordinate frame attached to an
     equilibrium (Boozer, PEST, Hamada, equal-arc).
+  - ``MagneticCoordinateMapProduct`` -- fitted spectral map with deferred
+    full R-z materialization.
+  - ``CoordinateAccuracy`` -- standard/strict coordinate tolerance budgets.
   - ``EQDSK`` -- g-EQDSK reader/writer with COCOS handling.
 
   Lowercase aliases (``equilibrium``, ``magnetic_coordinates``, ``eqdsk``)
@@ -33,6 +36,8 @@ underlying objects; pick whichever style matches your codebase.
 __version__ = "0.1.0"
 
 from .coordinates import (
+    CoordinateAccuracy,
+    MagneticCoordinateMapProduct,
     get_jacobian_function,
     register_coordinate_system,
     list_coordinate_systems,
@@ -46,6 +51,8 @@ __all__ = [
     "magnetic_coordinates",
     "eqdsk",
     "compute_magnetic_coordinates",
+    "CoordinateAccuracy",
+    "MagneticCoordinateMapProduct",
     "get_jacobian_function",
     "register_coordinate_system",
     "list_coordinate_systems",

@@ -50,6 +50,17 @@ JACOBIAN_REGISTRY: Dict[str, JacobianCallable] = {
     "pest": compute_pest_jacobian,
     "equal_arc": compute_equal_arc_jacobian,
 }
+_BUILTIN_CACHE_VERSION = "builtin-v1"
+_JACOBIAN_PERSISTENT_CACHE_VERSIONS: Dict[str, str | None] = {
+    name: _BUILTIN_CACHE_VERSION for name in JACOBIAN_REGISTRY
+}
+_JACOBIAN_RUNTIME_CACHE_TOKENS: Dict[str, str] = {
+    name: f"{name}:{_BUILTIN_CACHE_VERSION}" for name in JACOBIAN_REGISTRY
+}
+_JACOBIAN_TOKEN_CALLABLES: Dict[str, JacobianCallable] = dict(
+    JACOBIAN_REGISTRY
+)
+_REGISTRATION_GENERATION = 0
 
 
 def get_jacobian_function(name: str) -> JacobianCallable:
@@ -64,15 +75,63 @@ def get_jacobian_function(name: str) -> JacobianCallable:
     return _require_context_callable(JACOBIAN_REGISTRY[name_lower])
 
 
-def register_coordinate_system(name: str, jacobian_func: Callable) -> None:
+def register_coordinate_system(
+    name: str,
+    jacobian_func: Callable,
+    *,
+    cache_version: str | None = None,
+) -> None:
     """
     Register a context-only coordinate-system Jacobian callable.
 
     The callback must have exactly the signature
     ``jacobian_func(context) -> J``. Jacobian output validation and
     normalization are performed by the coordinate assembly layer.
+
+    ``cache_version`` is required only when persistent coordinate checkpoints
+    will be used. It is an application-owned token that must change whenever
+    the callable, its closure, or relevant module-global state changes.
+    Registrations without a version remain safe for in-process reuse, but are
+    deliberately ineligible for cross-process checkpoint reuse.
     """
-    JACOBIAN_REGISTRY[name.lower()] = _require_context_callable(jacobian_func)
+    global _REGISTRATION_GENERATION
+
+    normalized_name = name.lower()
+    if cache_version is not None:
+        if not isinstance(cache_version, str) or not cache_version.strip():
+            raise ValueError("cache_version must be a nonempty string or None.")
+        persistent_version = cache_version.strip()
+    else:
+        persistent_version = None
+    validated = _require_context_callable(jacobian_func)
+    _REGISTRATION_GENERATION += 1
+    JACOBIAN_REGISTRY[normalized_name] = validated
+    _JACOBIAN_PERSISTENT_CACHE_VERSIONS[normalized_name] = persistent_version
+    _JACOBIAN_RUNTIME_CACHE_TOKENS[normalized_name] = (
+        f"registration-{_REGISTRATION_GENERATION}"
+    )
+    _JACOBIAN_TOKEN_CALLABLES[normalized_name] = validated
+
+
+def _get_jacobian_cache_identity(name: str) -> tuple[str, str | None]:
+    """Return runtime and persistent cache identities for a registration."""
+
+    normalized_name = name.lower()
+    func = get_jacobian_function(normalized_name)
+    if _JACOBIAN_TOKEN_CALLABLES.get(normalized_name) is not func:
+        # Direct mutation of an existing public registry entry bypasses the
+        # versioned registration API. It is safe for this process only and
+        # must never inherit the replaced callable's persistent identity.
+        return f"direct-registry-entry-{id(func)}", None
+    runtime_token = _JACOBIAN_RUNTIME_CACHE_TOKENS.get(normalized_name)
+    if runtime_token is None:
+        # Direct mutation of the public registry is supported for historical
+        # compatibility, but it cannot establish a cross-process identity.
+        runtime_token = f"direct-registry-entry-{id(func)}"
+    return (
+        runtime_token,
+        _JACOBIAN_PERSISTENT_CACHE_VERSIONS.get(normalized_name),
+    )
 
 
 def list_coordinate_systems() -> list:

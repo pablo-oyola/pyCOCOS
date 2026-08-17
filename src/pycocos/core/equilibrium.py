@@ -3,9 +3,12 @@ Library to handle the magnetic equilibrium and compute magnetic coordinates
 related to tokamaks.
 """
 
+import os
+
 import numpy as np
+import scipy
 import xarray as xr
-from typing import Union, Optional, Tuple, Dict, Any, Literal
+from typing import Union, Optional, Tuple, Dict, Any, Literal, Mapping
 from findiff import FinDiff
 from skimage import measure
 from scipy.interpolate import (
@@ -19,13 +22,65 @@ from scipy.sparse.linalg import lsqr
 from scipy.constants import mu_0
 
 # Importing the internal utils.
-from ..coordinates.registry import get_jacobian_function
+from ..coordinates.accuracy import (
+    CoordinateAccuracy,
+    CoordinateAccuracyProfile,
+    resolve_coordinate_accuracy,
+)
+from ..coordinates.registry import (
+    _get_jacobian_cache_identity,
+    get_jacobian_function,
+)
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
 from ..coordinates.coordinate_map import SpectralCoordinateMap
+from ..coordinates.checkpoint import (
+    coordinate_checkpoint_key,
+    coordinate_checkpoint_path,
+    load_coordinate_checkpoint,
+    namespace_array_group,
+    write_coordinate_checkpoint,
+)
+from ..coordinates.product import MagneticCoordinateMapProduct
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
 
 
-_PROJECTED_FLUX_LABEL_TOLERANCE = 1.0e-8
+_PROJECTED_FLUX_LABEL_TOLERANCE = (
+    CoordinateAccuracy.standard().bridge_flux_tolerance
+)
+_PROJECTED_BRIDGE_MAX_COEFFICIENTS = 1_000_000
+_PROJECTED_BRIDGE_MAX_CONSTRAINT_ROWS = 500_000
+_PROJECTED_BRIDGE_MAX_DESIGN_NONZEROS = 8_000_000
+_COORDINATE_CHECKPOINT_ALGORITHM_VERSION = "spectral-coordinate-map-v1"
+_COORDINATE_RESULT_CACHE_LIMIT = 1
+
+
+def _coordinate_checkpoint_metadata_value(value: Any) -> Any:
+    """Convert construction diagnostics to finite JSON-compatible values."""
+
+    if isinstance(value, np.ndarray):
+        return [_coordinate_checkpoint_metadata_value(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _coordinate_checkpoint_metadata_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_coordinate_checkpoint_metadata_value(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        # Non-finite values occur only in optional diagnostics (for example a
+        # solver tolerance on a fast path that never launched the solver).
+        return None
+    return value
+
+
+class ProjectedFluxBridgeSizeError(RuntimeError):
+    """A projected-flux repair exceeds the bounded sparse-solve budget."""
+
+    def __init__(self, message: str, diagnostics: Dict[str, Any]):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def _reflection_paired_coordinate_psi_grid(
@@ -131,6 +186,10 @@ def _fit_projected_coordinate_psi_bridge(
     flux_scale: float,
     reflection_z: Optional[float] = None,
     tolerance: float = _PROJECTED_FLUX_LABEL_TOLERANCE,
+    repair_strategy: Literal["bounded", "allow"] = "bounded",
+    max_coefficients: int = _PROJECTED_BRIDGE_MAX_COEFFICIENTS,
+    max_constraint_rows: int = _PROJECTED_BRIDGE_MAX_CONSTRAINT_ROWS,
+    max_design_nonzeros: int = _PROJECTED_BRIDGE_MAX_DESIGN_NONZEROS,
 ) -> tuple[np.ndarray, Dict[str, Any]]:
     """Constrain the public projected-psi spline to its qualified surfaces.
 
@@ -139,6 +198,11 @@ def _fit_projected_coordinate_psi_bridge(
     the minimum scaled least-squares update that restores those labels.  The
     projected caller first supplies the complete reflection-knot union, for
     which this routine normally becomes an independent no-op verification.
+
+    Sparse repair is bounded by default because a tensor grid can otherwise
+    turn a modest interpolation residual into a multi-million-unknown LSQR
+    problem.  ``repair_strategy="allow"`` is an explicit opt-in to exceed the
+    size limits after inspecting the exception diagnostics.
     """
     radial_grid = np.asarray(Rgrid, dtype=np.float64)
     vertical_grid = np.asarray(zgrid, dtype=np.float64)
@@ -148,6 +212,17 @@ def _fit_projected_coordinate_psi_bridge(
     targets = np.asarray(surface_psi, dtype=np.float64)
     scale = max(abs(float(flux_scale)), np.finfo(np.float64).tiny)
     tolerance = float(tolerance)
+    if repair_strategy not in ("bounded", "allow"):
+        raise ValueError("repair_strategy must be 'bounded' or 'allow'.")
+    for name, value in (
+        ("max_coefficients", max_coefficients),
+        ("max_constraint_rows", max_constraint_rows),
+        ("max_design_nonzeros", max_design_nonzeros),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{name} must be a positive integer.")
+        if int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
     if values.shape != (radial_grid.size, vertical_grid.size):
         raise ValueError(
             "projected coordinate psi field must match its public R-z grid."
@@ -197,7 +272,12 @@ def _fit_projected_coordinate_psi_bridge(
     symmetry_R = np.empty(0, dtype=np.float64)
     symmetry_z = np.empty(0, dtype=np.float64)
     reflected_symmetry_z = np.empty(0, dtype=np.float64)
+    symmetry_grid_R = None
+    symmetry_grid_z = None
+    reflected_symmetry_grid_z = None
+    symmetry_domain = None
     initial_symmetry_residual = 0.0
+    candidate_symmetry_rows = 0
     if reflection_z is not None:
         grid_R, grid_z = np.meshgrid(
             radial_grid,
@@ -225,10 +305,8 @@ def _fit_projected_coordinate_psi_bridge(
             & (reflected_grid_flux >= target_min)
             & (reflected_grid_flux <= target_max)
         )
-        symmetry_R = grid_R[symmetry_domain]
-        symmetry_z = grid_z[symmetry_domain]
-        reflected_symmetry_z = reflected_grid_z[symmetry_domain]
-        if symmetry_R.size:
+        candidate_symmetry_rows = int(np.count_nonzero(symmetry_domain))
+        if candidate_symmetry_rows:
             initial_symmetry_residual = float(
                 np.max(
                     np.abs(
@@ -237,6 +315,14 @@ def _fit_projected_coordinate_psi_bridge(
                     )
                 ) / scale
             )
+        symmetry_grid_R = grid_R
+        symmetry_grid_z = grid_z
+        reflected_symmetry_grid_z = reflected_grid_z
+    include_symmetry_constraints = bool(
+        candidate_symmetry_rows and initial_symmetry_residual > tolerance
+    )
+    coefficient_count = int(values.size)
+    candidate_label_rows = int(mapped_R.size)
     if (
         float(np.max(initial_residual)) <= tolerance
         and initial_symmetry_residual <= tolerance
@@ -249,7 +335,26 @@ def _fit_projected_coordinate_psi_bridge(
             "relative_grid_correction": 0.0,
             "solver_stop_code": 0,
             "solver_iterations": 0,
+            "status": "fast_path",
+            "tolerance": tolerance,
+            "repair_strategy": repair_strategy,
+            "repair_performed": False,
+            "coefficient_count": coefficient_count,
+            "candidate_label_rows": candidate_label_rows,
+            "candidate_symmetry_rows": candidate_symmetry_rows,
+            "assembled_label_rows": 0,
+            "assembled_symmetry_rows": 0,
+            "assembled_constraint_rows": 0,
+            "estimated_design_nonzeros": 0,
+            "solver_atol": np.nan,
+            "solver_btol": np.nan,
+            "solver_iteration_limit": 0,
         }
+
+    if candidate_symmetry_rows:
+        symmetry_R = symmetry_grid_R[symmetry_domain]
+        symmetry_z = symmetry_grid_z[symmetry_domain]
+        reflected_symmetry_z = reflected_symmetry_grid_z[symmetry_domain]
 
     # The coordinate tables close periodically, so omit their duplicate last
     # angular point from the constraint system while retaining it in the
@@ -310,6 +415,54 @@ def _fit_projected_coordinate_psi_bridge(
         knots_R.size - degree_R - 1,
         knots_z.size - degree_z - 1,
     )
+    coefficient_count = int(np.prod(coefficient_shape))
+    label_constraint_rows = int(flat_R.size)
+    symmetry_constraint_rows = (
+        int(symmetry_R.size) if include_symmetry_constraints else 0
+    )
+    constraint_row_count = label_constraint_rows + symmetry_constraint_rows
+    label_nonzeros = label_constraint_rows * width_R * width_z
+    # A difference of two tensor rows has at most twice the tensor support.
+    symmetry_nonzeros = (
+        2 * symmetry_constraint_rows * width_R * width_z
+    )
+    estimated_design_nonzeros = label_nonzeros + symmetry_nonzeros
+    repair_diagnostics = {
+        "status": "repair_pending",
+        "tolerance": tolerance,
+        "repair_strategy": repair_strategy,
+        "repair_performed": False,
+        "coefficient_count": coefficient_count,
+        "candidate_label_rows": candidate_label_rows,
+        "candidate_symmetry_rows": candidate_symmetry_rows,
+        "assembled_label_rows": label_constraint_rows,
+        "assembled_symmetry_rows": symmetry_constraint_rows,
+        "assembled_constraint_rows": constraint_row_count,
+        "estimated_design_nonzeros": estimated_design_nonzeros,
+    }
+    exceeds_budget = (
+        coefficient_count > int(max_coefficients)
+        or constraint_row_count > int(max_constraint_rows)
+        or estimated_design_nonzeros > int(max_design_nonzeros)
+    )
+    if repair_strategy == "bounded" and exceeds_budget:
+        repair_diagnostics["status"] = "repair_rejected_by_size"
+        repair_diagnostics.update({
+            "max_coefficients": int(max_coefficients),
+            "max_constraint_rows": int(max_constraint_rows),
+            "max_design_nonzeros": int(max_design_nonzeros),
+        })
+        raise ProjectedFluxBridgeSizeError(
+            "Projected coordinate psi repair exceeds the bounded sparse-solve "
+            "budget: "
+            f"coefficients={coefficient_count}, "
+            f"rows={constraint_row_count}, "
+            f"estimated_nonzeros={estimated_design_nonzeros}. "
+            "Use a looser bridge_flux_tolerance when the normalized mapping "
+            "error is acceptable, or explicitly pass repair_strategy='allow' "
+            "after reviewing these diagnostics.",
+            repair_diagnostics,
+        )
 
     def tensor_design(
         sample_R: np.ndarray,
@@ -360,10 +513,10 @@ def _fit_projected_coordinate_psi_bridge(
     # the otherwise underdetermined public-grid correction without allowing
     # it to amplify the interpolation-limited field asymmetry between fitted
     # surfaces.
-    label_weight = 1000.0 if symmetry_R.size else 1.0
+    label_weight = 1000.0 if include_symmetry_constraints else 1.0
     design_blocks = [label_weight * design]
     right_hand_side_blocks = [label_weight * label_right_hand_side]
-    if symmetry_R.size:
+    if include_symmetry_constraints:
         symmetry_design = tensor_design(symmetry_R, symmetry_z) - tensor_design(
             symmetry_R,
             reflected_symmetry_z,
@@ -374,12 +527,21 @@ def _fit_projected_coordinate_psi_bridge(
         )
     combined_design = vstack(design_blocks, format="csr")
     right_hand_side = np.concatenate(right_hand_side_blocks)
+    if tolerance <= 1.0e-8:
+        solver_tolerance = 1.0e-14
+        solver_iteration_limit = 4000
+    else:
+        solver_tolerance = min(1.0e-8, 1.0e-2 * tolerance)
+        solver_iteration_limit = max(
+            250,
+            int(np.ceil(4000.0 * np.sqrt(1.0e-8 / tolerance))),
+        )
     solution = lsqr(
         combined_design,
         right_hand_side,
-        atol=1.0e-14,
-        btol=1.0e-14,
-        iter_lim=4000,
+        atol=solver_tolerance,
+        btol=solver_tolerance,
+        iter_lim=solver_iteration_limit,
     )
     corrected_coefficients = coefficients + scale * solution[0]
 
@@ -446,6 +608,24 @@ def _fit_projected_coordinate_psi_bridge(
         ),
         "solver_stop_code": int(solution[1]),
         "solver_iterations": int(solution[2]),
+        "status": (
+            "label_and_symmetry_repair"
+            if include_symmetry_constraints
+            else "label_repair"
+        ),
+        "tolerance": tolerance,
+        "repair_strategy": repair_strategy,
+        "repair_performed": True,
+        "coefficient_count": coefficient_count,
+        "candidate_label_rows": candidate_label_rows,
+        "candidate_symmetry_rows": candidate_symmetry_rows,
+        "assembled_label_rows": label_constraint_rows,
+        "assembled_symmetry_rows": symmetry_constraint_rows,
+        "assembled_constraint_rows": constraint_row_count,
+        "estimated_design_nonzeros": estimated_design_nonzeros,
+        "solver_atol": solver_tolerance,
+        "solver_btol": solver_tolerance,
+        "solver_iteration_limit": solver_iteration_limit,
     }
 
 
@@ -2288,6 +2468,192 @@ class equilibrium:
         return self.plot2d_var(var, name=name, ax=ax,
                               put_labels=put_labels, image=image, **kwargs)
 
+    def _coordinate_checkpoint_source_arrays(self) -> Dict[str, np.ndarray]:
+        """Return the authoritative arrays that determine coordinate output."""
+
+        arrays = {
+            "Rgrid": np.asarray(self.Rgrid, dtype=np.float64),
+            "zgrid": np.asarray(self.zgrid, dtype=np.float64),
+            "psi": np.asarray(self.flux.psi, dtype=np.float64),
+            "Br": np.asarray(self.field.Br, dtype=np.float64),
+            "Bz": np.asarray(self.field.Bz, dtype=np.float64),
+            "Bphi": np.asarray(self.field.Bphi, dtype=np.float64),
+            "axis_and_flux": np.asarray(
+                [
+                    float(self.geometry.R_axis.values),
+                    float(self.geometry.z_axis.values),
+                    float(
+                        self.geometry.attrs.get("psi_ax", self._psi_ax_init)
+                    ),
+                    float(
+                        self.geometry.attrs.get(
+                            "psi_bdy",
+                            self._psi_edge_init,
+                        )
+                    ),
+                ],
+                dtype=np.float64,
+            ),
+        }
+        if "R_boundary" in self.geometry:
+            arrays["R_boundary"] = np.asarray(
+                self.geometry.R_boundary,
+                dtype=np.float64,
+            )
+        if "z_boundary" in self.geometry:
+            arrays["z_boundary"] = np.asarray(
+                self.geometry.z_boundary,
+                dtype=np.float64,
+            )
+        return arrays
+
+    @staticmethod
+    def _coordinate_checkpoint_state_arrays(
+        *,
+        psigrid: np.ndarray,
+        thtable: np.ndarray,
+        nutable: np.ndarray,
+        jacobian: np.ndarray,
+        Rtransform: np.ndarray,
+        ztransform: np.ndarray,
+        Rgrid: np.ndarray,
+        zgrid: np.ndarray,
+        q: np.ndarray,
+        F: np.ndarray,
+        I: np.ndarray,
+        core_indices: np.ndarray,
+        coordinate_psi_field: Optional[np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        state = {
+            "psigrid": np.asarray(psigrid),
+            "thtable": np.asarray(thtable),
+            "nutable": np.asarray(nutable),
+            "jacobian": np.asarray(jacobian),
+            "Rtransform": np.asarray(Rtransform),
+            "ztransform": np.asarray(ztransform),
+            "Rgrid": np.asarray(Rgrid),
+            "zgrid": np.asarray(zgrid),
+            "q": np.asarray(q),
+            "F": np.asarray(F),
+            "I": np.asarray(I),
+            "core_indices": np.asarray(core_indices, dtype=np.int64),
+        }
+        if coordinate_psi_field is not None:
+            state["coordinate_psi_field"] = np.asarray(
+                coordinate_psi_field,
+                dtype=np.float64,
+            )
+        return state
+
+    def _coordinate_result_from_checkpoint(
+        self,
+        arrays: Mapping[str, np.ndarray],
+        metadata: Mapping[str, Any],
+        *,
+        materialize_rz: bool,
+        build_metric_cache: bool,
+    ) -> Union[MagneticCoordinates, MagneticCoordinateMapProduct]:
+        """Reconstruct a coordinate result from verified primitive state."""
+
+        required = {
+            "psigrid",
+            "thtable",
+            "nutable",
+            "jacobian",
+            "Rtransform",
+            "ztransform",
+            "Rgrid",
+            "zgrid",
+            "q",
+            "F",
+            "I",
+            "core_indices",
+        }
+        missing = sorted(required.difference(arrays))
+        if missing:
+            raise ValueError(
+                "Coordinate checkpoint is missing construction arrays: "
+                + ", ".join(missing)
+            )
+        accuracy = CoordinateAccuracy(**dict(metadata["accuracy"]))
+        return self._build_magnetic_coordinates_dataset(
+            arrays["psigrid"],
+            arrays["thtable"],
+            arrays["nutable"],
+            arrays["jacobian"],
+            arrays["Rtransform"],
+            arrays["ztransform"],
+            arrays["Rgrid"],
+            arrays["zgrid"],
+            arrays["q"],
+            arrays["F"],
+            arrays["I"],
+            int(metadata["ntht_pad"]),
+            str(metadata["coordinate_system"]),
+            spectral_max_mode=int(metadata["spectral_max_mode"]),
+            core_indices=np.asarray(arrays["core_indices"], dtype=np.int64),
+            radial_support_metadata=dict(
+                metadata.get("radial_support_metadata", {})
+            ),
+            symmetry_projection_audit=metadata.get(
+                "symmetry_projection_audit"
+            ),
+            coordinate_psi_field=arrays.get("coordinate_psi_field"),
+            coordinate_accuracy=accuracy,
+            construction_diagnostics=dict(
+                metadata.get("construction_diagnostics", {})
+            ),
+            materialize_rz=materialize_rz,
+            build_metric_cache=build_metric_cache,
+        )
+
+    def _activate_coordinate_result(
+        self,
+        coordinate_system: str,
+        result: Union[MagneticCoordinates, MagneticCoordinateMapProduct],
+    ) -> None:
+        """Expose the most recent result without changing legacy caches."""
+
+        coord_sys_lower = str(coordinate_system).lower()
+        self.coord_sys = coord_sys_lower
+        if isinstance(result, MagneticCoordinateMapProduct):
+            if not hasattr(self, "_coordinate_map_product_cache"):
+                self._coordinate_map_product_cache = {}
+            self._coordinate_map_product_cache[coord_sys_lower] = result
+            self.coordinate_map_product = result
+            return
+        if not hasattr(self, "_magnetic_coordinates_cache"):
+            self._magnetic_coordinates_cache = {}
+        self._magnetic_coordinates_cache[coord_sys_lower] = result
+        self.magnetic_coordinates = result
+
+    def _store_coordinate_build_cache(
+        self,
+        key: tuple[Any, ...],
+        result: Union[MagneticCoordinates, MagneticCoordinateMapProduct],
+        *,
+        enabled: bool,
+    ) -> None:
+        """Retain only the latest exact result requested for reuse.
+
+        Full coordinate objects can own gigabyte-scale R-z arrays.  A single
+        entry captures immediate repeated calls without allowing accuracy or
+        resolution scans to accumulate an unbounded second result cache.  The
+        historical per-coordinate-system cache remains the public ``coords``
+        interface and continues to retain its latest result.
+        """
+
+        if not hasattr(self, "_coordinate_build_cache"):
+            self._coordinate_build_cache = {}
+        if not enabled:
+            self._coordinate_build_cache.clear()
+            return
+        if key not in self._coordinate_build_cache:
+            self._coordinate_build_cache.clear()
+        self._coordinate_build_cache[key] = result
+        while len(self._coordinate_build_cache) > _COORDINATE_RESULT_CACHE_LIMIT:
+            self._coordinate_build_cache.pop(next(iter(self._coordinate_build_cache)))
+
     def compute_coordinates(self, coordinate_system: str='boozer',
                            lpsi: int=201, ltheta: int=256,
                            dr_hr: float=1.0e-3, dz_hz: float=1.0e-3,
@@ -2297,7 +2663,28 @@ class equilibrium:
                            spectral_max_mode: int=16,
                            radial_guard_surfaces: int=3,
                            enforce_up_down_symmetry: bool=False,
-                           symmetry_tolerance: Optional[float]=None):
+                           symmetry_tolerance: Optional[float]=None,
+                           coordinate_accuracy: Optional[
+                               Union[
+                                   CoordinateAccuracy,
+                                   CoordinateAccuracyProfile,
+                               ]
+                           ]=None,
+                           bridge_flux_tolerance: Optional[float]=None,
+                           surface_flux_tolerance: Optional[float]=None,
+                           constraint_flux_tolerance: Optional[float]=None,
+                           theta_tolerance: Optional[float]=None,
+                           projected_bridge_repair_strategy: Literal[
+                               "bounded", "allow"
+                           ]="bounded",
+                           n_theta_geom: Optional[int]=None,
+                           materialize_rz: bool=True,
+                           build_metric_cache: bool=False,
+                           reuse_cache: bool=True,
+                           checkpoint_dir: Optional[
+                               Union[str, os.PathLike]
+                           ]=None,
+                           reuse_checkpoint: bool=True):
         """
         Compute magnetic coordinates for the specified coordinate system.
 
@@ -2348,11 +2735,50 @@ class equilibrium:
             Maximum relative R/Z asymmetry accepted when explicit projection
             is requested. A finite positive value is required whenever
             ``enforce_up_down_symmetry=True``.
+        coordinate_accuracy : {"standard", "strict"} or CoordinateAccuracy, optional
+            Accuracy profile for approximation and nonlinear-solver stopping
+            criteria. The default ``"standard"`` profile uses normalized
+            bridge, surface, and constraint flux tolerances of ``1e-5``,
+            ``1e-7``, and ``1e-7``, plus a ``1e-8`` radian angular tolerance.
+            ``"strict"`` retains the previous pyCOCOS thresholds.
+        bridge_flux_tolerance, surface_flux_tolerance, constraint_flux_tolerance : float, optional
+            Explicit normalized-flux overrides applied after the selected
+            accuracy profile.
+        theta_tolerance : float, optional
+            Explicit angular Newton-update tolerance in radians.
+        projected_bridge_repair_strategy : {"bounded", "allow"}, optional
+            ``"bounded"`` rejects pathological sparse bridge repairs before
+            their design matrices are assembled. ``"allow"`` explicitly
+            opts into repairs exceeding the default memory-size budget.
+        n_theta_geom : int, optional
+            Explicit surface-tracing and quadrature resolution. By default a
+            workload-scaled power of two is selected from ``ltheta`` and
+            ``spectral_max_mode``.
+        materialize_rz : bool, optional
+            If False, return a lightweight spectral map product and defer the
+            expensive full R-z inverse/derivative construction. Default True
+            preserves the historical return type.
+        build_metric_cache : bool, optional
+            Construct the full derived Lamé and metric caches eagerly. This is
+            independent of the coordinate derivatives themselves. The default
+            False builds them transparently on first access.
+        reuse_cache : bool, optional
+            Reuse an exactly matching result already computed by this
+            equilibrium instance. Default True.
+        checkpoint_dir : path-like, optional
+            Content-addressed checkpoint root for the expensive traced and
+            fitted surface state. Matching checkpoints bypass surface tracing
+            on later processes or equilibrium instances.
+        reuse_checkpoint : bool, optional
+            Load an existing verified checkpoint when available. If False, a
+            matching existing checkpoint is verified after construction but
+            is not used as an input. Default True.
 
         Returns
         -------
-        MagneticCoordinates
-            Magnetic coordinates object containing the transformation
+        MagneticCoordinates or MagneticCoordinateMapProduct
+            Full magnetic coordinates by default, or a map-only product when
+            ``materialize_rz=False``.
 
         Notes
         -----
@@ -2360,8 +2786,150 @@ class equilibrium:
         (e.g. ``boozer``, ``pest``, ``equal_arc``, ``hamada``). Any registered
         system can be computed by passing its name.
         """
+        accuracy = resolve_coordinate_accuracy(
+            coordinate_accuracy,
+            bridge_flux_tolerance=bridge_flux_tolerance,
+            surface_flux_tolerance=surface_flux_tolerance,
+            constraint_flux_tolerance=constraint_flux_tolerance,
+            theta_tolerance=theta_tolerance,
+        )
+
+        for name, value in (
+            ("materialize_rz", materialize_rz),
+            ("build_metric_cache", build_metric_cache),
+            ("reuse_cache", reuse_cache),
+            ("reuse_checkpoint", reuse_checkpoint),
+        ):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be boolean.")
+
         # Get the Jacobian function for this coordinate system
         jacobian_func = get_jacobian_function(coordinate_system)
+        (
+            jacobian_runtime_cache_token,
+            jacobian_persistent_cache_version,
+        ) = _get_jacobian_cache_identity(coordinate_system)
+        if (
+            checkpoint_dir is not None
+            and jacobian_persistent_cache_version is None
+        ):
+            raise ValueError(
+                "Persistent coordinate checkpoints for a custom coordinate "
+                "system require register_coordinate_system(..., "
+                "cache_version='...')."
+            )
+
+        source_arrays = self._coordinate_checkpoint_source_arrays()
+        build_config = {
+            "coordinate_system": str(coordinate_system).lower(),
+            "jacobian_module": str(getattr(jacobian_func, "__module__", "")),
+            "jacobian_qualname": str(
+                getattr(jacobian_func, "__qualname__", repr(jacobian_func))
+            ),
+            "jacobian_cache_version": (
+                jacobian_persistent_cache_version
+                if jacobian_persistent_cache_version is not None
+                else jacobian_runtime_cache_token
+            ),
+            "lpsi": int(lpsi),
+            "ltheta": int(ltheta),
+            "dr_hr": float(dr_hr),
+            "dz_hz": float(dz_hz),
+            "padding": float(padding),
+            "ntht_pad": int(ntht_pad),
+            "rhopol_min": None if rhopol_min is None else float(rhopol_min),
+            "rhopol_max": None if rhopol_max is None else float(rhopol_max),
+            "spectral_max_mode": int(spectral_max_mode),
+            "radial_guard_surfaces": int(radial_guard_surfaces),
+            "enforce_up_down_symmetry": bool(enforce_up_down_symmetry),
+            "symmetry_tolerance": (
+                None if symmetry_tolerance is None else float(symmetry_tolerance)
+            ),
+            "bridge_flux_tolerance": float(accuracy.bridge_flux_tolerance),
+            "surface_flux_tolerance": float(accuracy.surface_flux_tolerance),
+            "constraint_flux_tolerance": float(
+                accuracy.constraint_flux_tolerance
+            ),
+            "theta_tolerance": float(accuracy.theta_tolerance),
+            "projected_bridge_repair_strategy": str(
+                projected_bridge_repair_strategy
+            ),
+            "n_theta_geom": (
+                None if n_theta_geom is None else int(n_theta_geom)
+            ),
+            "phiclockwise": bool(self.phiclockwise),
+            "flux_normalization": str(self.flux_normalization),
+            # Reconstructing a checkpoint refits its stored surface tables.
+            # Library versions therefore belong to the durable numerical
+            # identity alongside the explicit algorithm version.
+            "numpy_version": str(np.__version__),
+            "scipy_version": str(scipy.__version__),
+        }
+        construction_key = coordinate_checkpoint_key(
+            source_arrays,
+            build_config,
+            algorithm_version=_COORDINATE_CHECKPOINT_ALGORITHM_VERSION,
+        )
+        checkpoint_cache_token = (
+            None
+            if checkpoint_dir is None
+            else os.path.abspath(os.fspath(checkpoint_dir))
+        )
+        result_cache_key = (
+            construction_key,
+            bool(materialize_rz),
+            bool(build_metric_cache),
+            checkpoint_cache_token,
+        )
+        checkpoint_path = None
+        if checkpoint_dir is not None:
+            checkpoint_path = coordinate_checkpoint_path(
+                checkpoint_dir,
+                construction_key,
+            )
+        if not hasattr(self, "_coordinate_build_cache"):
+            self._coordinate_build_cache = {}
+        if not reuse_cache:
+            self._coordinate_build_cache.clear()
+        if reuse_cache and result_cache_key in self._coordinate_build_cache:
+            if checkpoint_path is None or checkpoint_path.is_dir():
+                result = self._coordinate_build_cache[result_cache_key]
+                self._activate_coordinate_result(coordinate_system, result)
+                return result
+            # A requested persistent checkpoint was removed externally. Drop
+            # the operational hit and rebuild so the call republishes it.
+            self._coordinate_build_cache.pop(result_cache_key, None)
+        if (
+            checkpoint_path is not None
+            and reuse_checkpoint
+            and checkpoint_path.is_dir()
+        ):
+            loaded = load_coordinate_checkpoint(
+                checkpoint_path,
+                expected_source_arrays=source_arrays,
+                expected_build_config=build_config,
+                expected_algorithm_version=(
+                    _COORDINATE_CHECKPOINT_ALGORITHM_VERSION
+                ),
+            )
+            result = self._coordinate_result_from_checkpoint(
+                loaded.array_group("construction"),
+                loaded.metadata,
+                materialize_rz=bool(materialize_rz),
+                build_metric_cache=bool(build_metric_cache),
+            )
+            result._coordinate_checkpoint = {
+                "key": construction_key,
+                "path": str(checkpoint_path),
+                "status": "loaded",
+            }
+            self._store_coordinate_build_cache(
+                result_cache_key,
+                result,
+                enabled=bool(reuse_cache),
+            )
+            self._activate_coordinate_result(coordinate_system, result)
+            return result
         
         # Build fine grid for flux surface contours
         rmin = float(self.Rgrid.values[0])
@@ -2503,10 +3071,12 @@ class equilibrium:
             rho_at_psi=rho_at_psi,
             coordinate_system=coordinate_system,
             spectral_max_mode=spectral_max_mode,
+            n_theta_geom=n_theta_geom,
             psi_field=psip,
             flux_scale=abs(psi_edge - psi_axis),
             enforce_up_down_symmetry=enforce_up_down_symmetry,
             symmetry_tolerance=symmetry_tolerance,
+            surface_projection_tolerance=accuracy.surface_flux_tolerance,
             diagnostics=coordinate_construction_diagnostics,
         )
 
@@ -2562,6 +3132,8 @@ class equilibrium:
                         surface_psi=psigrid,
                         flux_scale=abs(psi_edge - psi_axis),
                         reflection_z=z_axis_val,
+                        tolerance=accuracy.bridge_flux_tolerance,
+                        repair_strategy=projected_bridge_repair_strategy,
                     )
                 )
                 projection_audit[
@@ -2585,6 +3157,30 @@ class equilibrium:
                 projection_audit[
                     "projected_bridge_solver_iterations"
                 ] = bridge_audit["solver_iterations"]
+                projection_audit["projected_bridge_status"] = (
+                    bridge_audit["status"]
+                )
+                projection_audit["projected_bridge_tolerance"] = (
+                    bridge_audit["tolerance"]
+                )
+                projection_audit[
+                    "projected_bridge_coefficient_count"
+                ] = bridge_audit["coefficient_count"]
+                projection_audit[
+                    "projected_bridge_label_constraint_rows"
+                ] = bridge_audit["assembled_label_rows"]
+                projection_audit[
+                    "projected_bridge_symmetry_constraint_rows"
+                ] = bridge_audit["assembled_symmetry_rows"]
+                projection_audit[
+                    "projected_bridge_estimated_design_nonzeros"
+                ] = bridge_audit["estimated_design_nonzeros"]
+                projection_audit["projected_bridge_solver_atol"] = (
+                    bridge_audit["solver_atol"]
+                )
+                projection_audit[
+                    "projected_bridge_solver_iteration_limit"
+                ] = bridge_audit["solver_iteration_limit"]
                 projection_audit[
                     "projected_bridge_radial_grid_size"
                 ] = int(coordinate_Rgrid.size)
@@ -2681,29 +3277,104 @@ class equilibrium:
             )
         )
 
-        # Continue with post-processing
-        return self._build_magnetic_coordinates_dataset(
+        radial_support_metadata = {
+            "family": support_family,
+            "requested_guard_surfaces": int(radial_guard_surfaces),
+            "support_nsurface": int(psigrid.size),
+            "core_nsurface": int(lpsi),
+            "inner_guard_surfaces": inner_guard_surfaces,
+            "outer_guard_surfaces": outer_guard_surfaces,
+            "support_rhopol_min": float(np.min(final_support_rho)),
+            "support_rhopol_max": float(np.max(final_support_rho)),
+        }
+        checkpoint_metadata = _coordinate_checkpoint_metadata_value({
+            "coordinate_system": str(coordinate_system).lower(),
+            "ntht_pad": int(ntht_pad),
+            "spectral_max_mode": int(spectral_max_mode),
+            "radial_support_metadata": radial_support_metadata,
+            "symmetry_projection_audit": (
+                coordinate_construction_diagnostics.get("up_down_symmetry")
+            ),
+            "construction_diagnostics": {
+                "surface_construction": coordinate_construction_diagnostics.get(
+                    "surface_construction",
+                    {},
+                )
+            },
+            "accuracy": {
+                "bridge_flux_tolerance": accuracy.bridge_flux_tolerance,
+                "surface_flux_tolerance": accuracy.surface_flux_tolerance,
+                "constraint_flux_tolerance": (
+                    accuracy.constraint_flux_tolerance
+                ),
+                "theta_tolerance": accuracy.theta_tolerance,
+            },
+        })
+        checkpoint_state = self._coordinate_checkpoint_state_arrays(
+            psigrid=psigrid,
+            thtable=thtable,
+            nutable=nutable,
+            jacobian=jac,
+            Rtransform=Rtransform,
+            ztransform=ztransform,
+            Rgrid=coordinate_Rgrid,
+            zgrid=coordinate_zgrid,
+            q=qprof,
+            F=Fprof,
+            I=Iprof,
+            core_indices=core_indices,
+            coordinate_psi_field=coordinate_psi_field,
+        )
+        checkpoint_status = None
+        if checkpoint_path is not None:
+            existed = checkpoint_path.is_dir()
+            checkpoint_path = write_coordinate_checkpoint(
+                checkpoint_dir,
+                source_arrays=source_arrays,
+                build_config=build_config,
+                state_arrays=namespace_array_group(
+                    "construction",
+                    checkpoint_state,
+                ),
+                algorithm_version=_COORDINATE_CHECKPOINT_ALGORITHM_VERSION,
+                metadata=checkpoint_metadata,
+                reuse_existing=True,
+            )
+            checkpoint_status = "verified_existing" if existed else "written"
+
+        # Continue with optional full R-z post-processing.
+        result = self._build_magnetic_coordinates_dataset(
             psigrid, thtable, nutable, jac, Rtransform, ztransform,
             coordinate_Rgrid,
             coordinate_zgrid,
             qprof, Fprof, Iprof, ntht_pad, coordinate_system,
             spectral_max_mode=spectral_max_mode,
             core_indices=core_indices,
-            radial_support_metadata={
-                "family": support_family,
-                "requested_guard_surfaces": int(radial_guard_surfaces),
-                "support_nsurface": int(psigrid.size),
-                "core_nsurface": int(lpsi),
-                "inner_guard_surfaces": inner_guard_surfaces,
-                "outer_guard_surfaces": outer_guard_surfaces,
-                "support_rhopol_min": float(np.min(final_support_rho)),
-                "support_rhopol_max": float(np.max(final_support_rho)),
-            },
+            radial_support_metadata=radial_support_metadata,
             symmetry_projection_audit=coordinate_construction_diagnostics.get(
                 "up_down_symmetry"
             ),
             coordinate_psi_field=coordinate_psi_field,
+            coordinate_accuracy=accuracy,
+            construction_diagnostics=dict(
+                checkpoint_metadata["construction_diagnostics"]
+            ),
+            materialize_rz=bool(materialize_rz),
+            build_metric_cache=bool(build_metric_cache),
         )
+        if checkpoint_path is not None:
+            result._coordinate_checkpoint = {
+                "key": construction_key,
+                "path": str(checkpoint_path),
+                "status": checkpoint_status,
+            }
+        self._store_coordinate_build_cache(
+            result_cache_key,
+            result,
+            enabled=bool(reuse_cache),
+        )
+        self._activate_coordinate_result(coordinate_system, result)
+        return result
     
     def _build_magnetic_coordinates_dataset(
         self,
@@ -2725,7 +3396,12 @@ class equilibrium:
         radial_support_metadata: Optional[Dict[str, Any]] = None,
         symmetry_projection_audit: Optional[Dict[str, Any]] = None,
         coordinate_psi_field: Optional[np.ndarray] = None,
-    ) -> MagneticCoordinates:
+        coordinate_accuracy: Optional[CoordinateAccuracy] = None,
+        construction_diagnostics: Optional[Dict[str, Any]] = None,
+        materialize_rz: bool = True,
+        build_metric_cache: bool = True,
+        prebuilt_coordinate_map: Optional[SpectralCoordinateMap] = None,
+    ) -> Union[MagneticCoordinates, MagneticCoordinateMapProduct]:
         """
         Build the MagneticCoordinates dataset from computed coordinate arrays.
 
@@ -2758,12 +3434,30 @@ class equilibrium:
             Number of padding points for theta
         spectral_max_mode : int, optional
             Maximum Fourier mode retained by the common coordinate map.
+        coordinate_accuracy : CoordinateAccuracy, optional
+            Resolved approximation and nonlinear-solver tolerance budget.
+        construction_diagnostics : dict, optional
+            Surface-resolution and other construction diagnostics.
+        materialize_rz : bool, optional
+            Build full R-z coordinate and derivative arrays. If False, return
+            a lightweight map product. Default True.
+        build_metric_cache : bool, optional
+            Build derived Lamé and metric caches eagerly on a full result.
+        prebuilt_coordinate_map : SpectralCoordinateMap, optional
+            Reuse an already fitted map when materializing a map-only product.
 
         Returns
         -------
         MagneticCoordinates
             Magnetic coordinates object
         """
+        accuracy = resolve_coordinate_accuracy(coordinate_accuracy)
+        for name, value in (
+            ("materialize_rz", materialize_rz),
+            ("build_metric_cache", build_metric_cache),
+        ):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be boolean.")
         support_psi = np.asarray(psigrid, dtype=np.float64)
         support_theta_table = np.asarray(thtable, dtype=np.float64)
         support_nu_table = np.asarray(nutable, dtype=np.float64)
@@ -2826,11 +3520,13 @@ class equilibrium:
                     coordinate_psi_field,
                     dtype=np.float64,
                 ),
-                "flux_constraint_tolerance": 1.0e-10,
+                "flux_constraint_tolerance": (
+                    accuracy.constraint_flux_tolerance
+                ),
                 # Projected high-resolution equilibria can require more than
                 # twelve Newton steps near the private support guards.  Keep
-                # the strict 1e-10 constructor residual and allow the same
-                # iteration budget used by the downstream angle inversion.
+                # the same iteration budget used by the downstream angle
+                # inversion; the selected accuracy profile owns acceptance.
                 "flux_constraint_max_iterations": 30,
             }
 
@@ -2876,23 +3572,30 @@ class equilibrium:
 
         R_axis_val = float(self.geometry.R_axis.values)
         z_axis_val = float(self.geometry.z_axis.values)
-        coordinate_map = SpectralCoordinateMap(
-            psi=support_psi,
-            theta=magnetic_theta,
-            R=support_R,
-            z=support_z,
-            nu=support_nu_magnetic,
-            psi_axis=float(
-                self.geometry.attrs.get('psi_ax', self._psi_ax_init)
-            ),
-            psi_boundary=float(
-                self.geometry.attrs.get('psi_bdy', self._psi_edge_init)
-            ),
-            R_axis=R_axis_val,
-            z_axis=z_axis_val,
-            max_mode=spectral_max_mode,
-            **flux_constraint_options,
-        )
+        if prebuilt_coordinate_map is None:
+            coordinate_map = SpectralCoordinateMap(
+                psi=support_psi,
+                theta=magnetic_theta,
+                R=support_R,
+                z=support_z,
+                nu=support_nu_magnetic,
+                psi_axis=float(
+                    self.geometry.attrs.get('psi_ax', self._psi_ax_init)
+                ),
+                psi_boundary=float(
+                    self.geometry.attrs.get('psi_bdy', self._psi_edge_init)
+                ),
+                R_axis=R_axis_val,
+                z_axis=z_axis_val,
+                max_mode=spectral_max_mode,
+                **flux_constraint_options,
+            )
+        else:
+            coordinate_map = prebuilt_coordinate_map
+            if not np.array_equal(coordinate_map.psi, support_psi):
+                raise ValueError(
+                    "prebuilt_coordinate_map uses a different radial grid."
+                )
 
         # Everything public remains on the exact requested core grid. The
         # private coordinate map above retains hidden support on both sides.
@@ -2907,6 +3610,87 @@ class equilibrium:
         Iprof = support_I[core_selection]
         nu_magnetic = support_nu_magnetic[core_selection]
         jacobian_magnetic = support_jacobian_magnetic[core_selection]
+
+        if not materialize_rz:
+            product_diagnostics = dict(construction_diagnostics or {})
+            product_diagnostics["radial_support"] = dict(
+                radial_support_metadata or {}
+            )
+            product_diagnostics["up_down_symmetry"] = (
+                dict(symmetry_projection_audit)
+                if isinstance(symmetry_projection_audit, Mapping)
+                else dict(coordinate_map.up_down_symmetry_audit)
+            )
+            product_node_psi, product_node_theta = np.meshgrid(
+                psigrid,
+                magnetic_theta,
+                indexing="ij",
+            )
+            product_node_tangent = coordinate_map.direct_differentials(
+                product_node_psi,
+                product_node_theta,
+            )
+            product_direct = product_node_tangent.direct
+            product_poloidal_determinant = (
+                product_direct[..., 0, 0] * product_direct[..., 2, 1]
+                - product_direct[..., 0, 1] * product_direct[..., 2, 0]
+            )
+            product_jacobian = (
+                -product_direct[..., 1, 2] * product_poloidal_determinant
+            )
+            product_target_scale = np.maximum(
+                np.max(np.abs(jacobian_magnetic), axis=1),
+                np.finfo(np.float64).tiny,
+            )
+            product_diagnostics["jacobian_relative_residual"] = np.max(
+                np.abs(product_jacobian - jacobian_magnetic),
+                axis=1,
+            ) / product_target_scale
+
+            def materializer(eager_metric_cache: bool) -> MagneticCoordinates:
+                return self._build_magnetic_coordinates_dataset(
+                    support_psi,
+                    support_theta_table,
+                    support_nu_table,
+                    support_jacobian_table,
+                    support_R,
+                    support_z,
+                    R_fine,
+                    z_fine,
+                    support_q,
+                    support_F,
+                    support_I,
+                    ntht_pad,
+                    coordinate_system,
+                    spectral_max_mode=spectral_max_mode,
+                    core_indices=core_selection,
+                    radial_support_metadata=radial_support_metadata,
+                    symmetry_projection_audit=symmetry_projection_audit,
+                    coordinate_psi_field=coordinate_psi_field,
+                    coordinate_accuracy=accuracy,
+                    construction_diagnostics=construction_diagnostics,
+                    materialize_rz=True,
+                    build_metric_cache=eager_metric_cache,
+                    prebuilt_coordinate_map=coordinate_map,
+                )
+
+            return MagneticCoordinateMapProduct(
+                coordinate_map=coordinate_map,
+                psi=psigrid,
+                theta=magnetic_theta,
+                R=Rtransform,
+                z=ztransform,
+                nu=nu_magnetic,
+                jacobian=product_jacobian,
+                target_jacobian=jacobian_magnetic,
+                q=qprof,
+                F=Fprof,
+                I=Iprof,
+                coordinate_system=coordinate_system,
+                accuracy=accuracy,
+                diagnostics=product_diagnostics,
+                _materializer=materializer,
+            )
 
         # Build coordinate grids (using geometry for axis)
         grr, gzz = np.meshgrid(R_fine, z_fine, indexing='ij')
@@ -3058,16 +3842,20 @@ class equilibrium:
                 R=R_chunk,
                 z=z_chunk,
                 initial_theta=initial_theta[chunk_indices],
-                tolerance=5.0e-11,
+                tolerance=accuracy.theta_tolerance,
                 max_iterations=30,
             )
-            differential = coordinate_map.differentials(
+            tangent = coordinate_map.direct_differentials(
                 psi_chunk,
                 theta_chunk,
             )
-            direct = differential.direct.copy()
+            # This direct-only product is newly allocated and intentionally
+            # mutable.  The physical-flux correction below does not need the
+            # inverse basis or either metric tensor, avoiding those temporary
+            # arrays for every materialization chunk.
+            direct = tangent.direct
             map_radius = np.asarray(
-                differential.values['R'],
+                tangent.values['R'],
                 dtype=np.float64,
             )
             # ``solve_theta`` locates the closest point on the fitted surface;
@@ -3097,17 +3885,40 @@ class equilibrium:
                 direct[:, 0, column] += correction * grad_R
                 direct[:, 2, column] += correction * grad_z
 
-            jacobian_chunk = np.linalg.det(direct)
+            # The corrected axisymmetric tangent matrix retains the exact
+            # sparse form [[A,B,0],[C,D,R],[E,F,0]].  Use its closed-form
+            # determinant and reciprocal basis instead of invoking a dense
+            # 3x3 factorization for every R-z point.
+            A = direct[:, 0, 0]
+            B = direct[:, 0, 1]
+            C = direct[:, 1, 0]
+            D = direct[:, 1, 1]
+            E = direct[:, 2, 0]
+            F = direct[:, 2, 1]
+            poloidal_determinant = A * F - B * E
+            jacobian_chunk = -R_chunk * poloidal_determinant
             if np.any(~np.isfinite(jacobian_chunk)) or np.any(
                 np.isclose(jacobian_chunk, 0.0)
             ):
                 raise ValueError(
                     "Flux-constrained coordinate differential is singular."
                 )
-            inverse = np.linalg.inv(direct)
+            inverse = np.zeros_like(direct)
+            reciprocal_poloidal = 1.0 / poloidal_determinant
+            inverse[:, 0, 0] = F * reciprocal_poloidal
+            inverse[:, 0, 2] = -B * reciprocal_poloidal
+            inverse[:, 1, 0] = -E * reciprocal_poloidal
+            inverse[:, 1, 2] = A * reciprocal_poloidal
+            inverse[:, 2, 0] = (
+                (D * E - C * F) / R_chunk * reciprocal_poloidal
+            )
+            inverse[:, 2, 1] = 1.0 / R_chunk
+            inverse[:, 2, 2] = (
+                (C * B - D * A) / R_chunk * reciprocal_poloidal
+            )
 
             theta_Rz.ravel()[chunk_indices] = theta_chunk
-            nu_Rz.ravel()[chunk_indices] = differential.values['nu']
+            nu_Rz.ravel()[chunk_indices] = tangent.values['nu']
             jac_Rz.ravel()[chunk_indices] = jacobian_chunk
 
             map_derivatives['dR_dpsi'].ravel()[chunk_indices] = direct[:, 0, 0]
@@ -3237,6 +4048,25 @@ class equilibrium:
 
         # Build coordinate dataset
         magcoords = xr.Dataset(attrs={
+            "coordinate_accuracy_profile": (
+                "strict"
+                if accuracy == CoordinateAccuracy.strict()
+                else "custom"
+                if accuracy != CoordinateAccuracy.standard()
+                else "standard"
+            ),
+            "coordinate_bridge_flux_tolerance": float(
+                accuracy.bridge_flux_tolerance
+            ),
+            "coordinate_surface_flux_tolerance": float(
+                accuracy.surface_flux_tolerance
+            ),
+            "coordinate_constraint_flux_tolerance": float(
+                accuracy.constraint_flux_tolerance
+            ),
+            "coordinate_theta_tolerance": float(
+                accuracy.theta_tolerance
+            ),
             "radial_support_family": str(
                 support_metadata.get("family", "unspecified")
             ),
@@ -3523,10 +4353,14 @@ class equilibrium:
         mag_coords_obj = MagneticCoordinates(magcoords, magdevs,
                                               Raxis=R_axis_val,
                                               zaxis=z_axis_val,
-                                              pad=ntht_pad)
+                                              pad=ntht_pad,
+                                              build_metric_cache=(
+                                                  build_metric_cache
+                                              ))
         # Private numerical engine used by the unchanged public transform
         # methods. It is intentionally not serialized as an xarray object.
         mag_coords_obj._coordinate_map = coordinate_map
+        mag_coords_obj._theta_tolerance = float(accuracy.theta_tolerance)
 
         node_psi, node_theta = np.meshgrid(
             psigrid,
@@ -3552,6 +4386,7 @@ class equilibrium:
             'jacobian_relative_residual': jacobian_relative_residual,
             'radial_support': support_metadata,
             'up_down_symmetry': symmetry_audit,
+            **dict(construction_diagnostics or {}),
         }
         mag_coords_obj.deriv['jacobian'].attrs.update({
             'construction': 'determinant of the common Fourier-spline map',

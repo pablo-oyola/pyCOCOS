@@ -1,4 +1,5 @@
 import inspect
+import shutil
 import warnings
 import numpy as np
 import pytest
@@ -1055,6 +1056,246 @@ def test_build_magnetic_coordinates_dataset_boozer_current_convention(monkeypatc
     )
     assert mag.deriv["h"].attrs["units"] == "T*m"
     assert "J*B**2 = I + qF" in mag.deriv["h"].attrs["desc"]
+
+
+def test_map_only_coordinate_product_defers_and_reuses_rz_materialization(
+    monkeypatch,
+    tmp_path,
+):
+    eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+    npsi = 8
+    ltheta = 24
+    theta = np.linspace(0.0, 2.0 * np.pi, ltheta)
+    psi_axis = float(eq.geometry.attrs["psi_ax"])
+    psi_boundary = float(eq.geometry.attrs["psi_bdy"])
+    psigrid = np.linspace(psi_axis + 0.01, psi_boundary - 0.01, npsi)
+    psi_scale = (psi_boundary - psi_axis) / 0.16
+    radius = np.sqrt((psigrid - psi_axis) / psi_scale)
+    Rtransform = 1.5 + radius[:, None] * np.cos(theta)[None, :]
+    ztransform = radius[:, None] * np.sin(theta)[None, :]
+    thtable = np.tile(theta, (npsi, 1))
+    nutable = np.zeros_like(thtable)
+    jacobian = np.ones_like(thtable)
+    q = np.linspace(1.0, 2.0, npsi)
+    F = np.linspace(2.0, 1.8, npsi)
+    I = np.linspace(0.3, 0.5, npsi)
+
+    product = eq._build_magnetic_coordinates_dataset(  # noqa: SLF001
+        psigrid=psigrid,
+        thtable=thtable,
+        nutable=nutable,
+        jac=jacobian,
+        Rtransform=Rtransform,
+        ztransform=ztransform,
+        R_fine=eq.Rgrid.values,
+        z_fine=eq.zgrid.values,
+        qprof=q,
+        Fprof=F,
+        Iprof=I,
+        ntht_pad=2,
+        coordinate_system="boozer",
+        materialize_rz=False,
+    )
+
+    assert isinstance(product, equilibrium_mod.MagneticCoordinateMapProduct)
+    assert not product.rz_materialized
+    sampled = product.values(psigrid[:, None], theta[None, :])
+    np.testing.assert_allclose(sampled["R"], Rtransform, atol=2.0e-12)
+    np.testing.assert_allclose(sampled["z"], ztransform, atol=2.0e-12)
+    node_psi, node_theta = np.meshgrid(psigrid, product.theta, indexing="ij")
+    np.testing.assert_allclose(
+        product.jacobian,
+        product.differentials(node_psi, node_theta).jacobian,
+    )
+    np.testing.assert_allclose(product.target_jacobian, jacobian)
+
+    full = product.materialize_rz(build_metric_cache=False)
+    assert product.rz_materialized
+    assert full.rz_materialized
+    assert not full.metric_cache_built
+    assert full._coordinate_map is product.coordinate_map  # noqa: SLF001
+    np.testing.assert_allclose(full.deriv.q, q)
+
+    upgraded = product.materialize_rz(build_metric_cache=True)
+    assert upgraded is full
+    assert upgraded.metric_cache_built
+    assert {"h_psi", "h_theta", "h_zeta"}.issubset(upgraded.lame_mag)
+
+
+def test_coordinate_checkpoint_bypasses_surface_reconstruction(
+    monkeypatch,
+    tmp_path,
+):
+    checkpoint_root = tmp_path / "coordinate-checkpoints"
+    first_eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+    kernel_calls = 0
+    forwarded = {}
+
+    def fake_compute_magnetic_coordinates(**kwargs):
+        nonlocal kernel_calls
+        kernel_calls += 1
+        forwarded.update(kwargs)
+        psi = np.asarray(kwargs["psigrid"], dtype=np.float64)
+        theta = np.linspace(0.0, 2.0 * np.pi, int(kwargs["ltheta"]))
+        shape = (psi.size, theta.size)
+        radius = np.linspace(0.1, 0.4, psi.size)
+        return (
+            np.ones(psi.size),
+            np.full(psi.size, 2.0),
+            np.full(psi.size, 0.2),
+            np.broadcast_to(theta, shape).copy(),
+            np.zeros(shape),
+            np.ones(shape),
+            1.5 + radius[:, None] * np.cos(theta)[None, :],
+            radius[:, None] * np.sin(theta)[None, :],
+        )
+
+    monkeypatch.setattr(
+        equilibrium_mod,
+        "compute_magnetic_coordinates",
+        fake_compute_magnetic_coordinates,
+    )
+    first_builder_calls = 0
+    first_builder_kwargs = {}
+
+    def first_builder(*args, **kwargs):
+        nonlocal first_builder_calls
+        first_builder_calls += 1
+        first_builder_kwargs.update(kwargs)
+        return SimpleNamespace(origin="computed")
+
+    monkeypatch.setattr(
+        first_eq,
+        "_build_magnetic_coordinates_dataset",
+        first_builder,
+    )
+    uncached_checkpoint = first_eq.compute_coordinates(
+        lpsi=8,
+        ltheta=16,
+        dr_hr=0.05,
+        dz_hz=0.05,
+        n_theta_geom=512,
+    )
+    assert uncached_checkpoint.origin == "computed"
+    assert kernel_calls == 1
+    assert not checkpoint_root.exists()
+
+    first = first_eq.compute_coordinates(
+        lpsi=8,
+        ltheta=16,
+        dr_hr=0.05,
+        dz_hz=0.05,
+        n_theta_geom=512,
+        checkpoint_dir=checkpoint_root,
+    )
+    assert kernel_calls == 2
+    assert first_builder_calls == 2
+    assert first_builder_kwargs["build_metric_cache"] is False
+    assert forwarded["n_theta_geom"] == 512
+    assert first._coordinate_checkpoint["status"] == "written"
+    cached = first_eq.compute_coordinates(
+        lpsi=8,
+        ltheta=16,
+        dr_hr=0.05,
+        dz_hz=0.05,
+        n_theta_geom=512,
+        checkpoint_dir=checkpoint_root,
+    )
+    assert cached is first
+    assert kernel_calls == 2
+    assert first_builder_calls == 2
+    assert len(first_eq._coordinate_build_cache) == 1  # noqa: SLF001
+
+    checkpoint_path = first._coordinate_checkpoint["path"]
+    shutil.rmtree(checkpoint_path)
+    republished = first_eq.compute_coordinates(
+        lpsi=8,
+        ltheta=16,
+        dr_hr=0.05,
+        dz_hz=0.05,
+        n_theta_geom=512,
+        checkpoint_dir=checkpoint_root,
+    )
+    assert republished.origin == "computed"
+    assert republished._coordinate_checkpoint["status"] == "written"
+    assert kernel_calls == 3
+    assert first_builder_calls == 3
+
+    recomputed = first_eq.compute_coordinates(
+        lpsi=8,
+        ltheta=16,
+        dr_hr=0.05,
+        dz_hz=0.05,
+        n_theta_geom=512,
+        checkpoint_dir=checkpoint_root,
+        reuse_cache=False,
+        reuse_checkpoint=False,
+    )
+    assert recomputed.origin == "computed"
+    assert kernel_calls == 4
+    assert first_builder_calls == 4
+    assert not first_eq._coordinate_build_cache  # noqa: SLF001
+
+    second_eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+
+    def forbidden_compute(**kwargs):
+        pytest.fail("verified checkpoint should bypass surface construction")
+
+    monkeypatch.setattr(
+        equilibrium_mod,
+        "compute_magnetic_coordinates",
+        forbidden_compute,
+    )
+    restored = {}
+
+    def restored_builder(*args, **kwargs):
+        restored["psigrid"] = np.asarray(args[0]).copy()
+        restored["core_indices"] = np.asarray(kwargs["core_indices"]).copy()
+        return SimpleNamespace(origin="checkpoint")
+
+    monkeypatch.setattr(
+        second_eq,
+        "_build_magnetic_coordinates_dataset",
+        restored_builder,
+    )
+    second = second_eq.compute_coordinates(
+        lpsi=8,
+        ltheta=16,
+        dr_hr=0.05,
+        dz_hz=0.05,
+        n_theta_geom=512,
+        checkpoint_dir=checkpoint_root,
+    )
+    assert second.origin == "checkpoint"
+    assert second._coordinate_checkpoint["status"] == "loaded"
+    assert restored["core_indices"].size == 8
+    assert restored["psigrid"].size >= 8
+
+
+def test_custom_coordinate_checkpoint_requires_cache_version(
+    monkeypatch,
+    tmp_path,
+):
+    from pycocos.coordinates.registry import (
+        JACOBIAN_REGISTRY,
+        register_coordinate_system,
+    )
+
+    name = "unversioned_checkpoint_test"
+
+    def custom_jacobian(context):
+        return np.ones_like(context["B"])
+
+    register_coordinate_system(name, custom_jacobian)
+    try:
+        eq = _make_fake_eq_instance(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="cache_version"):
+            eq.compute_coordinates(
+                coordinate_system=name,
+                checkpoint_dir=tmp_path / "custom-checkpoint",
+            )
+    finally:
+        JACOBIAN_REGISTRY.pop(name, None)
 
 
 def test_plot2d_var_transposes_data_for_rz_layout(monkeypatch, tmp_path):

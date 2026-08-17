@@ -23,6 +23,22 @@ from .field_lines import (
 )
 
 from .compute_coordinates import compute_magnetic_coordinates
+from .accuracy import (
+    CoordinateAccuracy,
+    CoordinateAccuracyProfile,
+    resolve_coordinate_accuracy,
+)
+from .checkpoint import (
+    CheckpointIntegrityError,
+    CheckpointMismatchError,
+    CoordinateCheckpointError,
+    LoadedCoordinateCheckpoint,
+    coordinate_checkpoint_key,
+    coordinate_checkpoint_path,
+    load_coordinate_checkpoint,
+    write_coordinate_checkpoint,
+)
+from .product import MagneticCoordinateMapProduct
 
 __all__ = [
     "jacobians",
@@ -39,5 +55,16 @@ __all__ = [
     "get_field_line",
     "integrate_pol_field_line",
     "compute_magnetic_coordinates",
+    "CoordinateAccuracy",
+    "CoordinateAccuracyProfile",
+    "resolve_coordinate_accuracy",
+    "MagneticCoordinateMapProduct",
+    "CoordinateCheckpointError",
+    "CheckpointIntegrityError",
+    "CheckpointMismatchError",
+    "LoadedCoordinateCheckpoint",
+    "coordinate_checkpoint_key",
+    "coordinate_checkpoint_path",
+    "load_coordinate_checkpoint",
+    "write_coordinate_checkpoint",
 ]
-

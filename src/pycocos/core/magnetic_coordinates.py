@@ -6,6 +6,7 @@ eases the access and control of the magnetic coordinates.
 import numpy as np
 import xarray as xr
 import os
+import hashlib
 from typing import Union, Optional, Tuple, Dict, Any, Mapping, List
 from scipy.interpolate import RectBivariateSpline
 from scipy.interpolate import RegularGridInterpolator
@@ -82,7 +83,8 @@ class magnetic_coordinates:
         deriv: xr.Dataset,
         Raxis: float,
         zaxis: float,
-        pad: int = 0
+        pad: int = 0,
+        build_metric_cache: bool = True,
     ) -> None:
         """
         Initialize the magnetic coordinate object.
@@ -100,28 +102,32 @@ class magnetic_coordinates:
             z position of the magnetic axis
         pad : int, optional
             Number of padding points for periodic boundaries. Default is 0
+        build_metric_cache : bool, optional
+            Build Lamé factors and both metric tensors eagerly. Set to
+            ``False`` to defer these derived R-z arrays until first access.
+            Default is ``True`` for backward compatibility.
         """
         if "nu" not in coords:
             raise ValueError("coords must contain the toroidal gauge shift 'nu'.")
 
         self.coords = coords.copy()
         self.deriv = deriv
+        if not isinstance(build_metric_cache, (bool, np.bool_)):
+            raise TypeError("build_metric_cache must be boolean.")
 
-        # Computing the Lamé factors for the magnetic derivatives.
-        self.lame_mag = xr.Dataset()
-        self.lame_mag['h_psi'] = np.sqrt(self.deriv.dR_dpsi**2 + 
-                                         self.deriv.dz_dpsi**2 +
-                                         self.deriv.R**2 * self.deriv.dphi_dpsi**2)
-        self.lame_mag['h_theta'] = np.sqrt(self.deriv.dR_dtheta**2 + 
-                                           self.deriv.dz_dtheta**2 +
-                                           self.deriv.R**2 * self.deriv.dphi_dtheta**2)
-        self.lame_mag['h_zeta'] = np.sqrt(self.deriv.dR_dzeta**2 + 
-                                          self.deriv.dz_dzeta**2 +
-                                          self.deriv.R**2 * self.deriv.dphi_dzeta**2)
-
-        # Pre-compute metric coefficient caches.
+        # Lamé factors and metric tensors duplicate several full R-z arrays.
+        # Preserve historical eager construction by default while allowing the
+        # coordinate builder to defer that cost until these products are used.
+        self._lame_mag_cache: Optional[xr.Dataset] = None
+        self._metric_covariant_cache: Optional[xr.Dataset] = None
+        self._metric_contravariant_cache: Optional[xr.Dataset] = None
         self._metric_missing_terms: List[str] = []
-        self.metric_covariant, self.metric_contravariant = self._build_metric_cache()
+        self._cyl2mag_sampling_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._cyl2mag_sampling_cache_hits = 0
+        self._cyl2mag_sampling_cache_misses = 0
+        if build_metric_cache:
+            self._ensure_lame_cache()
+            self._ensure_metric_cache()
         
         # Storing the axis position.
         self.Raxis = Raxis
@@ -129,6 +135,95 @@ class magnetic_coordinates:
 
         # and the padding introduced to the geometrical poloidal angle.
         self.nthtpad = pad
+
+    def _build_lame_cache(self) -> xr.Dataset:
+        """Build Lamé factors from the cylindrical coordinate tangents."""
+        required = (
+            "dR_dpsi", "dz_dpsi", "dphi_dpsi",
+            "dR_dtheta", "dz_dtheta", "dphi_dtheta",
+            "dR_dzeta", "dz_dzeta", "dphi_dzeta", "R",
+        )
+        if any(name not in self.deriv for name in required):
+            return xr.Dataset()
+        lame = xr.Dataset()
+        lame['h_psi'] = np.sqrt(self.deriv.dR_dpsi**2 +
+                                self.deriv.dz_dpsi**2 +
+                                self.deriv.R**2 * self.deriv.dphi_dpsi**2)
+        lame['h_theta'] = np.sqrt(self.deriv.dR_dtheta**2 +
+                                  self.deriv.dz_dtheta**2 +
+                                  self.deriv.R**2 * self.deriv.dphi_dtheta**2)
+        lame['h_zeta'] = np.sqrt(self.deriv.dR_dzeta**2 +
+                                 self.deriv.dz_dzeta**2 +
+                                 self.deriv.R**2 * self.deriv.dphi_dzeta**2)
+        return lame
+
+    def _ensure_lame_cache(self) -> None:
+        if self._lame_mag_cache is None:
+            self._lame_mag_cache = self._build_lame_cache()
+
+    def _ensure_metric_cache(self) -> None:
+        if (
+            self._metric_covariant_cache is None
+            or self._metric_contravariant_cache is None
+        ):
+            (
+                self._metric_covariant_cache,
+                self._metric_contravariant_cache,
+            ) = self._build_metric_cache()
+
+    @property
+    def lame_mag(self) -> xr.Dataset:
+        """Lamé factors, constructed on first access when deferred."""
+        self._ensure_lame_cache()
+        assert self._lame_mag_cache is not None
+        return self._lame_mag_cache
+
+    @property
+    def metric_covariant(self) -> xr.Dataset:
+        """Covariant metric cache, constructed on first access when deferred."""
+        self._ensure_metric_cache()
+        assert self._metric_covariant_cache is not None
+        return self._metric_covariant_cache
+
+    @property
+    def metric_contravariant(self) -> xr.Dataset:
+        """Contravariant metric cache, constructed on first access when deferred."""
+        self._ensure_metric_cache()
+        assert self._metric_contravariant_cache is not None
+        return self._metric_contravariant_cache
+
+    @property
+    def metric_cache_built(self) -> bool:
+        """Whether both full R-z metric caches have been materialized."""
+        return (
+            self._metric_covariant_cache is not None
+            and self._metric_contravariant_cache is not None
+        )
+
+    @property
+    def rz_materialized(self) -> bool:
+        """Whether this object contains the traditional full R-z fields."""
+
+        return "psi" in self.coords and "jacobian" in self.deriv
+
+    @staticmethod
+    def _sampling_array_signature(values: np.ndarray) -> Tuple[Any, ...]:
+        """Return a deterministic, compact signature for a sampling grid."""
+        array = np.ascontiguousarray(values)
+        digest = hashlib.blake2b(
+            memoryview(array).cast("B"),
+            digest_size=16,
+        ).hexdigest()
+        return array.shape, array.dtype.str, digest
+
+    @property
+    def sampling_cache_info(self) -> Dict[str, int]:
+        """Return cylindrical-to-magnetic sampling-cache statistics."""
+        return {
+            "size": len(self._cyl2mag_sampling_cache),
+            "hits": self._cyl2mag_sampling_cache_hits,
+            "misses": self._cyl2mag_sampling_cache_misses,
+        }
 
     @staticmethod
     def _metric_component_name(i: str, j: str, tensor: str) -> str:
@@ -630,7 +725,9 @@ class magnetic_coordinates:
                     R=np.asarray(grr).ravel()[selected],
                     z=np.asarray(gzz).ravel()[selected],
                     initial_theta=np.asarray(thetageom).ravel()[selected],
-                    tolerance=5.0e-11,
+                    tolerance=float(
+                        getattr(self, "_theta_tolerance", 5.0e-11)
+                    ),
                     max_iterations=30,
                 )
                 theta_values.ravel()[selected] = theta_chunk
@@ -896,14 +993,13 @@ class magnetic_coordinates:
             psi_eval = gpsi
 
         coordinate_map = getattr(self, "_coordinate_map", None)
+        mapped_values = None
+        if coordinate_map is not None:
+            mapped_values = coordinate_map.values(psi_eval, gtht)
         for ivar in ('R_inv', 'z_inv'):
-            if coordinate_map is not None:
+            if mapped_values is not None:
                 mapped_name = "R" if ivar == "R_inv" else "z"
-                tmp = coordinate_map.evaluate(
-                    mapped_name,
-                    psi_eval,
-                    gtht,
-                )
+                tmp = mapped_values[mapped_name]
             else:
                 inverse_values = np.asarray(self.coords[ivar].values)[psi_order]
                 intrp = RectBivariateSpline(psi0_spline,
@@ -1166,24 +1262,50 @@ class magnetic_coordinates:
         Theta = flux_grid['Theta']
         psi_eval = flux_grid['psi_eval']
 
-        inv = self.transform_inverse(psi=psi_eval,
-                                     thetamag=Theta,
-                                     grid=True,
-                                     psi_is_norm=False)
-        R_out = inv.R_inv.values
-        z_out = inv.z_inv.values
+        cache_key = (
+            self._sampling_array_signature(R),
+            self._sampling_array_signature(z),
+            int(np.asarray(Zeta).size),
+            self._sampling_array_signature(Psi),
+            self._sampling_array_signature(Theta),
+            self._sampling_array_signature(psi_eval),
+        )
+        cached = self._cyl2mag_sampling_cache.get(cache_key)
+        if cached is not None:
+            self._cyl2mag_sampling_cache_hits += 1
+            return dict(cached)
+        self._cyl2mag_sampling_cache_misses += 1
 
-        psi_out = np.broadcast_to(psi_eval[:, None], R_out.shape)
-        thetageom_out = np.arctan2(z_out - self.zaxis, R_out - self.Raxis)
-        thetageom_out = np.mod(thetageom_out + 2.0*np.pi, 2.0*np.pi)
+        coordinate_map = getattr(self, "_coordinate_map", None)
+        if coordinate_map is not None:
+            psi_mesh, theta_mesh = np.meshgrid(
+                psi_eval,
+                Theta,
+                indexing="ij",
+            )
+            mapped = coordinate_map.values(psi_mesh, theta_mesh)
+            R_out = np.asarray(mapped["R"], dtype=np.float64)
+            z_out = np.asarray(mapped["z"], dtype=np.float64)
+            nu = np.asarray(mapped["nu"], dtype=np.float64)
+            psi_out = psi_mesh
+        else:
+            inv = self.transform_inverse(psi=psi_eval,
+                                         thetamag=Theta,
+                                         grid=True,
+                                         psi_is_norm=False)
+            R_out = inv.R_inv.values
+            z_out = inv.z_inv.values
+            psi_out = np.broadcast_to(psi_eval[:, None], R_out.shape)
+            thetageom_out = np.arctan2(z_out - self.zaxis, R_out - self.Raxis)
+            thetageom_out = np.mod(thetageom_out + 2.0*np.pi, 2.0*np.pi)
 
-        psi0_values = np.asarray(self.coords.psi0.values, dtype=np.float64)
-        psi_order = np.argsort(psi0_values)
-        intrp_nu = RectBivariateSpline(psi0_values[psi_order],
-                                       self.coords.thetageom.values,
-                                       self.coords.nu.values[psi_order],
-                                       kx=3, ky=5)
-        nu = intrp_nu(psi_out, thetageom_out, grid=False)
+            psi0_values = np.asarray(self.coords.psi0.values, dtype=np.float64)
+            psi_order = np.argsort(psi0_values)
+            intrp_nu = RectBivariateSpline(psi0_values[psi_order],
+                                           self.coords.thetageom.values,
+                                           self.coords.nu.values[psi_order],
+                                           kx=3, ky=5)
+            nu = intrp_nu(psi_out, thetageom_out, grid=False)
 
         output_shape = (Psi.size, Theta.size, Zeta.size)
         Rout = np.broadcast_to(R_out[:, :, None], output_shape)
@@ -1198,13 +1320,21 @@ class magnetic_coordinates:
             atol=max(1.0e-12, 1.0e-12 * abs(flux_grid['psi_span']))
         )
 
-        return {
+        sampling = {
             'output_shape': output_shape,
             'Rout': Rout,
             'zout': zout,
             'nu': nu,
             'axis_mask': axis_mask,
         }
+        # A small bounded cache captures the common case where many fields use
+        # the same cylindrical and magnetic grids without retaining arbitrary
+        # user grids indefinitely.
+        if len(self._cyl2mag_sampling_cache) >= 4:
+            oldest_key = next(iter(self._cyl2mag_sampling_cache))
+            self._cyl2mag_sampling_cache.pop(oldest_key)
+        self._cyl2mag_sampling_cache[cache_key] = dict(sampling)
+        return sampling
 
     @staticmethod
     def _cyl2mag_phi_eval(

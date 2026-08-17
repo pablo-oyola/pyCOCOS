@@ -1,15 +1,26 @@
+from importlib import import_module
+
 import numpy as np
+import pytest
 import xarray as xr
 from scipy.interpolate import RectBivariateSpline
 
+from pycocos.coordinates.accuracy import (
+    CoordinateAccuracy,
+    resolve_coordinate_accuracy,
+)
 from pycocos.core.equilibrium import (
+    ProjectedFluxBridgeSizeError,
     _fit_projected_coordinate_psi_bridge,
     _reflection_paired_coordinate_psi_grid,
 )
 from pycocos.core.magnetic_coordinates import magnetic_coordinates
 
 
-def test_projected_psi_bridge_preserves_surface_flux_on_public_grid():
+equilibrium_module = import_module("pycocos.core.equilibrium")
+
+
+def _quartic_bridge_fixture():
     Rgrid = np.linspace(1.0, 3.0, 41)
     zgrid = np.linspace(-1.0, 1.0, 41)
     RR, ZZ = np.meshgrid(Rgrid, zgrid, indexing="ij")
@@ -35,6 +46,18 @@ def test_projected_psi_bridge_preserves_surface_flux_on_public_grid():
     )
     surface_R = 2.0 + np.sqrt(radius_squared) * cosine
     surface_z = np.sqrt(radius_squared) * sine
+    return Rgrid, zgrid, psi_field, surface_R, surface_z, surface_psi
+
+
+def test_projected_psi_bridge_preserves_surface_flux_on_public_grid():
+    (
+        Rgrid,
+        zgrid,
+        psi_field,
+        surface_R,
+        surface_z,
+        surface_psi,
+    ) = _quartic_bridge_fixture()
 
     corrected, audit = _fit_projected_coordinate_psi_bridge(
         Rgrid=Rgrid,
@@ -45,6 +68,7 @@ def test_projected_psi_bridge_preserves_surface_flux_on_public_grid():
         surface_psi=surface_psi,
         flux_scale=1.0,
         reflection_z=0.0,
+        tolerance=1.0e-8,
     )
 
     assert corrected.shape == psi_field.shape
@@ -52,6 +76,11 @@ def test_projected_psi_bridge_preserves_surface_flux_on_public_grid():
     assert np.max(audit["final_residual"]) <= 1.0e-8
     assert audit["final_symmetry_residual"] <= 1.0e-8
     assert audit["relative_grid_correction"] < 1.0e-4
+    assert audit["status"] == "label_repair"
+    assert audit["candidate_symmetry_rows"] > 0
+    assert audit["assembled_symmetry_rows"] == 0
+    assert audit["solver_atol"] == 1.0e-14
+    assert audit["solver_iteration_limit"] == 4000
 
     bridge = RectBivariateSpline(
         Rgrid,
@@ -71,6 +100,113 @@ def test_projected_psi_bridge_preserves_surface_flux_on_public_grid():
         rtol=0.0,
         atol=1.0e-8,
     )
+
+
+def test_standard_bridge_tolerance_skips_sparse_repair(monkeypatch):
+    fixture = _quartic_bridge_fixture()
+
+    def _unexpected_lsqr(*_args, **_kwargs):
+        raise AssertionError("LSQR must not run inside the accepted fast path.")
+
+    monkeypatch.setattr(equilibrium_module, "lsqr", _unexpected_lsqr)
+    corrected, audit = _fit_projected_coordinate_psi_bridge(
+        Rgrid=fixture[0],
+        zgrid=fixture[1],
+        psi_field=fixture[2],
+        surface_R=fixture[3],
+        surface_z=fixture[4],
+        surface_psi=fixture[5],
+        flux_scale=1.0,
+        reflection_z=0.0,
+    )
+
+    np.testing.assert_array_equal(corrected, fixture[2])
+    assert 1.0e-8 < np.max(audit["initial_residual"]) < 1.0e-6
+    assert audit["status"] == "fast_path"
+    assert audit["solver_iterations"] == 0
+    assert audit["assembled_constraint_rows"] == 0
+
+
+def test_bridge_solver_budget_scales_with_requested_accuracy():
+    fixture = _quartic_bridge_fixture()
+    _, audit = _fit_projected_coordinate_psi_bridge(
+        Rgrid=fixture[0],
+        zgrid=fixture[1],
+        psi_field=fixture[2],
+        surface_R=fixture[3],
+        surface_z=fixture[4],
+        surface_psi=fixture[5],
+        flux_scale=1.0,
+        reflection_z=0.0,
+        tolerance=2.0e-8,
+    )
+
+    assert audit["repair_performed"]
+    assert audit["solver_atol"] == pytest.approx(2.0e-10)
+    assert 250 < audit["solver_iteration_limit"] < 4000
+    assert np.max(audit["final_residual"]) <= 2.0e-8
+
+
+def test_bridge_rejects_large_repair_before_sparse_assembly():
+    fixture = _quartic_bridge_fixture()
+    with pytest.raises(ProjectedFluxBridgeSizeError) as exc_info:
+        _fit_projected_coordinate_psi_bridge(
+            Rgrid=fixture[0],
+            zgrid=fixture[1],
+            psi_field=fixture[2],
+            surface_R=fixture[3],
+            surface_z=fixture[4],
+            surface_psi=fixture[5],
+            flux_scale=1.0,
+            reflection_z=0.0,
+            tolerance=1.0e-8,
+            max_coefficients=100,
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["status"] == "repair_rejected_by_size"
+    assert diagnostics["coefficient_count"] == fixture[2].size
+    assert diagnostics["assembled_symmetry_rows"] == 0
+    assert "repair_strategy='allow'" in str(exc_info.value)
+
+    _, allowed_audit = _fit_projected_coordinate_psi_bridge(
+        Rgrid=fixture[0],
+        zgrid=fixture[1],
+        psi_field=fixture[2],
+        surface_R=fixture[3],
+        surface_z=fixture[4],
+        surface_psi=fixture[5],
+        flux_scale=1.0,
+        reflection_z=0.0,
+        tolerance=1.0e-8,
+        repair_strategy="allow",
+        max_coefficients=100,
+    )
+    assert allowed_audit["repair_performed"]
+    assert allowed_audit["repair_strategy"] == "allow"
+
+
+def test_coordinate_accuracy_profiles_and_explicit_overrides():
+    standard = resolve_coordinate_accuracy()
+    strict = resolve_coordinate_accuracy("strict")
+    overridden = resolve_coordinate_accuracy(
+        strict,
+        bridge_flux_tolerance=3.0e-7,
+        theta_tolerance=2.0e-9,
+    )
+
+    assert standard == CoordinateAccuracy.standard()
+    assert standard.bridge_flux_tolerance == 1.0e-5
+    assert standard.surface_flux_tolerance == 1.0e-7
+    assert standard.constraint_flux_tolerance == 1.0e-7
+    assert standard.theta_tolerance == 1.0e-8
+    assert strict == CoordinateAccuracy.strict()
+    assert overridden.bridge_flux_tolerance == 3.0e-7
+    assert overridden.surface_flux_tolerance == strict.surface_flux_tolerance
+    assert overridden.theta_tolerance == 2.0e-9
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        CoordinateAccuracy(theta_tolerance=0.0)
 
 
 def test_reflection_knot_union_preserves_full_surface_family_without_fit():

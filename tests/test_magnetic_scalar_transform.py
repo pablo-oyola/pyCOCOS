@@ -505,6 +505,31 @@ def test_cyl2mag_scalar_batched_ndarray_matches_scalar_calls():
     assert np.allclose(out_batch.isel(field=1).values, out1.values, rtol=0.0, atol=1.0e-12)
 
 
+def test_cyl2mag_scalar_reuses_sampling_map(monkeypatch):
+    mag = _build_synthetic_magnetic_coordinates()
+    R = mag.coords.R.values
+    z = mag.coords.z.values
+    phi = np.linspace(0.0, 2.0 * np.pi, 8)
+    RR, ZZ, PP = np.meshgrid(R, z, phi, indexing='ij')
+    field = RR + 0.3 * ZZ + np.cos(PP)
+
+    original = mag.transform_inverse
+    calls = 0
+
+    def counted_transform_inverse(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mag, "transform_inverse", counted_transform_inverse)
+    first = mag.cyl2mag_scalar(field, R=R, z=z, phi=phi)
+    second = mag.cyl2mag_scalar(2.0 * field, R=R, z=z, phi=phi)
+
+    assert calls == 1
+    assert mag.sampling_cache_info == {"size": 1, "hits": 1, "misses": 1}
+    np.testing.assert_allclose(second, 2.0 * first, rtol=0.0, atol=2.0e-12)
+
+
 def test_cyl2mag_scalar_batched_dataarray_extra_dims():
     mag = _build_synthetic_magnetic_coordinates()
 

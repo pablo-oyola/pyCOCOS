@@ -31,6 +31,24 @@ def test_metric_covariant_access_returns_rzphi_dataarray():
     assert np.all(np.isfinite(gij.values))
 
 
+def test_metric_cache_can_be_built_lazily():
+    complete = _build_synthetic_magnetic_coordinates()
+    lazy = magnetic_coordinates(
+        complete.coords,
+        complete.deriv,
+        Raxis=complete.Raxis,
+        zaxis=complete.zaxis,
+        pad=complete.nthtpad,
+        build_metric_cache=False,
+    )
+
+    assert not lazy.metric_cache_built
+    metric = lazy.metric_covariant
+    assert lazy.metric_cache_built
+    assert "g_psi_psi" in metric
+    assert "h_psi" in lazy.lame_mag
+
+
 def test_metric_covariant_and_contravariant_are_inverse():
     mag = _build_synthetic_magnetic_coordinates()
     names = ("psi", "theta", "zeta")

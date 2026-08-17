@@ -15,6 +15,7 @@ from pycocos.coordinates.jacobians import (
 )
 from pycocos.coordinates.registry import (
     JACOBIAN_REGISTRY,
+    _get_jacobian_cache_identity,
     get_jacobian_function,
     register_coordinate_system,
 )
@@ -137,6 +138,41 @@ def test_custom_shape_normalization_closes_at_two_pi_and_is_scale_invariant():
         assert get_jacobian_function(name) is custom_shape
     finally:
         JACOBIAN_REGISTRY.pop(name, None)
+
+
+def test_custom_registration_requires_explicit_persistent_cache_version():
+    name = "custom_checkpoint_identity_test"
+
+    def custom_shape(context):
+        return np.ones_like(context["B"])
+
+    register_coordinate_system(name, custom_shape)
+    runtime_token, persistent_version = _get_jacobian_cache_identity(name)
+    assert runtime_token.startswith("registration-")
+    assert persistent_version is None
+
+    register_coordinate_system(name, custom_shape, cache_version="shape-v2")
+    replacement_token, persistent_version = _get_jacobian_cache_identity(name)
+    assert replacement_token != runtime_token
+    assert persistent_version == "shape-v2"
+    JACOBIAN_REGISTRY.pop(name, None)
+
+
+def test_direct_builtin_registry_override_cannot_inherit_checkpoint_identity():
+    original = JACOBIAN_REGISTRY["boozer"]
+
+    def replacement(context):
+        return np.ones_like(context["B"])
+
+    try:
+        JACOBIAN_REGISTRY["boozer"] = replacement
+        runtime_token, persistent_version = _get_jacobian_cache_identity(
+            "boozer"
+        )
+        assert runtime_token.startswith("direct-registry-entry-")
+        assert persistent_version is None
+    finally:
+        JACOBIAN_REGISTRY["boozer"] = original
 
 
 def test_normalization_preserves_negative_orientation():
