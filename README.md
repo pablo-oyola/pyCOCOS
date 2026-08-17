@@ -8,6 +8,9 @@ magnetic coordinate workflows extracted from `pynova`.
 - g-EQDSK read/write and equilibrium construction
 - Magnetic field handling on R-z grids
 - Magnetic coordinates (Boozer, PEST, Equal-Arc, Hamada)
+- Flux-constrained surfaces for general up-down-asymmetric equilibria
+- One Fourier/radial-spline coordinate map for transforms, derivatives, metrics,
+  and the signed physical Jacobian
 - COCOS convention detection and transformations
 
 ## Installation
@@ -54,10 +57,13 @@ To enable documentation publishing, set in GitHub repository settings:
 ```python
 from pycocos import EQDSK
 
-eq = EQDSK("equilibrium.geqdsk")
+eq = EQDSK("equilibrium.geqdsk", cocos_in=1, cocos_internal=1)
 mag_coords = eq.compute_coordinates(coordinate_system="boozer")
 coords = mag_coords(R=2.0, z=0.0)
 ```
+
+See [CONVENTIONS.md](CONVENTIONS.md) for the canonical COCOS, Boozer-gauge,
+current-coefficient, and metric contracts.
 
 ## Jacobian Formula Mapping
 
@@ -75,8 +81,65 @@ Implementation details:
 - Per-surface normalization follows the `theta`-span construction from Eq. 8.99/8.100 logic
 - Hot loops (power-law Jacobian assembly, Boozer `h/B^2`, normalization integrals) run in
   `numba` kernels in `pycocos.coordinates.jacobian_numba_kernels`
-- Registry API accepts context callables and legacy `(I, F, q, B)` custom callables
-  through an adapter layer
+- Registry callables use the single interface `jacobian(context) -> J(theta)`
+- Custom non-Boozer Jacobian shapes are validated and normalized once to a
+  monotonic `0 -> 2*pi` poloidal coordinate
+
+## Coordinate Construction
+
+Each retained contour is Fourier-filtered without imposing parity, projected
+back to its requested physical poloidal flux, and checked for orientation and
+strict nesting. Up-down-asymmetric sine and cosine content is retained.
+
+The inverse map `(R, z, nu)(psi, theta)` is represented by one periodic Fourier
+expansion and one radial spline family. The radial fit uses signed
+sqrt-normalized flux for regularity near the magnetic axis, while all exported
+derivatives are transformed back to physical `psi`. Forward/inverse transforms,
+covariant and contravariant metrics, and the Jacobian are all evaluated from
+this same map. The fitted annulus is exposed as
+`coords.inside_coordinate_domain`; equilibrium `dPsi/dR` and `dPsi/dz` remain
+defined on the complete finite R-z grid, as does the pure flux metric
+`g^{psi psi}`. Magnetic-angle derivatives and mixed/angular metrics are masked
+outside the fitted annulus.
+
+Coordinate construction uses an explicit accuracy budget. The default
+``CoordinateAccuracy.standard()`` accepts interpolation-limited projected-flux
+bridge residuals up to ``1e-5`` while keeping surface and constrained-map
+flux residuals at ``1e-7`` and the angle solve at ``1e-8`` radians. Use
+``coordinate_accuracy="strict"`` for reference comparisons with the former
+stopping criteria. Topology, nesting, orientation, periodic closure, and
+algebraic reciprocal-basis identities are never relaxed by either profile.
+
+The surface quadrature now scales with the requested workload instead of
+always using 7,200 points. Pass ``n_theta_geom=7200`` for a legacy-resolution
+comparison. Expensive derived products can also be staged explicitly:
+
+```python
+product = eq.compute_coordinates(
+    "boozer",
+    materialize_rz=False,
+    checkpoint_dir="coordinate-checkpoints",
+)
+# R, z, nu and their exact differentials are already available spectrally.
+values = product.values(psi, theta)
+# product.jacobian is the fitted-map determinant; product.target_jacobian
+# retains the independently constructed target table for fit diagnostics.
+
+# Build the traditional R-z datasets later, without tracing surfaces again.
+mag_coords = product.materialize_rz(build_metric_cache=False)
+```
+
+``checkpoint_dir`` stores a content-addressed, integrity-checked construction
+checkpoint. Reuse requires exact matches of the equilibrium source arrays,
+coordinate configuration, accuracy budget, and algorithm version. On a full
+``MagneticCoordinates`` result, the default ``build_metric_cache=False``
+defers the Lamé and metric tensors until first access; repeated cylindrical-to-magnetic scalar
+transforms reuse their shared sampling map.
+
+Custom registered coordinate systems must supply an application-owned
+``cache_version`` to ``register_coordinate_system`` before persistent
+checkpoints are enabled. Bump that token whenever the Jacobian implementation
+or any closure/global state affecting it changes.
 
 ## Numba Runtime Notes
 

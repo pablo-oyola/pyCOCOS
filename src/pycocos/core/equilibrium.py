@@ -3,19 +3,802 @@ Library to handle the magnetic equilibrium and compute magnetic coordinates
 related to tokamaks.
 """
 
-import numpy as np
-import xarray as xr
 import os
-from typing import Union, Optional, Tuple, Dict, Any
+
+import numpy as np
+import scipy
+import xarray as xr
+from typing import Union, Optional, Tuple, Dict, Any, Literal, Mapping
 from findiff import FinDiff
 from skimage import measure
-from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline
+from scipy.interpolate import (
+    BSpline,
+    CubicSpline,
+    PchipInterpolator,
+    RectBivariateSpline,
+)
+from scipy.sparse import csr_matrix, vstack
+from scipy.sparse.linalg import lsqr
 from scipy.constants import mu_0
 
 # Importing the internal utils.
-from ..coordinates.registry import get_jacobian_function
+from ..coordinates.accuracy import (
+    CoordinateAccuracy,
+    CoordinateAccuracyProfile,
+    resolve_coordinate_accuracy,
+)
+from ..coordinates.registry import (
+    _get_jacobian_cache_identity,
+    get_jacobian_function,
+)
 from ..coordinates.compute_coordinates import compute_magnetic_coordinates
+from ..coordinates.coordinate_map import SpectralCoordinateMap
+from ..coordinates.checkpoint import (
+    coordinate_checkpoint_key,
+    coordinate_checkpoint_path,
+    load_coordinate_checkpoint,
+    namespace_array_group,
+    write_coordinate_checkpoint,
+)
+from ..coordinates.product import MagneticCoordinateMapProduct
 from .magnetic_coordinates import magnetic_coordinates as MagneticCoordinates
+
+
+_PROJECTED_FLUX_LABEL_TOLERANCE = (
+    CoordinateAccuracy.standard().bridge_flux_tolerance
+)
+_PROJECTED_BRIDGE_MAX_COEFFICIENTS = 1_000_000
+_PROJECTED_BRIDGE_MAX_CONSTRAINT_ROWS = 500_000
+_PROJECTED_BRIDGE_MAX_DESIGN_NONZEROS = 8_000_000
+_COORDINATE_CHECKPOINT_ALGORITHM_VERSION = "spectral-coordinate-map-v1"
+_COORDINATE_RESULT_CACHE_LIMIT = 1
+
+
+def _coordinate_checkpoint_metadata_value(value: Any) -> Any:
+    """Convert construction diagnostics to finite JSON-compatible values."""
+
+    if isinstance(value, np.ndarray):
+        return [_coordinate_checkpoint_metadata_value(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, Mapping):
+        return {
+            str(key): _coordinate_checkpoint_metadata_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_coordinate_checkpoint_metadata_value(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        # Non-finite values occur only in optional diagnostics (for example a
+        # solver tolerance on a fast path that never launched the solver).
+        return None
+    return value
+
+
+class ProjectedFluxBridgeSizeError(RuntimeError):
+    """A projected-flux repair exceeds the bounded sparse-solve budget."""
+
+    def __init__(self, message: str, diagnostics: Dict[str, Any]):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _reflection_paired_coordinate_psi_grid(
+    *,
+    tracing_R: np.ndarray,
+    tracing_z: np.ndarray,
+    tracing_psi: np.ndarray,
+    public_R: np.ndarray,
+    reflection_z: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Represent the paired projected flux on its complete vertical knot set.
+
+    Reflection about an off-grid magnetic axis shifts every vertical spline
+    knot.  Sampling the reflected average back onto only the original knots
+    therefore cannot, in general, represent the field that generated the
+    projected surfaces.  Retain the union of the tracing knots and their
+    reflections over the common domain.  The radial knot set is unchanged by
+    an up-down reflection, so the equilibrium's public radial grid remains
+    sufficient.
+    """
+    radial = np.asarray(tracing_R, dtype=np.float64)
+    vertical = np.asarray(tracing_z, dtype=np.float64)
+    values = np.asarray(tracing_psi, dtype=np.float64)
+    output_radial = np.asarray(public_R, dtype=np.float64)
+    midplane = float(reflection_z)
+    if (
+        radial.ndim != 1
+        or vertical.ndim != 1
+        or output_radial.ndim != 1
+        or values.shape != (radial.size, vertical.size)
+        or radial.size < 4
+        or vertical.size < 4
+        or output_radial.size < 4
+        or not np.all(np.isfinite(radial))
+        or not np.all(np.isfinite(vertical))
+        or not np.all(np.isfinite(output_radial))
+        or not np.all(np.isfinite(values))
+        or not np.isfinite(midplane)
+        or np.any(np.diff(radial) <= 0.0)
+        or np.any(np.diff(vertical) <= 0.0)
+        or np.any(np.diff(output_radial) <= 0.0)
+    ):
+        raise ValueError("projected coordinate psi grids must be finite and increasing.")
+
+    reflected_vertical = 2.0 * midplane - vertical
+    common_lower = max(vertical[0], float(np.min(reflected_vertical)))
+    common_upper = min(vertical[-1], float(np.max(reflected_vertical)))
+    scale = max(1.0, abs(common_lower), abs(common_upper))
+    bound_tolerance = 64.0 * np.finfo(np.float64).eps * scale
+    if common_upper <= common_lower + bound_tolerance:
+        raise ValueError("projected coordinate psi has no reflected vertical domain.")
+    candidates = np.concatenate(
+        (
+            vertical[
+                (vertical >= common_lower - bound_tolerance)
+                & (vertical <= common_upper + bound_tolerance)
+            ],
+            reflected_vertical[
+                (reflected_vertical >= common_lower - bound_tolerance)
+                & (reflected_vertical <= common_upper + bound_tolerance)
+            ],
+        )
+    )
+    output_vertical = np.unique(np.clip(candidates, common_lower, common_upper))
+    # Remove only roundoff duplicates, then pair the surviving knots exactly.
+    keep = np.concatenate(
+        (
+            np.asarray([True]),
+            np.diff(output_vertical) > bound_tolerance,
+        )
+    )
+    output_vertical = output_vertical[keep]
+    output_vertical = 0.5 * (
+        output_vertical + 2.0 * midplane - output_vertical[::-1]
+    )
+    if output_vertical.size < 4 or np.any(np.diff(output_vertical) <= 0.0):
+        raise ValueError("projected coordinate psi knot union is not increasing.")
+
+    source = RectBivariateSpline(
+        radial,
+        vertical,
+        values,
+        kx=min(3, radial.size - 1),
+        ky=min(3, vertical.size - 1),
+        s=0.0,
+    )
+    RR, ZZ = np.meshgrid(output_radial, output_vertical, indexing="ij")
+    paired_values = 0.5 * (
+        source.ev(RR.ravel(), ZZ.ravel())
+        + source.ev(RR.ravel(), (2.0 * midplane - ZZ).ravel())
+    ).reshape(RR.shape)
+    return output_radial.copy(), output_vertical, paired_values
+
+
+def _fit_projected_coordinate_psi_bridge(
+    *,
+    Rgrid: np.ndarray,
+    zgrid: np.ndarray,
+    psi_field: np.ndarray,
+    surface_R: np.ndarray,
+    surface_z: np.ndarray,
+    surface_psi: np.ndarray,
+    flux_scale: float,
+    reflection_z: Optional[float] = None,
+    tolerance: float = _PROJECTED_FLUX_LABEL_TOLERANCE,
+    repair_strategy: Literal["bounded", "allow"] = "bounded",
+    max_coefficients: int = _PROJECTED_BRIDGE_MAX_COEFFICIENTS,
+    max_constraint_rows: int = _PROJECTED_BRIDGE_MAX_CONSTRAINT_ROWS,
+    max_design_nonzeros: int = _PROJECTED_BRIDGE_MAX_DESIGN_NONZEROS,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    """Constrain the public projected-psi spline to its qualified surfaces.
+
+    A direct downsample-and-refit can move the mapped surfaces off their
+    physical flux labels.  Correct the tensor-product spline coefficients by
+    the minimum scaled least-squares update that restores those labels.  The
+    projected caller first supplies the complete reflection-knot union, for
+    which this routine normally becomes an independent no-op verification.
+
+    Sparse repair is bounded by default because a tensor grid can otherwise
+    turn a modest interpolation residual into a multi-million-unknown LSQR
+    problem.  ``repair_strategy="allow"`` is an explicit opt-in to exceed the
+    size limits after inspecting the exception diagnostics.
+    """
+    radial_grid = np.asarray(Rgrid, dtype=np.float64)
+    vertical_grid = np.asarray(zgrid, dtype=np.float64)
+    values = np.asarray(psi_field, dtype=np.float64)
+    mapped_R = np.asarray(surface_R, dtype=np.float64)
+    mapped_z = np.asarray(surface_z, dtype=np.float64)
+    targets = np.asarray(surface_psi, dtype=np.float64)
+    scale = max(abs(float(flux_scale)), np.finfo(np.float64).tiny)
+    tolerance = float(tolerance)
+    if repair_strategy not in ("bounded", "allow"):
+        raise ValueError("repair_strategy must be 'bounded' or 'allow'.")
+    for name, value in (
+        ("max_coefficients", max_coefficients),
+        ("max_constraint_rows", max_constraint_rows),
+        ("max_design_nonzeros", max_design_nonzeros),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{name} must be a positive integer.")
+        if int(value) <= 0:
+            raise ValueError(f"{name} must be a positive integer.")
+    if values.shape != (radial_grid.size, vertical_grid.size):
+        raise ValueError(
+            "projected coordinate psi field must match its public R-z grid."
+        )
+    if (
+        mapped_R.shape != mapped_z.shape
+        or mapped_R.ndim != 2
+        or mapped_R.shape[0] != targets.size
+    ):
+        raise ValueError(
+            "projected inverse geometry must have shape (surface, angle)."
+        )
+    if not (
+        np.all(np.isfinite(values))
+        and np.all(np.isfinite(mapped_R))
+        and np.all(np.isfinite(mapped_z))
+        and np.all(np.isfinite(targets))
+        and np.isfinite(tolerance)
+        and tolerance > 0.0
+    ):
+        raise ValueError("projected coordinate psi bridge inputs must be finite.")
+    if reflection_z is not None:
+        reflection_z = float(reflection_z)
+        if not np.isfinite(reflection_z):
+            raise ValueError("projected coordinate psi reflection_z must be finite.")
+
+    spline = RectBivariateSpline(
+        radial_grid,
+        vertical_grid,
+        values,
+        kx=min(3, radial_grid.size - 1),
+        ky=min(3, vertical_grid.size - 1),
+        s=0.0,
+    )
+
+    def surface_residual(candidate: RectBivariateSpline) -> np.ndarray:
+        sampled = candidate.ev(
+            mapped_R.ravel(),
+            mapped_z.ravel(),
+        ).reshape(mapped_R.shape)
+        return np.max(
+            np.abs(sampled - targets[:, None]),
+            axis=1,
+        ) / scale
+
+    initial_residual = surface_residual(spline)
+    symmetry_R = np.empty(0, dtype=np.float64)
+    symmetry_z = np.empty(0, dtype=np.float64)
+    reflected_symmetry_z = np.empty(0, dtype=np.float64)
+    symmetry_grid_R = None
+    symmetry_grid_z = None
+    reflected_symmetry_grid_z = None
+    symmetry_domain = None
+    initial_symmetry_residual = 0.0
+    candidate_symmetry_rows = 0
+    if reflection_z is not None:
+        grid_R, grid_z = np.meshgrid(
+            radial_grid,
+            vertical_grid,
+            indexing="ij",
+        )
+        reflected_grid_z = 2.0 * reflection_z - grid_z
+        in_reflected_domain = (
+            (reflected_grid_z >= vertical_grid[0])
+            & (reflected_grid_z <= vertical_grid[-1])
+        )
+        grid_flux = spline.ev(grid_R.ravel(), grid_z.ravel()).reshape(
+            grid_R.shape
+        )
+        reflected_grid_flux = spline.ev(
+            grid_R.ravel(),
+            reflected_grid_z.ravel(),
+        ).reshape(grid_R.shape)
+        target_min = float(np.min(targets))
+        target_max = float(np.max(targets))
+        symmetry_domain = (
+            in_reflected_domain
+            & (grid_flux >= target_min)
+            & (grid_flux <= target_max)
+            & (reflected_grid_flux >= target_min)
+            & (reflected_grid_flux <= target_max)
+        )
+        candidate_symmetry_rows = int(np.count_nonzero(symmetry_domain))
+        if candidate_symmetry_rows:
+            initial_symmetry_residual = float(
+                np.max(
+                    np.abs(
+                        grid_flux[symmetry_domain]
+                        - reflected_grid_flux[symmetry_domain]
+                    )
+                ) / scale
+            )
+        symmetry_grid_R = grid_R
+        symmetry_grid_z = grid_z
+        reflected_symmetry_grid_z = reflected_grid_z
+    include_symmetry_constraints = bool(
+        candidate_symmetry_rows and initial_symmetry_residual > tolerance
+    )
+    coefficient_count = int(values.size)
+    candidate_label_rows = int(mapped_R.size)
+    if (
+        float(np.max(initial_residual)) <= tolerance
+        and initial_symmetry_residual <= tolerance
+    ):
+        return values.copy(), {
+            "initial_residual": initial_residual,
+            "final_residual": initial_residual.copy(),
+            "initial_symmetry_residual": initial_symmetry_residual,
+            "final_symmetry_residual": initial_symmetry_residual,
+            "relative_grid_correction": 0.0,
+            "solver_stop_code": 0,
+            "solver_iterations": 0,
+            "status": "fast_path",
+            "tolerance": tolerance,
+            "repair_strategy": repair_strategy,
+            "repair_performed": False,
+            "coefficient_count": coefficient_count,
+            "candidate_label_rows": candidate_label_rows,
+            "candidate_symmetry_rows": candidate_symmetry_rows,
+            "assembled_label_rows": 0,
+            "assembled_symmetry_rows": 0,
+            "assembled_constraint_rows": 0,
+            "estimated_design_nonzeros": 0,
+            "solver_atol": np.nan,
+            "solver_btol": np.nan,
+            "solver_iteration_limit": 0,
+        }
+
+    if candidate_symmetry_rows:
+        symmetry_R = symmetry_grid_R[symmetry_domain]
+        symmetry_z = symmetry_grid_z[symmetry_domain]
+        reflected_symmetry_z = reflected_symmetry_grid_z[symmetry_domain]
+
+    # The coordinate tables close periodically, so omit their duplicate last
+    # angular point from the constraint system while retaining it in the
+    # independent final residual check above and below.
+    constraint_R = mapped_R
+    constraint_z = mapped_z
+    geometry_scale = max(
+        1.0,
+        float(np.ptp(mapped_R)),
+        float(np.ptp(mapped_z)),
+    )
+    if (
+        mapped_R.shape[1] > 1
+        and np.allclose(
+            mapped_R[:, -1],
+            mapped_R[:, 0],
+            rtol=0.0,
+            atol=1.0e-12 * geometry_scale,
+        )
+        and np.allclose(
+            mapped_z[:, -1],
+            mapped_z[:, 0],
+            rtol=0.0,
+            atol=1.0e-12 * geometry_scale,
+        )
+    ):
+        constraint_R = mapped_R[:, :-1]
+        constraint_z = mapped_z[:, :-1]
+
+    flat_R = constraint_R.ravel()
+    flat_z = constraint_z.ravel()
+    target_vector = np.repeat(targets, constraint_R.shape[1])
+    radial_tolerance = 32.0 * np.finfo(np.float64).eps * max(
+        1.0,
+        float(np.max(np.abs(radial_grid))),
+    )
+    vertical_tolerance = 32.0 * np.finfo(np.float64).eps * max(
+        1.0,
+        float(np.max(np.abs(vertical_grid))),
+    )
+    if (
+        np.min(flat_R) < radial_grid[0] - radial_tolerance
+        or np.max(flat_R) > radial_grid[-1] + radial_tolerance
+        or np.min(flat_z) < vertical_grid[0] - vertical_tolerance
+        or np.max(flat_z) > vertical_grid[-1] + vertical_tolerance
+    ):
+        raise ValueError(
+            "projected inverse geometry leaves the public coordinate psi grid."
+        )
+    flat_R = np.clip(flat_R, radial_grid[0], radial_grid[-1])
+    flat_z = np.clip(flat_z, vertical_grid[0], vertical_grid[-1])
+
+    knots_R, knots_z = spline.get_knots()
+    degree_R, degree_z = spline.degrees
+    width_R = degree_R + 1
+    width_z = degree_z + 1
+    coefficient_shape = (
+        knots_R.size - degree_R - 1,
+        knots_z.size - degree_z - 1,
+    )
+    coefficient_count = int(np.prod(coefficient_shape))
+    label_constraint_rows = int(flat_R.size)
+    symmetry_constraint_rows = (
+        int(symmetry_R.size) if include_symmetry_constraints else 0
+    )
+    constraint_row_count = label_constraint_rows + symmetry_constraint_rows
+    label_nonzeros = label_constraint_rows * width_R * width_z
+    # A difference of two tensor rows has at most twice the tensor support.
+    symmetry_nonzeros = (
+        2 * symmetry_constraint_rows * width_R * width_z
+    )
+    estimated_design_nonzeros = label_nonzeros + symmetry_nonzeros
+    repair_diagnostics = {
+        "status": "repair_pending",
+        "tolerance": tolerance,
+        "repair_strategy": repair_strategy,
+        "repair_performed": False,
+        "coefficient_count": coefficient_count,
+        "candidate_label_rows": candidate_label_rows,
+        "candidate_symmetry_rows": candidate_symmetry_rows,
+        "assembled_label_rows": label_constraint_rows,
+        "assembled_symmetry_rows": symmetry_constraint_rows,
+        "assembled_constraint_rows": constraint_row_count,
+        "estimated_design_nonzeros": estimated_design_nonzeros,
+    }
+    exceeds_budget = (
+        coefficient_count > int(max_coefficients)
+        or constraint_row_count > int(max_constraint_rows)
+        or estimated_design_nonzeros > int(max_design_nonzeros)
+    )
+    if repair_strategy == "bounded" and exceeds_budget:
+        repair_diagnostics["status"] = "repair_rejected_by_size"
+        repair_diagnostics.update({
+            "max_coefficients": int(max_coefficients),
+            "max_constraint_rows": int(max_constraint_rows),
+            "max_design_nonzeros": int(max_design_nonzeros),
+        })
+        raise ProjectedFluxBridgeSizeError(
+            "Projected coordinate psi repair exceeds the bounded sparse-solve "
+            "budget: "
+            f"coefficients={coefficient_count}, "
+            f"rows={constraint_row_count}, "
+            f"estimated_nonzeros={estimated_design_nonzeros}. "
+            "Use a looser bridge_flux_tolerance when the normalized mapping "
+            "error is acceptable, or explicitly pass repair_strategy='allow' "
+            "after reviewing these diagnostics.",
+            repair_diagnostics,
+        )
+
+    def tensor_design(
+        sample_R: np.ndarray,
+        sample_z: np.ndarray,
+    ) -> csr_matrix:
+        sample_radial = np.asarray(sample_R, dtype=np.float64).ravel()
+        sample_vertical = np.asarray(sample_z, dtype=np.float64).ravel()
+        basis_R = BSpline.design_matrix(
+            sample_radial,
+            knots_R,
+            degree_R,
+        ).tocsr()
+        basis_z = BSpline.design_matrix(
+            sample_vertical,
+            knots_z,
+            degree_z,
+        ).tocsr()
+        if not (
+            np.all(np.diff(basis_R.indptr) == width_R)
+            and np.all(np.diff(basis_z.indptr) == width_z)
+        ):
+            raise RuntimeError("Unexpected tensor-product spline basis layout.")
+        indices_R = basis_R.indices.reshape(sample_radial.size, width_R)
+        indices_z = basis_z.indices.reshape(sample_vertical.size, width_z)
+        data_R = basis_R.data.reshape(sample_radial.size, width_R)
+        data_z = basis_z.data.reshape(sample_vertical.size, width_z)
+        columns = (
+            indices_R[:, :, None] * coefficient_shape[1]
+            + indices_z[:, None, :]
+        ).reshape(-1)
+        data = (data_R[:, :, None] * data_z[:, None, :]).reshape(-1)
+        rows = np.repeat(
+            np.arange(sample_radial.size, dtype=np.int64),
+            width_R * width_z,
+        )
+        return csr_matrix(
+            (data, (rows, columns)),
+            shape=(sample_radial.size, int(np.prod(coefficient_shape))),
+        )
+
+    design = tensor_design(flat_R, flat_z)
+
+    coefficients = np.asarray(spline.get_coeffs(), dtype=np.float64)
+    label_right_hand_side = (
+        target_vector - design @ coefficients
+    ) / scale
+    # Flux labels are the hard physical contract. Reflection rows regularize
+    # the otherwise underdetermined public-grid correction without allowing
+    # it to amplify the interpolation-limited field asymmetry between fitted
+    # surfaces.
+    label_weight = 1000.0 if include_symmetry_constraints else 1.0
+    design_blocks = [label_weight * design]
+    right_hand_side_blocks = [label_weight * label_right_hand_side]
+    if include_symmetry_constraints:
+        symmetry_design = tensor_design(symmetry_R, symmetry_z) - tensor_design(
+            symmetry_R,
+            reflected_symmetry_z,
+        )
+        design_blocks.append(symmetry_design)
+        right_hand_side_blocks.append(
+            -(symmetry_design @ coefficients) / scale
+        )
+    combined_design = vstack(design_blocks, format="csr")
+    right_hand_side = np.concatenate(right_hand_side_blocks)
+    if tolerance <= 1.0e-8:
+        solver_tolerance = 1.0e-14
+        solver_iteration_limit = 4000
+    else:
+        solver_tolerance = min(1.0e-8, 1.0e-2 * tolerance)
+        solver_iteration_limit = max(
+            250,
+            int(np.ceil(4000.0 * np.sqrt(1.0e-8 / tolerance))),
+        )
+    solution = lsqr(
+        combined_design,
+        right_hand_side,
+        atol=solver_tolerance,
+        btol=solver_tolerance,
+        iter_lim=solver_iteration_limit,
+    )
+    corrected_coefficients = coefficients + scale * solution[0]
+
+    grid_basis_R = BSpline.design_matrix(
+        radial_grid,
+        knots_R,
+        degree_R,
+    )
+    grid_basis_z = BSpline.design_matrix(
+        vertical_grid,
+        knots_z,
+        degree_z,
+    )
+    corrected_values = np.asarray(
+        grid_basis_R
+        @ corrected_coefficients.reshape(coefficient_shape)
+        @ grid_basis_z.T,
+        dtype=np.float64,
+    )
+    corrected_spline = RectBivariateSpline(
+        radial_grid,
+        vertical_grid,
+        corrected_values,
+        kx=degree_R,
+        ky=degree_z,
+        s=0.0,
+    )
+    final_residual = surface_residual(corrected_spline)
+    maximum_final_residual = float(np.max(final_residual))
+    if maximum_final_residual > tolerance:
+        raise ValueError(
+            "public projected coordinate psi bridge no longer matches its "
+            "physical-flux labels: "
+            f"residual={maximum_final_residual:.3e}"
+        )
+    final_symmetry_residual = 0.0
+    if symmetry_R.size:
+        final_symmetry_residual = float(
+            np.max(
+                np.abs(
+                    corrected_spline.ev(symmetry_R, symmetry_z)
+                    - corrected_spline.ev(
+                        symmetry_R,
+                        reflected_symmetry_z,
+                    )
+                )
+            ) / scale
+        )
+        symmetry_limit = max(tolerance, initial_symmetry_residual)
+        if final_symmetry_residual > symmetry_limit * (1.0 + 1.0e-8):
+            raise ValueError(
+                "public projected coordinate psi bridge amplified its "
+                "reflection asymmetry in the fitted annulus: "
+                f"initial={initial_symmetry_residual:.3e}, "
+                f"final={final_symmetry_residual:.3e}"
+            )
+    return corrected_values, {
+        "initial_residual": initial_residual,
+        "final_residual": final_residual,
+        "initial_symmetry_residual": initial_symmetry_residual,
+        "final_symmetry_residual": final_symmetry_residual,
+        "relative_grid_correction": float(
+            np.max(np.abs(corrected_values - values)) / scale
+        ),
+        "solver_stop_code": int(solution[1]),
+        "solver_iterations": int(solution[2]),
+        "status": (
+            "label_and_symmetry_repair"
+            if include_symmetry_constraints
+            else "label_repair"
+        ),
+        "tolerance": tolerance,
+        "repair_strategy": repair_strategy,
+        "repair_performed": True,
+        "coefficient_count": coefficient_count,
+        "candidate_label_rows": candidate_label_rows,
+        "candidate_symmetry_rows": candidate_symmetry_rows,
+        "assembled_label_rows": label_constraint_rows,
+        "assembled_symmetry_rows": symmetry_constraint_rows,
+        "assembled_constraint_rows": constraint_row_count,
+        "estimated_design_nonzeros": estimated_design_nonzeros,
+        "solver_atol": solver_tolerance,
+        "solver_btol": solver_tolerance,
+        "solver_iteration_limit": solver_iteration_limit,
+    }
+
+
+def _extend_radial_support(
+    core: np.ndarray,
+    *,
+    lower_bound: float,
+    upper_bound: float,
+    guard_surfaces: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Add hidden same-spacing guard nodes without changing the core grid."""
+    values = np.asarray(core, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or values.size < 2
+        or not np.all(np.isfinite(values))
+        or np.any(np.diff(values) <= 0.0)
+    ):
+        raise ValueError("radial core grid must be finite and strictly increasing.")
+    if isinstance(guard_surfaces, bool) or not isinstance(
+        guard_surfaces,
+        (int, np.integer),
+    ):
+        raise TypeError("radial_guard_surfaces must be an integer.")
+    guard_count = int(guard_surfaces)
+    if guard_count < 0:
+        raise ValueError("radial_guard_surfaces must be non-negative.")
+    if not (
+        np.isfinite(lower_bound)
+        and np.isfinite(upper_bound)
+        and lower_bound < upper_bound
+        and lower_bound <= values[0] < values[-1] <= upper_bound
+    ):
+        raise ValueError("radial support bounds must contain the core grid.")
+
+    left_step = values[1] - values[0]
+    right_step = values[-1] - values[-2]
+    left = values[0] - left_step * np.arange(guard_count, 0, -1)
+    right = values[-1] + right_step * np.arange(1, guard_count + 1)
+    left = left[left > lower_bound]
+    right = right[right < upper_bound]
+    support = np.concatenate((left, values, right))
+    core_indices = left.size + np.arange(values.size, dtype=np.int64)
+    if not np.array_equal(support[core_indices], values):
+        raise RuntimeError("radial support construction changed the requested core.")
+    return support, core_indices
+
+
+def _normalized_resolvable_axis_flux(
+    psi_at_axis: float,
+    *,
+    psi_axis: float,
+    psi_boundary: float,
+) -> float:
+    """Return the non-negative normalized flux represented at the axis."""
+    values = np.asarray(
+        [psi_at_axis, psi_axis, psi_boundary],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("axis and boundary flux values must be finite.")
+    span = float(psi_boundary - psi_axis)
+    if abs(span) <= np.finfo(np.float64).tiny:
+        raise ValueError("axis and boundary flux values must be distinct.")
+    normalized = float((psi_at_axis - psi_axis) / span)
+    if normalized > 1.0:
+        raise ValueError(
+            "the interpolated axis flux lies beyond the boundary flux."
+        )
+    return float(np.clip(normalized, 0.0, 1.0))
+
+
+def _outboard_midplane_seeds(
+    R: np.ndarray,
+    psi: np.ndarray,
+    target_rho: np.ndarray,
+    *,
+    psi_axis: float,
+    psi_boundary: float,
+) -> np.ndarray:
+    """Invert the monotone outboard flux branch without cubic overshoot."""
+    radial = np.asarray(R, dtype=np.float64)
+    flux = np.asarray(psi, dtype=np.float64)
+    targets = np.asarray(target_rho, dtype=np.float64)
+    if (
+        radial.ndim != 1
+        or flux.shape != radial.shape
+        or targets.ndim != 1
+        or radial.size < 2
+        or not np.all(np.isfinite(radial))
+        or not np.all(np.isfinite(flux))
+        or not np.all(np.isfinite(targets))
+        or np.any(np.diff(radial) <= 0.0)
+        or np.any(np.diff(targets) <= 0.0)
+    ):
+        raise ValueError(
+            "outboard seed inversion requires finite increasing radial grids."
+        )
+    span = float(psi_boundary - psi_axis)
+    if not np.isfinite(span) or abs(span) <= np.finfo(np.float64).tiny:
+        raise ValueError("axis and boundary flux values must be distinct.")
+
+    normalized = (flux - float(psi_axis)) / span
+    rho = np.sqrt(np.clip(normalized, 0.0, None))
+    monotone_rho = np.maximum.accumulate(rho)
+    scale = max(1.0, float(np.max(np.abs(monotone_rho))))
+    tolerance = 64.0 * np.finfo(np.float64).eps * scale
+    keep = np.concatenate(
+        ([True], np.diff(monotone_rho) > tolerance)
+    )
+    rho_nodes = monotone_rho[keep]
+    radial_nodes = radial[keep]
+    if rho_nodes.size < 2:
+        raise ValueError("outboard midplane flux does not form an invertible branch.")
+    if (
+        targets[0] < rho_nodes[0] - tolerance
+        or targets[-1] > rho_nodes[-1] + tolerance
+    ):
+        raise ValueError(
+            "requested radial labels leave the resolvable outboard flux branch: "
+            f"requested=[{targets[0]:.6g}, {targets[-1]:.6g}], "
+            f"available=[{rho_nodes[0]:.6g}, {rho_nodes[-1]:.6g}]."
+        )
+
+    seeds = np.asarray(
+        PchipInterpolator(
+            rho_nodes,
+            radial_nodes,
+            extrapolate=False,
+        )(targets),
+        dtype=np.float64,
+    )
+    if (
+        not np.all(np.isfinite(seeds))
+        or np.any(np.diff(seeds) <= 0.0)
+        or seeds[0] < radial[0] - tolerance
+        or seeds[-1] > radial[-1] + tolerance
+    ):
+        raise ValueError("outboard midplane seed inversion produced invalid seeds.")
+    return seeds
+
+
+def _inverse_toroidal_derivatives(
+    dpsi_dR,
+    dpsi_dZ,
+    dtheta_dR,
+    dtheta_dZ,
+    dnu_dR,
+    dnu_dZ,
+):
+    r"""Return inverse toroidal derivatives for ``zeta = phi + nu``.
+
+    The denominator here is the direct two-dimensional determinant
+
+    ``D_RZ = det(partial(psi, theta) / partial(R, Z))``.
+
+    It is distinct from the signed physical coordinate Jacobian
+
+    ``J = [grad(psi) . (grad(theta) x grad(zeta))]**-1 = -R / D_RZ``.
+
+    In particular, ``phi = zeta - nu(psi, theta)`` makes
+    ``partial(phi)/partial(zeta)`` exactly one.
+    """
+    direct_det = dpsi_dR * dtheta_dZ - dpsi_dZ * dtheta_dR
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dphi_dpsi = (
+            dtheta_dR * dnu_dZ - dtheta_dZ * dnu_dR
+        ) / direct_det
+        dphi_dtheta = (
+            dpsi_dZ * dnu_dR - dpsi_dR * dnu_dZ
+        ) / direct_det
+    dphi_dzeta = np.ones_like(direct_det, dtype=np.float64)
+    return direct_det, dphi_dpsi, dphi_dtheta, dphi_dzeta
 
 
 def _require_matplotlib_pyplot():
@@ -176,7 +959,15 @@ class equilibrium:
     psi_ax : float
         Poloidal flux at magnetic axis
     phiclockwise : bool, optional
-        Whether toroidal angle increases clockwise. Default is True
+        Orientation of arrays supplied directly to this generic constructor.
+        Default is False, the canonical internal COCOS-1 orientation.
+    flux_normalization : {"Wb", "Wb/rad"}, optional
+        Poloidal-flux normalization of the supplied arrays. Default is
+        ``"Wb/rad"``.
+    R_boundary, z_boundary : np.ndarray, optional
+        Paired coordinates of a supplied plasma boundary. When both are
+        provided they define the LCFS used by the equilibrium; otherwise the
+        LCFS is reconstructed from the ``rhopol=1`` contour.
 
     Attributes
     ----------
@@ -213,7 +1004,10 @@ class equilibrium:
         zaxis: float,
         psi_edge: float,
         psi_ax: float,
-        phiclockwise: bool = True
+        phiclockwise: bool = False,
+        flux_normalization: Literal["Wb", "Wb/rad"] = "Wb/rad",
+        R_boundary: Optional[np.ndarray] = None,
+        z_boundary: Optional[np.ndarray] = None,
     ) -> None:
         """
         Initialize a generic equilibrium.
@@ -241,7 +1035,16 @@ class equilibrium:
         psi_ax : float
             Poloidal flux at magnetic axis
         phiclockwise : bool, optional
-            Whether toroidal angle increases clockwise. Default is True
+            Toroidal-angle orientation of the supplied arrays. Default is
+            False.
+        flux_normalization : {"Wb", "Wb/rad"}, optional
+            Poloidal-flux normalization of the supplied arrays. Default is
+            ``"Wb/rad"``.
+        R_boundary, z_boundary : np.ndarray, optional
+            Paired coordinates of a supplied plasma boundary. Both arrays
+            must be finite, one-dimensional, have the same length, and span
+            the magnetic axis in both coordinate ranges. If omitted, the
+            boundary is reconstructed from the ``rhopol=1`` contour.
 
         Raises
         ------
@@ -250,7 +1053,13 @@ class equilibrium:
         """
         rgrid = np.atleast_1d(rgrid)
         zgrid = np.atleast_1d(zgrid)
-        self.phiclockwise = phiclockwise
+        if not isinstance(phiclockwise, (bool, np.bool_)):
+            raise TypeError("phiclockwise must be a boolean.")
+        if flux_normalization not in ("Wb", "Wb/rad"):
+            raise ValueError("flux_normalization must be either 'Wb' or 'Wb/rad'")
+
+        self.phiclockwise = bool(phiclockwise)
+        self.flux_normalization = flux_normalization
         
         # Store axis values for later use in _build_structured_data
         self._Raxis_init = Raxis
@@ -357,29 +1166,75 @@ class equilibrium:
                                                 attrs={'name': 'Psi',
                                                         'desc': 'Poloidal magnetic flux',
                                                         'short_name': '$\\Psi$',
-                                                        'units': 'Wb'})
+                                                        'units': self.flux_normalization})
+
+        psimax = psi_edge - psi_ax
+        flux_tolerance = max(1.0e-10, 1.0e-3 * abs(psimax))
 
         # Checking consistency of the axis flux.
         psiax_intrp = self.fluxdata.psipol.interp(R=Raxis, z=zaxis, method='cubic')
-        if(np.abs(psiax_intrp - psi_ax) > 1.0e-4):
+        if np.abs(psiax_intrp - psi_ax) > flux_tolerance:
             raise ValueError('The specified magnetic axis is not ' +
                              'consistent with the input flux: ' +
                              '%f (evaluated) vs %f (input)' % (psiax_intrp, psi_ax))
 
         # With the psipol, we get the magnetic axis and the separatrix values
         # for the flux to finally get rhopol.
-        psimax = psi_edge - psi_ax
         self.fluxdata['rhopol'] = np.sqrt((self.fluxdata.psipol - psi_ax) / psimax)
         self.fluxdata.rhopol.attrs['units'] = ''
         self.fluxdata.rhopol.attrs['desc'] = 'Radial magnetic coordinate'
         self.fluxdata.rhopol.attrs['name'] = 'rhopol'
         self.fluxdata.rhopol.attrs['short_name'] = '$\\rho_{pol}$'
 
-        # From this rhopol, we can get the separatrix contour line.
-        R, z = self.rhopol2rz((1.0,))
-        if len(R) == 1:
-            R = R[0]
-            z = z[0]
+        supplied_boundary = R_boundary is not None or z_boundary is not None
+        if supplied_boundary:
+            if R_boundary is None or z_boundary is None:
+                raise ValueError(
+                    "R_boundary and z_boundary must be provided together."
+                )
+            R = np.array(R_boundary, dtype=np.float64, copy=True)
+            z = np.array(z_boundary, dtype=np.float64, copy=True)
+            if (
+                R.ndim != 1
+                or z.ndim != 1
+                or R.shape != z.shape
+                or R.size < 3
+                or not np.all(np.isfinite(R))
+                or not np.all(np.isfinite(z))
+            ):
+                raise ValueError(
+                    "The supplied plasma boundary must contain matching finite "
+                    "one-dimensional R and z arrays with at least three points."
+                )
+            if (
+                np.min(R) >= Raxis
+                or np.max(R) <= Raxis
+                or np.min(z) >= zaxis
+                or np.max(z) <= zaxis
+            ):
+                raise ValueError(
+                    "The supplied plasma boundary must span the magnetic axis "
+                    "within its R-z bounds."
+                )
+            if (
+                np.min(R) < rgrid.min()
+                or np.max(R) > rgrid.max()
+                or np.min(z) < zgrid.min()
+                or np.max(z) > zgrid.max()
+            ):
+                raise ValueError(
+                    "The supplied plasma boundary must lie inside the "
+                    "equilibrium grid."
+                )
+            boundary_source = "supplied"
+        else:
+            # Generic equilibria without an explicit LCFS retain the contour
+            # reconstruction fallback.
+            R, z = self.rhopol2rz((1.0,))
+            if len(R) == 1:
+                R = R[0]
+                z = z[0]
+            boundary_source = "rhopol_contour"
 
         self._boundary = xr.Dataset()
         self._boundary['R'] = xr.DataArray(R, dims=('idx',),
@@ -396,12 +1251,13 @@ class equilibrium:
         # Checking consistency of the flux at the LCFS.
         psiedge_intrp = self.fluxdata.psipol.interp(R=self._boundary.R[0],
                                                     z=self._boundary.z[0], method='cubic')
-        if(np.abs(psiedge_intrp - psi_edge) > 1.0e-4):
+        if np.abs(psiedge_intrp - psi_edge) > flux_tolerance:
             raise ValueError('The specified separatrix flux is not consistent with the equilibrium.')
 
         self._boundary.attrs['psi_bdy'] = psi_edge
         self._boundary.attrs['psi_ax'] = psi_ax
         self._boundary.attrs['psimax'] = psimax
+        self._boundary.attrs['source'] = boundary_source
 
         # Getting the radius of the separatrix at the geometrical midplane.
         rgrid_max = float(self.Rgrid.values[-1])
@@ -1238,9 +2094,9 @@ class equilibrium:
         print(f"  B_axis = {float(self.Bdata.Baxis.values):.3f} T")
         
         print(f"\nFlux Surfaces:")
-        print(f"  psi_ax = {self.geometry.attrs.get('psi_ax', 'N/A'):.3e} Wb")
-        print(f"  psi_bdy = {self.geometry.attrs.get('psi_bdy', 'N/A'):.3e} Wb")
-        print(f"  psimax = {self.geometry.attrs.get('psimax', 'N/A'):.3e} Wb")
+        print(f"  psi_ax = {self.geometry.attrs.get('psi_ax', 'N/A'):.3e} {self.flux_normalization}")
+        print(f"  psi_bdy = {self.geometry.attrs.get('psi_bdy', 'N/A'):.3e} {self.flux_normalization}")
+        print(f"  psimax = {self.geometry.attrs.get('psimax', 'N/A'):.3e} {self.flux_normalization}")
         
         if len(self._profiles) > 0:
             print(f"\nProfiles available:")
@@ -1612,13 +2468,223 @@ class equilibrium:
         return self.plot2d_var(var, name=name, ax=ax,
                               put_labels=put_labels, image=image, **kwargs)
 
+    def _coordinate_checkpoint_source_arrays(self) -> Dict[str, np.ndarray]:
+        """Return the authoritative arrays that determine coordinate output."""
+
+        arrays = {
+            "Rgrid": np.asarray(self.Rgrid, dtype=np.float64),
+            "zgrid": np.asarray(self.zgrid, dtype=np.float64),
+            "psi": np.asarray(self.flux.psi, dtype=np.float64),
+            "Br": np.asarray(self.field.Br, dtype=np.float64),
+            "Bz": np.asarray(self.field.Bz, dtype=np.float64),
+            "Bphi": np.asarray(self.field.Bphi, dtype=np.float64),
+            "axis_and_flux": np.asarray(
+                [
+                    float(self.geometry.R_axis.values),
+                    float(self.geometry.z_axis.values),
+                    float(
+                        self.geometry.attrs.get("psi_ax", self._psi_ax_init)
+                    ),
+                    float(
+                        self.geometry.attrs.get(
+                            "psi_bdy",
+                            self._psi_edge_init,
+                        )
+                    ),
+                ],
+                dtype=np.float64,
+            ),
+        }
+        if "R_boundary" in self.geometry:
+            arrays["R_boundary"] = np.asarray(
+                self.geometry.R_boundary,
+                dtype=np.float64,
+            )
+        if "z_boundary" in self.geometry:
+            arrays["z_boundary"] = np.asarray(
+                self.geometry.z_boundary,
+                dtype=np.float64,
+            )
+        return arrays
+
+    @staticmethod
+    def _coordinate_checkpoint_state_arrays(
+        *,
+        psigrid: np.ndarray,
+        thtable: np.ndarray,
+        nutable: np.ndarray,
+        jacobian: np.ndarray,
+        Rtransform: np.ndarray,
+        ztransform: np.ndarray,
+        Rgrid: np.ndarray,
+        zgrid: np.ndarray,
+        q: np.ndarray,
+        F: np.ndarray,
+        I: np.ndarray,
+        core_indices: np.ndarray,
+        coordinate_psi_field: Optional[np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        state = {
+            "psigrid": np.asarray(psigrid),
+            "thtable": np.asarray(thtable),
+            "nutable": np.asarray(nutable),
+            "jacobian": np.asarray(jacobian),
+            "Rtransform": np.asarray(Rtransform),
+            "ztransform": np.asarray(ztransform),
+            "Rgrid": np.asarray(Rgrid),
+            "zgrid": np.asarray(zgrid),
+            "q": np.asarray(q),
+            "F": np.asarray(F),
+            "I": np.asarray(I),
+            "core_indices": np.asarray(core_indices, dtype=np.int64),
+        }
+        if coordinate_psi_field is not None:
+            state["coordinate_psi_field"] = np.asarray(
+                coordinate_psi_field,
+                dtype=np.float64,
+            )
+        return state
+
+    def _coordinate_result_from_checkpoint(
+        self,
+        arrays: Mapping[str, np.ndarray],
+        metadata: Mapping[str, Any],
+        *,
+        materialize_rz: bool,
+        build_metric_cache: bool,
+    ) -> Union[MagneticCoordinates, MagneticCoordinateMapProduct]:
+        """Reconstruct a coordinate result from verified primitive state."""
+
+        required = {
+            "psigrid",
+            "thtable",
+            "nutable",
+            "jacobian",
+            "Rtransform",
+            "ztransform",
+            "Rgrid",
+            "zgrid",
+            "q",
+            "F",
+            "I",
+            "core_indices",
+        }
+        missing = sorted(required.difference(arrays))
+        if missing:
+            raise ValueError(
+                "Coordinate checkpoint is missing construction arrays: "
+                + ", ".join(missing)
+            )
+        accuracy = CoordinateAccuracy(**dict(metadata["accuracy"]))
+        return self._build_magnetic_coordinates_dataset(
+            arrays["psigrid"],
+            arrays["thtable"],
+            arrays["nutable"],
+            arrays["jacobian"],
+            arrays["Rtransform"],
+            arrays["ztransform"],
+            arrays["Rgrid"],
+            arrays["zgrid"],
+            arrays["q"],
+            arrays["F"],
+            arrays["I"],
+            int(metadata["ntht_pad"]),
+            str(metadata["coordinate_system"]),
+            spectral_max_mode=int(metadata["spectral_max_mode"]),
+            core_indices=np.asarray(arrays["core_indices"], dtype=np.int64),
+            radial_support_metadata=dict(
+                metadata.get("radial_support_metadata", {})
+            ),
+            symmetry_projection_audit=metadata.get(
+                "symmetry_projection_audit"
+            ),
+            coordinate_psi_field=arrays.get("coordinate_psi_field"),
+            coordinate_accuracy=accuracy,
+            construction_diagnostics=dict(
+                metadata.get("construction_diagnostics", {})
+            ),
+            materialize_rz=materialize_rz,
+            build_metric_cache=build_metric_cache,
+        )
+
+    def _activate_coordinate_result(
+        self,
+        coordinate_system: str,
+        result: Union[MagneticCoordinates, MagneticCoordinateMapProduct],
+    ) -> None:
+        """Expose the most recent result without changing legacy caches."""
+
+        coord_sys_lower = str(coordinate_system).lower()
+        self.coord_sys = coord_sys_lower
+        if isinstance(result, MagneticCoordinateMapProduct):
+            if not hasattr(self, "_coordinate_map_product_cache"):
+                self._coordinate_map_product_cache = {}
+            self._coordinate_map_product_cache[coord_sys_lower] = result
+            self.coordinate_map_product = result
+            return
+        if not hasattr(self, "_magnetic_coordinates_cache"):
+            self._magnetic_coordinates_cache = {}
+        self._magnetic_coordinates_cache[coord_sys_lower] = result
+        self.magnetic_coordinates = result
+
+    def _store_coordinate_build_cache(
+        self,
+        key: tuple[Any, ...],
+        result: Union[MagneticCoordinates, MagneticCoordinateMapProduct],
+        *,
+        enabled: bool,
+    ) -> None:
+        """Retain only the latest exact result requested for reuse.
+
+        Full coordinate objects can own gigabyte-scale R-z arrays.  A single
+        entry captures immediate repeated calls without allowing accuracy or
+        resolution scans to accumulate an unbounded second result cache.  The
+        historical per-coordinate-system cache remains the public ``coords``
+        interface and continues to retain its latest result.
+        """
+
+        if not hasattr(self, "_coordinate_build_cache"):
+            self._coordinate_build_cache = {}
+        if not enabled:
+            self._coordinate_build_cache.clear()
+            return
+        if key not in self._coordinate_build_cache:
+            self._coordinate_build_cache.clear()
+        self._coordinate_build_cache[key] = result
+        while len(self._coordinate_build_cache) > _COORDINATE_RESULT_CACHE_LIMIT:
+            self._coordinate_build_cache.pop(next(iter(self._coordinate_build_cache)))
+
     def compute_coordinates(self, coordinate_system: str='boozer',
                            lpsi: int=201, ltheta: int=256,
                            dr_hr: float=1.0e-3, dz_hz: float=1.0e-3,
                            padding: float=0.05, ntht_pad: int=5,
                            rhopol_min: Optional[float]=None,
                            rhopol_max: Optional[float]=None,
-                           spectral_max_mode: int=16):
+                           spectral_max_mode: int=16,
+                           radial_guard_surfaces: int=3,
+                           enforce_up_down_symmetry: bool=False,
+                           symmetry_tolerance: Optional[float]=None,
+                           coordinate_accuracy: Optional[
+                               Union[
+                                   CoordinateAccuracy,
+                                   CoordinateAccuracyProfile,
+                               ]
+                           ]=None,
+                           bridge_flux_tolerance: Optional[float]=None,
+                           surface_flux_tolerance: Optional[float]=None,
+                           constraint_flux_tolerance: Optional[float]=None,
+                           theta_tolerance: Optional[float]=None,
+                           projected_bridge_repair_strategy: Literal[
+                               "bounded", "allow"
+                           ]="bounded",
+                           n_theta_geom: Optional[int]=None,
+                           materialize_rz: bool=True,
+                           build_metric_cache: bool=False,
+                           reuse_cache: bool=True,
+                           checkpoint_dir: Optional[
+                               Union[str, os.PathLike]
+                           ]=None,
+                           reuse_checkpoint: bool=True):
         """
         Compute magnetic coordinates for the specified coordinate system.
 
@@ -1636,9 +2702,11 @@ class equilibrium:
         ltheta : int, optional
             Number of points along the poloidal direction. Default is 256
         dr_hr : float, optional
-            Radial step for the coordinate grid. Default is 1.0e-3
+            Requested radial step for the tracing grid. Refinement is capped
+            at four samples per native equilibrium cell. Default is 1.0e-3.
         dz_hz : float, optional
-            Poloidal step for the coordinate grid. Default is 1.0e-3
+            Requested vertical step for the tracing grid. Refinement is capped
+            at four samples per native equilibrium cell. Default is 1.0e-3.
         padding : float, optional
             Padding for the coordinate grid. Default is 0.05
         ntht_pad : int, optional
@@ -1654,11 +2722,63 @@ class equilibrium:
         spectral_max_mode : int, optional
             Maximum retained poloidal Fourier mode in the spectral surface
             reconstruction. Default is 16.
+        radial_guard_surfaces : int, optional
+            Number of hidden same-spacing radial support surfaces added on
+            each physically available side of the requested grid. The returned
+            ``psi0`` grid still contains exactly ``lpsi`` points. Default is 3.
+        enforce_up_down_symmetry : bool, optional
+            Explicitly project the common ``R(psi,theta)``, ``z(psi,theta)``,
+            and ``nu(psi,theta)`` map onto up-down parity before derivatives
+            and metrics are constructed. General equilibria remain unchanged
+            by default.
+        symmetry_tolerance : float, optional
+            Maximum relative R/Z asymmetry accepted when explicit projection
+            is requested. A finite positive value is required whenever
+            ``enforce_up_down_symmetry=True``.
+        coordinate_accuracy : {"standard", "strict"} or CoordinateAccuracy, optional
+            Accuracy profile for approximation and nonlinear-solver stopping
+            criteria. The default ``"standard"`` profile uses normalized
+            bridge, surface, and constraint flux tolerances of ``1e-5``,
+            ``1e-7``, and ``1e-7``, plus a ``1e-8`` radian angular tolerance.
+            ``"strict"`` retains the previous pyCOCOS thresholds.
+        bridge_flux_tolerance, surface_flux_tolerance, constraint_flux_tolerance : float, optional
+            Explicit normalized-flux overrides applied after the selected
+            accuracy profile.
+        theta_tolerance : float, optional
+            Explicit angular Newton-update tolerance in radians.
+        projected_bridge_repair_strategy : {"bounded", "allow"}, optional
+            ``"bounded"`` rejects pathological sparse bridge repairs before
+            their design matrices are assembled. ``"allow"`` explicitly
+            opts into repairs exceeding the default memory-size budget.
+        n_theta_geom : int, optional
+            Explicit surface-tracing and quadrature resolution. By default a
+            workload-scaled power of two is selected from ``ltheta`` and
+            ``spectral_max_mode``.
+        materialize_rz : bool, optional
+            If False, return a lightweight spectral map product and defer the
+            expensive full R-z inverse/derivative construction. Default True
+            preserves the historical return type.
+        build_metric_cache : bool, optional
+            Construct the full derived Lamé and metric caches eagerly. This is
+            independent of the coordinate derivatives themselves. The default
+            False builds them transparently on first access.
+        reuse_cache : bool, optional
+            Reuse an exactly matching result already computed by this
+            equilibrium instance. Default True.
+        checkpoint_dir : path-like, optional
+            Content-addressed checkpoint root for the expensive traced and
+            fitted surface state. Matching checkpoints bypass surface tracing
+            on later processes or equilibrium instances.
+        reuse_checkpoint : bool, optional
+            Load an existing verified checkpoint when available. If False, a
+            matching existing checkpoint is verified after construction but
+            is not used as an input. Default True.
 
         Returns
         -------
-        MagneticCoordinates
-            Magnetic coordinates object containing the transformation
+        MagneticCoordinates or MagneticCoordinateMapProduct
+            Full magnetic coordinates by default, or a map-only product when
+            ``materialize_rz=False``.
 
         Notes
         -----
@@ -1666,8 +2786,150 @@ class equilibrium:
         (e.g. ``boozer``, ``pest``, ``equal_arc``, ``hamada``). Any registered
         system can be computed by passing its name.
         """
+        accuracy = resolve_coordinate_accuracy(
+            coordinate_accuracy,
+            bridge_flux_tolerance=bridge_flux_tolerance,
+            surface_flux_tolerance=surface_flux_tolerance,
+            constraint_flux_tolerance=constraint_flux_tolerance,
+            theta_tolerance=theta_tolerance,
+        )
+
+        for name, value in (
+            ("materialize_rz", materialize_rz),
+            ("build_metric_cache", build_metric_cache),
+            ("reuse_cache", reuse_cache),
+            ("reuse_checkpoint", reuse_checkpoint),
+        ):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be boolean.")
+
         # Get the Jacobian function for this coordinate system
         jacobian_func = get_jacobian_function(coordinate_system)
+        (
+            jacobian_runtime_cache_token,
+            jacobian_persistent_cache_version,
+        ) = _get_jacobian_cache_identity(coordinate_system)
+        if (
+            checkpoint_dir is not None
+            and jacobian_persistent_cache_version is None
+        ):
+            raise ValueError(
+                "Persistent coordinate checkpoints for a custom coordinate "
+                "system require register_coordinate_system(..., "
+                "cache_version='...')."
+            )
+
+        source_arrays = self._coordinate_checkpoint_source_arrays()
+        build_config = {
+            "coordinate_system": str(coordinate_system).lower(),
+            "jacobian_module": str(getattr(jacobian_func, "__module__", "")),
+            "jacobian_qualname": str(
+                getattr(jacobian_func, "__qualname__", repr(jacobian_func))
+            ),
+            "jacobian_cache_version": (
+                jacobian_persistent_cache_version
+                if jacobian_persistent_cache_version is not None
+                else jacobian_runtime_cache_token
+            ),
+            "lpsi": int(lpsi),
+            "ltheta": int(ltheta),
+            "dr_hr": float(dr_hr),
+            "dz_hz": float(dz_hz),
+            "padding": float(padding),
+            "ntht_pad": int(ntht_pad),
+            "rhopol_min": None if rhopol_min is None else float(rhopol_min),
+            "rhopol_max": None if rhopol_max is None else float(rhopol_max),
+            "spectral_max_mode": int(spectral_max_mode),
+            "radial_guard_surfaces": int(radial_guard_surfaces),
+            "enforce_up_down_symmetry": bool(enforce_up_down_symmetry),
+            "symmetry_tolerance": (
+                None if symmetry_tolerance is None else float(symmetry_tolerance)
+            ),
+            "bridge_flux_tolerance": float(accuracy.bridge_flux_tolerance),
+            "surface_flux_tolerance": float(accuracy.surface_flux_tolerance),
+            "constraint_flux_tolerance": float(
+                accuracy.constraint_flux_tolerance
+            ),
+            "theta_tolerance": float(accuracy.theta_tolerance),
+            "projected_bridge_repair_strategy": str(
+                projected_bridge_repair_strategy
+            ),
+            "n_theta_geom": (
+                None if n_theta_geom is None else int(n_theta_geom)
+            ),
+            "phiclockwise": bool(self.phiclockwise),
+            "flux_normalization": str(self.flux_normalization),
+            # Reconstructing a checkpoint refits its stored surface tables.
+            # Library versions therefore belong to the durable numerical
+            # identity alongside the explicit algorithm version.
+            "numpy_version": str(np.__version__),
+            "scipy_version": str(scipy.__version__),
+        }
+        construction_key = coordinate_checkpoint_key(
+            source_arrays,
+            build_config,
+            algorithm_version=_COORDINATE_CHECKPOINT_ALGORITHM_VERSION,
+        )
+        checkpoint_cache_token = (
+            None
+            if checkpoint_dir is None
+            else os.path.abspath(os.fspath(checkpoint_dir))
+        )
+        result_cache_key = (
+            construction_key,
+            bool(materialize_rz),
+            bool(build_metric_cache),
+            checkpoint_cache_token,
+        )
+        checkpoint_path = None
+        if checkpoint_dir is not None:
+            checkpoint_path = coordinate_checkpoint_path(
+                checkpoint_dir,
+                construction_key,
+            )
+        if not hasattr(self, "_coordinate_build_cache"):
+            self._coordinate_build_cache = {}
+        if not reuse_cache:
+            self._coordinate_build_cache.clear()
+        if reuse_cache and result_cache_key in self._coordinate_build_cache:
+            if checkpoint_path is None or checkpoint_path.is_dir():
+                result = self._coordinate_build_cache[result_cache_key]
+                self._activate_coordinate_result(coordinate_system, result)
+                return result
+            # A requested persistent checkpoint was removed externally. Drop
+            # the operational hit and rebuild so the call republishes it.
+            self._coordinate_build_cache.pop(result_cache_key, None)
+        if (
+            checkpoint_path is not None
+            and reuse_checkpoint
+            and checkpoint_path.is_dir()
+        ):
+            loaded = load_coordinate_checkpoint(
+                checkpoint_path,
+                expected_source_arrays=source_arrays,
+                expected_build_config=build_config,
+                expected_algorithm_version=(
+                    _COORDINATE_CHECKPOINT_ALGORITHM_VERSION
+                ),
+            )
+            result = self._coordinate_result_from_checkpoint(
+                loaded.array_group("construction"),
+                loaded.metadata,
+                materialize_rz=bool(materialize_rz),
+                build_metric_cache=bool(build_metric_cache),
+            )
+            result._coordinate_checkpoint = {
+                "key": construction_key,
+                "path": str(checkpoint_path),
+                "status": "loaded",
+            }
+            self._store_coordinate_build_cache(
+                result_cache_key,
+                result,
+                enabled=bool(reuse_cache),
+            )
+            self._activate_coordinate_result(coordinate_system, result)
+            return result
         
         # Build fine grid for flux surface contours
         rmin = float(self.Rgrid.values[0])
@@ -1675,8 +2937,22 @@ class equilibrium:
         zmin = float(self.zgrid.values[0])
         zmax = float(self.zgrid.values[-1])
 
-        nr_fine = int((rmax - rmin) // dr_hr)
-        nz_fine = int((zmax - zmin) // dz_hz)
+        if dr_hr <= 0.0 or dz_hz <= 0.0:
+            raise ValueError("dr_hr and dz_hz must be positive.")
+        requested_nr = int(np.ceil((rmax - rmin) / dr_hr)) + 1
+        requested_nz = int(np.ceil((zmax - zmin) / dz_hz)) + 1
+        # Cubic refinement does not create independent equilibrium
+        # information.  Cap the tracing grid at four samples per native cell
+        # to avoid workstation-scale O(N_R*N_Z) memory growth when callers
+        # retain historical 1 mm settings on a multi-metre domain.
+        nr_fine = max(
+            int(self.nr),
+            min(requested_nr, 4 * (int(self.nr) - 1) + 1),
+        )
+        nz_fine = max(
+            int(self.nz),
+            min(requested_nz, 4 * (int(self.nz) - 1) + 1),
+        )
 
         R_fine = np.linspace(rmin, rmax, nr_fine)
         z_fine = np.linspace(zmin, zmax, nz_fine)
@@ -1690,6 +2966,24 @@ class equilibrium:
         # Generate psi grid (using geometry attributes)
         psi_axis = float(self.geometry.attrs.get('psi_ax', self._psi_ax_init))
         psi_edge = float(self.geometry.attrs.get('psi_bdy', self._psi_edge_init))
+        R_axis_val = float(self.geometry.R_axis.values)
+        z_axis_val = float(self.geometry.z_axis.values)
+        psi_at_axis = np.asarray(
+            RectBivariateSpline(
+                R_fine,
+                z_fine,
+                psip,
+                kx=min(3, R_fine.size - 1),
+                ky=min(3, z_fine.size - 1),
+                s=0.0,
+            ).ev(R_axis_val, z_axis_val),
+            dtype=np.float64,
+        ).item()
+        normalized_axis_floor = _normalized_resolvable_axis_flux(
+            psi_at_axis,
+            psi_axis=psi_axis,
+            psi_boundary=psi_edge,
+        )
         if rhopol_min is not None or rhopol_max is not None:
             rho_min = padding if rhopol_min is None else float(rhopol_min)
             rho_max = 1.0 - padding if rhopol_max is None else float(rhopol_max)
@@ -1700,41 +2994,59 @@ class equilibrium:
             rho_max = min(rho_max, 1.0 - eps)
             if rho_max <= rho_min:
                 raise ValueError("rhopol_min/rhopol_max window is too narrow after edge protection.")
-            psi0 = psi_axis + rho_min**2 * (psi_edge - psi_axis)
-            psi1 = psi_axis + rho_max**2 * (psi_edge - psi_axis)
+            # Distribute the fitted surfaces uniformly in rho while retaining
+            # physical poloidal flux as the interpolation coordinate.  A
+            # uniform-psi mesh severely under-resolves R(psi) ~ sqrt(psi)
+            # near the magnetic axis and corrupts radial map derivatives.
+            rho_grid = np.linspace(rho_min, rho_max, lpsi)
+            rho_axis_floor = float(np.sqrt(normalized_axis_floor))
+            if rho_axis_floor >= rho_grid[0]:
+                raise ValueError(
+                    "The requested inner rhopol surface lies inside the flux "
+                    "range resolved by the interpolated equilibrium field: "
+                    f"requested={rho_grid[0]:.6g}, "
+                    f"resolvable>{rho_axis_floor:.6g}."
+                )
+            support_rho, core_indices = _extend_radial_support(
+                rho_grid,
+                lower_bound=rho_axis_floor,
+                upper_bound=1.0,
+                guard_surfaces=radial_guard_surfaces,
+            )
+            core_psigrid_requested = (
+                psi_axis + rho_grid**2 * (psi_edge - psi_axis)
+            )
+            psigrid = psi_axis + support_rho**2 * (psi_edge - psi_axis)
+            support_family = "rhopol"
         else:
-            psi0 = np.amin([psi_axis, psi_edge])
-            psi1 = np.amax([psi_axis, psi_edge])
-            dpsi = psi1 - psi0
-            psi0 += padding * dpsi
-            psi1 -= padding * dpsi
-        psigrid = np.linspace(psi0, psi1, lpsi)
+            psi_span = psi_edge - psi_axis
+            normalized_core = np.linspace(padding, 1.0 - padding, lpsi)
+            normalized_support, core_indices = _extend_radial_support(
+                normalized_core,
+                lower_bound=normalized_axis_floor,
+                upper_bound=1.0,
+                guard_surfaces=radial_guard_surfaces,
+            )
+            core_psigrid_requested = (
+                psi_axis + normalized_core * psi_span
+            )
+            psigrid = psi_axis + normalized_support * psi_span
+            support_rho = np.sqrt(np.clip(normalized_support, 0.0, 1.0))
+            support_family = "psi_n"
 
         # Transform psigrid to radial positions at midplane (using geometry)
-        R_axis_val = float(self.geometry.R_axis.values)
-        z_axis_val = float(self.geometry.z_axis.values)
         R_bdy_max = float(self.geometry.R_boundary.max().values)
         Rgrid_mid = np.linspace(R_axis_val, R_bdy_max, 1000)
         psi_on_Rgrid = self.flux.psi.interp(R=Rgrid_mid,
                                             z=z_axis_val,
                                             method='cubic')
-        idxsort = np.argsort(psi_on_Rgrid.values)
-        frr0 = InterpolatedUnivariateSpline(psi_on_Rgrid.values[idxsort], 
-                                            Rgrid_mid[idxsort])(psigrid)
-
-        # Remove repeated values
-        idx = np.where(frr0 == frr0[0])[0]
-        if len(idx) > 1:
-            frr0 = np.delete(frr0, idx[:-1])
-            psigrid = np.delete(psigrid, idx[:-1])
-        idx = np.where(frr0 == frr0[-1])[0]
-        if len(idx) > 1:
-            frr0 = np.delete(frr0, idx[1:])
-            psigrid = np.delete(psigrid, idx[1:])
-
-        if psi1 < psi0:
-            psigrid = np.flip(psigrid, axis=0)
-            frr0 = np.flip(frr0, axis=0)
+        frr0 = _outboard_midplane_seeds(
+            Rgrid_mid,
+            np.asarray(psi_on_Rgrid, dtype=np.float64),
+            support_rho,
+            psi_axis=psi_axis,
+            psi_boundary=psi_edge,
+        )
 
         psi_span = psi_edge - psi_axis
         if abs(psi_span) < 1.0e-14:
@@ -1745,6 +3057,7 @@ class equilibrium:
 
         # Compute coordinates using generic function
         # Pass frr0 (radial positions at midplane) corresponding to psigrid
+        coordinate_construction_diagnostics: Dict[str, Any] = {}
         out = compute_magnetic_coordinates(
             Rgrid=R_fine, zgrid=z_fine,
             br=br_fine, bz=bz_fine, bphi=bphi_fine,
@@ -1758,21 +3071,310 @@ class equilibrium:
             rho_at_psi=rho_at_psi,
             coordinate_system=coordinate_system,
             spectral_max_mode=spectral_max_mode,
+            n_theta_geom=n_theta_geom,
+            psi_field=psip,
+            flux_scale=abs(psi_edge - psi_axis),
+            enforce_up_down_symmetry=enforce_up_down_symmetry,
+            symmetry_tolerance=symmetry_tolerance,
+            surface_projection_tolerance=accuracy.surface_flux_tolerance,
+            diagnostics=coordinate_construction_diagnostics,
         )
 
         qprof, Fprof, Iprof, thtable, nutable, jac, Rtransform, ztransform = out
-
-        if psi1 < psi0:
-            thtable = np.flip(thtable, axis=0)
-            nutable = np.flip(nutable, axis=0)
-            psigrid = np.flip(psigrid, axis=0)
-            frr0 = np.flip(frr0, axis=0)
-
-        # Continue with post-processing
-        return self._build_magnetic_coordinates_dataset(
-            psigrid, thtable, nutable, jac, Rtransform, ztransform,
-            R_fine, z_fine, qprof, Fprof, Iprof, ntht_pad, coordinate_system
+        coordinate_psi_field = coordinate_construction_diagnostics.pop(
+            "coordinate_psi_field",
+            None,
         )
+        coordinate_Rgrid = np.asarray(self.Rgrid, dtype=np.float64)
+        coordinate_zgrid = np.asarray(self.zgrid, dtype=np.float64)
+        if coordinate_psi_field is not None:
+            # Coordinate construction operates on the refined tracing grid.
+            # General equilibria retain the original public R-z grid.  An
+            # explicitly projected equilibrium instead retains the reflected
+            # vertical knot union needed to represent its authoritative paired
+            # flux evaluator without relabelling the fitted surfaces.
+            coordinate_psi_values = np.asarray(
+                coordinate_psi_field,
+                dtype=np.float64,
+            )
+            expected_tracing_shape = (R_fine.size, z_fine.size)
+            if coordinate_psi_values.shape != expected_tracing_shape:
+                raise ValueError(
+                    "projected coordinate psi field has shape "
+                    f"{coordinate_psi_values.shape}; expected tracing-grid "
+                    f"shape {expected_tracing_shape}."
+                )
+            projection_audit = coordinate_construction_diagnostics.get(
+                "up_down_symmetry"
+            )
+            if (
+                isinstance(projection_audit, dict)
+                and bool(projection_audit.get("applied", False))
+            ):
+                (
+                    coordinate_Rgrid,
+                    coordinate_zgrid,
+                    coordinate_psi_field,
+                ) = _reflection_paired_coordinate_psi_grid(
+                    tracing_R=R_fine,
+                    tracing_z=z_fine,
+                    tracing_psi=coordinate_psi_values,
+                    public_R=coordinate_Rgrid,
+                    reflection_z=z_axis_val,
+                )
+                coordinate_psi_field, bridge_audit = (
+                    _fit_projected_coordinate_psi_bridge(
+                        Rgrid=coordinate_Rgrid,
+                        zgrid=coordinate_zgrid,
+                        psi_field=coordinate_psi_field,
+                        surface_R=Rtransform,
+                        surface_z=ztransform,
+                        surface_psi=psigrid,
+                        flux_scale=abs(psi_edge - psi_axis),
+                        reflection_z=z_axis_val,
+                        tolerance=accuracy.bridge_flux_tolerance,
+                        repair_strategy=projected_bridge_repair_strategy,
+                    )
+                )
+                projection_audit[
+                    "projected_bridge_flux_initial_residual"
+                ] = bridge_audit["initial_residual"]
+                projection_audit["projected_bridge_flux_residual"] = (
+                    bridge_audit["final_residual"]
+                )
+                projection_audit[
+                    "projected_bridge_relative_grid_correction"
+                ] = bridge_audit["relative_grid_correction"]
+                projection_audit[
+                    "projected_bridge_symmetry_initial_residual"
+                ] = bridge_audit["initial_symmetry_residual"]
+                projection_audit[
+                    "projected_bridge_symmetry_residual"
+                ] = bridge_audit["final_symmetry_residual"]
+                projection_audit[
+                    "projected_bridge_solver_stop_code"
+                ] = bridge_audit["solver_stop_code"]
+                projection_audit[
+                    "projected_bridge_solver_iterations"
+                ] = bridge_audit["solver_iterations"]
+                projection_audit["projected_bridge_status"] = (
+                    bridge_audit["status"]
+                )
+                projection_audit["projected_bridge_tolerance"] = (
+                    bridge_audit["tolerance"]
+                )
+                projection_audit[
+                    "projected_bridge_coefficient_count"
+                ] = bridge_audit["coefficient_count"]
+                projection_audit[
+                    "projected_bridge_label_constraint_rows"
+                ] = bridge_audit["assembled_label_rows"]
+                projection_audit[
+                    "projected_bridge_symmetry_constraint_rows"
+                ] = bridge_audit["assembled_symmetry_rows"]
+                projection_audit[
+                    "projected_bridge_estimated_design_nonzeros"
+                ] = bridge_audit["estimated_design_nonzeros"]
+                projection_audit["projected_bridge_solver_atol"] = (
+                    bridge_audit["solver_atol"]
+                )
+                projection_audit[
+                    "projected_bridge_solver_iteration_limit"
+                ] = bridge_audit["solver_iteration_limit"]
+                projection_audit[
+                    "projected_bridge_radial_grid_size"
+                ] = int(coordinate_Rgrid.size)
+                projection_audit[
+                    "projected_bridge_vertical_grid_size"
+                ] = int(coordinate_zgrid.size)
+            else:
+                coordinate_psi_field = RectBivariateSpline(
+                    R_fine,
+                    z_fine,
+                    coordinate_psi_values,
+                    kx=min(3, R_fine.size - 1),
+                    ky=min(3, z_fine.size - 1),
+                    s=0.0,
+                )(coordinate_Rgrid, coordinate_zgrid)
+
+        # Surface tracing and near-axis regularization use axis-to-boundary
+        # order. Sort every radial output together only at the storage
+        # boundary because scipy's spline constructors require increasing
+        # physical psi. The physical axis-to-boundary direction is retained
+        # separately in psi0 metadata.
+        psi_order = np.argsort(psigrid)
+        psigrid = np.asarray(psigrid)[psi_order]
+        qprof = np.asarray(qprof)[psi_order]
+        Fprof = np.asarray(Fprof)[psi_order]
+        Iprof = np.asarray(Iprof)[psi_order]
+        thtable = np.asarray(thtable)[psi_order, :]
+        nutable = np.asarray(nutable)[psi_order, :]
+        jac = np.asarray(jac)[psi_order, :]
+        Rtransform = np.asarray(Rtransform)[psi_order, :]
+        ztransform = np.asarray(ztransform)[psi_order, :]
+        symmetry_projection_audit = coordinate_construction_diagnostics.get(
+            "up_down_symmetry"
+        )
+        if isinstance(symmetry_projection_audit, dict):
+            for name, values in tuple(symmetry_projection_audit.items()):
+                if (
+                    isinstance(values, np.ndarray)
+                    and values.shape == (psi_order.size,)
+                ):
+                    symmetry_projection_audit[name] = values[psi_order]
+                elif isinstance(values, dict):
+                    for field_name, field_values in tuple(values.items()):
+                        field_array = np.asarray(field_values)
+                        if field_array.shape == (psi_order.size,):
+                            values[field_name] = field_array[psi_order]
+        if np.any(np.diff(psigrid) <= 0.0):
+            raise ValueError(
+                "Computed magnetic-coordinate psi grid must be strictly increasing."
+            )
+        sorted_core = np.sort(
+            np.asarray(core_psigrid_requested, dtype=np.float64)
+        )
+        core_indices = np.searchsorted(psigrid, sorted_core)
+        if (
+            core_indices.shape != (lpsi,)
+            or np.any(core_indices >= psigrid.size)
+            or not np.allclose(
+                psigrid[core_indices],
+                sorted_core,
+                rtol=0.0,
+                atol=10.0 * np.finfo(np.float64).eps
+                * max(1.0, float(np.max(np.abs(psigrid)))),
+            )
+        ):
+            raise ValueError(
+                "Hidden radial support construction lost a requested core surface."
+            )
+        if abs(psi_span) < 1.0e-14:
+            final_support_rho = np.zeros_like(psigrid, dtype=np.float64)
+            final_core_rho = np.zeros_like(sorted_core, dtype=np.float64)
+        else:
+            final_support_rho = np.sqrt(
+                np.clip((psigrid - psi_axis) / psi_span, 0.0, None)
+            )
+            final_core_rho = np.sqrt(
+                np.clip((sorted_core - psi_axis) / psi_span, 0.0, None)
+            )
+        radial_scale = max(
+            1.0,
+            float(np.max(np.abs(final_support_rho))),
+        )
+        radial_tolerance = 10.0 * np.finfo(np.float64).eps * radial_scale
+        inner_guard_surfaces = int(
+            np.count_nonzero(
+                final_support_rho
+                < float(np.min(final_core_rho)) - radial_tolerance
+            )
+        )
+        outer_guard_surfaces = int(
+            np.count_nonzero(
+                final_support_rho
+                > float(np.max(final_core_rho)) + radial_tolerance
+            )
+        )
+
+        radial_support_metadata = {
+            "family": support_family,
+            "requested_guard_surfaces": int(radial_guard_surfaces),
+            "support_nsurface": int(psigrid.size),
+            "core_nsurface": int(lpsi),
+            "inner_guard_surfaces": inner_guard_surfaces,
+            "outer_guard_surfaces": outer_guard_surfaces,
+            "support_rhopol_min": float(np.min(final_support_rho)),
+            "support_rhopol_max": float(np.max(final_support_rho)),
+        }
+        checkpoint_metadata = _coordinate_checkpoint_metadata_value({
+            "coordinate_system": str(coordinate_system).lower(),
+            "ntht_pad": int(ntht_pad),
+            "spectral_max_mode": int(spectral_max_mode),
+            "radial_support_metadata": radial_support_metadata,
+            "symmetry_projection_audit": (
+                coordinate_construction_diagnostics.get("up_down_symmetry")
+            ),
+            "construction_diagnostics": {
+                "surface_construction": coordinate_construction_diagnostics.get(
+                    "surface_construction",
+                    {},
+                )
+            },
+            "accuracy": {
+                "bridge_flux_tolerance": accuracy.bridge_flux_tolerance,
+                "surface_flux_tolerance": accuracy.surface_flux_tolerance,
+                "constraint_flux_tolerance": (
+                    accuracy.constraint_flux_tolerance
+                ),
+                "theta_tolerance": accuracy.theta_tolerance,
+            },
+        })
+        checkpoint_state = self._coordinate_checkpoint_state_arrays(
+            psigrid=psigrid,
+            thtable=thtable,
+            nutable=nutable,
+            jacobian=jac,
+            Rtransform=Rtransform,
+            ztransform=ztransform,
+            Rgrid=coordinate_Rgrid,
+            zgrid=coordinate_zgrid,
+            q=qprof,
+            F=Fprof,
+            I=Iprof,
+            core_indices=core_indices,
+            coordinate_psi_field=coordinate_psi_field,
+        )
+        checkpoint_status = None
+        if checkpoint_path is not None:
+            existed = checkpoint_path.is_dir()
+            checkpoint_path = write_coordinate_checkpoint(
+                checkpoint_dir,
+                source_arrays=source_arrays,
+                build_config=build_config,
+                state_arrays=namespace_array_group(
+                    "construction",
+                    checkpoint_state,
+                ),
+                algorithm_version=_COORDINATE_CHECKPOINT_ALGORITHM_VERSION,
+                metadata=checkpoint_metadata,
+                reuse_existing=True,
+            )
+            checkpoint_status = "verified_existing" if existed else "written"
+
+        # Continue with optional full R-z post-processing.
+        result = self._build_magnetic_coordinates_dataset(
+            psigrid, thtable, nutable, jac, Rtransform, ztransform,
+            coordinate_Rgrid,
+            coordinate_zgrid,
+            qprof, Fprof, Iprof, ntht_pad, coordinate_system,
+            spectral_max_mode=spectral_max_mode,
+            core_indices=core_indices,
+            radial_support_metadata=radial_support_metadata,
+            symmetry_projection_audit=coordinate_construction_diagnostics.get(
+                "up_down_symmetry"
+            ),
+            coordinate_psi_field=coordinate_psi_field,
+            coordinate_accuracy=accuracy,
+            construction_diagnostics=dict(
+                checkpoint_metadata["construction_diagnostics"]
+            ),
+            materialize_rz=bool(materialize_rz),
+            build_metric_cache=bool(build_metric_cache),
+        )
+        if checkpoint_path is not None:
+            result._coordinate_checkpoint = {
+                "key": construction_key,
+                "path": str(checkpoint_path),
+                "status": checkpoint_status,
+            }
+        self._store_coordinate_build_cache(
+            result_cache_key,
+            result,
+            enabled=bool(reuse_cache),
+        )
+        self._activate_coordinate_result(coordinate_system, result)
+        return result
     
     def _build_magnetic_coordinates_dataset(
         self,
@@ -1788,8 +3390,18 @@ class equilibrium:
         Fprof: np.ndarray,
         Iprof: np.ndarray,
         ntht_pad: int,
-        coordinate_system: str = 'boozer'
-    ) -> MagneticCoordinates:
+        coordinate_system: str = 'boozer',
+        spectral_max_mode: Optional[int] = None,
+        core_indices: Optional[np.ndarray] = None,
+        radial_support_metadata: Optional[Dict[str, Any]] = None,
+        symmetry_projection_audit: Optional[Dict[str, Any]] = None,
+        coordinate_psi_field: Optional[np.ndarray] = None,
+        coordinate_accuracy: Optional[CoordinateAccuracy] = None,
+        construction_diagnostics: Optional[Dict[str, Any]] = None,
+        materialize_rz: bool = True,
+        build_metric_cache: bool = True,
+        prebuilt_coordinate_map: Optional[SpectralCoordinateMap] = None,
+    ) -> Union[MagneticCoordinates, MagneticCoordinateMapProduct]:
         """
         Build the MagneticCoordinates dataset from computed coordinate arrays.
 
@@ -1800,7 +3412,8 @@ class equilibrium:
         thtable : np.ndarray
             Magnetic poloidal angle table
         nutable : np.ndarray
-            Magnetic toroidal angle table
+            Axisymmetric toroidal gauge-shift table ``nu(psi, theta)`` in
+            ``zeta = phi + nu``
         jac : np.ndarray
             Jacobian table
         Rtransform : np.ndarray
@@ -1816,173 +3429,756 @@ class equilibrium:
         Fprof : np.ndarray
             F(psi) profile
         Iprof : np.ndarray
-            Toroidal current profile
+            Covariant Boozer magnetic-field coefficient ``I = B_Theta``
         ntht_pad : int
             Number of padding points for theta
+        spectral_max_mode : int, optional
+            Maximum Fourier mode retained by the common coordinate map.
+        coordinate_accuracy : CoordinateAccuracy, optional
+            Resolved approximation and nonlinear-solver tolerance budget.
+        construction_diagnostics : dict, optional
+            Surface-resolution and other construction diagnostics.
+        materialize_rz : bool, optional
+            Build full R-z coordinate and derivative arrays. If False, return
+            a lightweight map product. Default True.
+        build_metric_cache : bool, optional
+            Build derived Lamé and metric caches eagerly on a full result.
+        prebuilt_coordinate_map : SpectralCoordinateMap, optional
+            Reuse an already fitted map when materializing a map-only product.
 
         Returns
         -------
         MagneticCoordinates
             Magnetic coordinates object
         """
-        ltheta = thtable.shape[1]
-        
-        # Build coordinate grids (using geometry for axis)
+        accuracy = resolve_coordinate_accuracy(coordinate_accuracy)
+        for name, value in (
+            ("materialize_rz", materialize_rz),
+            ("build_metric_cache", build_metric_cache),
+        ):
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"{name} must be boolean.")
+        support_psi = np.asarray(psigrid, dtype=np.float64)
+        support_theta_table = np.asarray(thtable, dtype=np.float64)
+        support_nu_table = np.asarray(nutable, dtype=np.float64)
+        support_jacobian_table = np.asarray(jac, dtype=np.float64)
+        support_R = np.asarray(Rtransform, dtype=np.float64)
+        support_z = np.asarray(ztransform, dtype=np.float64)
+        support_q = np.asarray(qprof, dtype=np.float64)
+        support_F = np.asarray(Fprof, dtype=np.float64)
+        support_I = np.asarray(Iprof, dtype=np.float64)
+        ltheta = support_theta_table.shape[1]
+        support_nsurface = support_psi.size
+        expected_surface_shape = (support_nsurface, ltheta)
+        for name, values in (
+            ("theta", support_theta_table),
+            ("nu", support_nu_table),
+            ("jacobian", support_jacobian_table),
+            ("R", support_R),
+            ("z", support_z),
+        ):
+            if values.shape != expected_surface_shape:
+                raise ValueError(
+                    f"{name} support table has shape {values.shape}; "
+                    f"expected {expected_surface_shape}."
+                )
+        for name, values in (
+            ("q", support_q),
+            ("F", support_F),
+            ("I", support_I),
+        ):
+            if values.shape != (support_nsurface,):
+                raise ValueError(
+                    f"{name} support profile has shape {values.shape}; "
+                    f"expected {(support_nsurface,)}."
+                )
+        if core_indices is None:
+            core_selection = np.arange(support_nsurface, dtype=np.int64)
+        else:
+            core_selection = np.asarray(core_indices, dtype=np.int64)
+            if (
+                core_selection.ndim != 1
+                or core_selection.size < 2
+                or np.any(np.diff(core_selection) <= 0)
+                or core_selection[0] < 0
+                or core_selection[-1] >= support_nsurface
+            ):
+                raise ValueError(
+                    "core_indices must select an increasing interior radial grid."
+                )
+        projected_coordinate_field = bool(
+            coordinate_psi_field is not None
+            and isinstance(symmetry_projection_audit, dict)
+            and symmetry_projection_audit.get("applied", False)
+        )
+        flux_constraint_options: Dict[str, Any] = {}
+        if projected_coordinate_field:
+            flux_constraint_options = {
+                "flux_constraint_R": np.asarray(R_fine, dtype=np.float64),
+                "flux_constraint_z": np.asarray(z_fine, dtype=np.float64),
+                "flux_constraint_psi": np.asarray(
+                    coordinate_psi_field,
+                    dtype=np.float64,
+                ),
+                "flux_constraint_tolerance": (
+                    accuracy.constraint_flux_tolerance
+                ),
+                # Projected high-resolution equilibria can require more than
+                # twelve Newton steps near the private support guards.  Keep
+                # the same iteration budget used by the downstream angle
+                # inversion; the selected accuracy profile owns acceptance.
+                "flux_constraint_max_iterations": 30,
+            }
+
+        # Convert direct surface-parameter tables to the same uniform magnetic
+        # angle used by Rtransform/ztransform. Periodic cubic interpolation
+        # avoids a directional seam bias in nu and the target Jacobian.
+        magnetic_theta = np.linspace(0.0, 2.0*np.pi, ltheta)
+        support_nu_magnetic = np.empty_like(
+            support_nu_table,
+            dtype=np.float64,
+        )
+        support_jacobian_magnetic = np.empty_like(
+            support_jacobian_table,
+            dtype=np.float64,
+        )
+        for radial_index in range(support_nsurface):
+            theta_row = support_theta_table[radial_index]
+            if np.any(np.diff(theta_row) <= 0.0):
+                raise ValueError(
+                    "Direct magnetic-angle table must be strictly increasing "
+                    f"on surface {radial_index}."
+                )
+            nu_row = support_nu_table[radial_index].copy()
+            jacobian_row = support_jacobian_table[radial_index].copy()
+            nu_row[-1] = nu_row[0]
+            jacobian_row[-1] = jacobian_row[0]
+            support_nu_magnetic[radial_index] = CubicSpline(
+                theta_row,
+                nu_row,
+                bc_type="periodic",
+            )(magnetic_theta)
+            support_jacobian_magnetic[radial_index] = CubicSpline(
+                theta_row,
+                jacobian_row,
+                bc_type="periodic",
+            )(magnetic_theta)
+            support_nu_magnetic[radial_index, -1] = (
+                support_nu_magnetic[radial_index, 0]
+            )
+            support_jacobian_magnetic[radial_index, -1] = (
+                support_jacobian_magnetic[radial_index, 0]
+            )
+
         R_axis_val = float(self.geometry.R_axis.values)
         z_axis_val = float(self.geometry.z_axis.values)
+        if prebuilt_coordinate_map is None:
+            coordinate_map = SpectralCoordinateMap(
+                psi=support_psi,
+                theta=magnetic_theta,
+                R=support_R,
+                z=support_z,
+                nu=support_nu_magnetic,
+                psi_axis=float(
+                    self.geometry.attrs.get('psi_ax', self._psi_ax_init)
+                ),
+                psi_boundary=float(
+                    self.geometry.attrs.get('psi_bdy', self._psi_edge_init)
+                ),
+                R_axis=R_axis_val,
+                z_axis=z_axis_val,
+                max_mode=spectral_max_mode,
+                **flux_constraint_options,
+            )
+        else:
+            coordinate_map = prebuilt_coordinate_map
+            if not np.array_equal(coordinate_map.psi, support_psi):
+                raise ValueError(
+                    "prebuilt_coordinate_map uses a different radial grid."
+                )
+
+        # Everything public remains on the exact requested core grid. The
+        # private coordinate map above retains hidden support on both sides.
+        psigrid = support_psi[core_selection]
+        thtable = support_theta_table[core_selection]
+        nutable = support_nu_table[core_selection]
+        jac = support_jacobian_table[core_selection]
+        Rtransform = support_R[core_selection]
+        ztransform = support_z[core_selection]
+        qprof = support_q[core_selection]
+        Fprof = support_F[core_selection]
+        Iprof = support_I[core_selection]
+        nu_magnetic = support_nu_magnetic[core_selection]
+        jacobian_magnetic = support_jacobian_magnetic[core_selection]
+
+        if not materialize_rz:
+            product_diagnostics = dict(construction_diagnostics or {})
+            product_diagnostics["radial_support"] = dict(
+                radial_support_metadata or {}
+            )
+            product_diagnostics["up_down_symmetry"] = (
+                dict(symmetry_projection_audit)
+                if isinstance(symmetry_projection_audit, Mapping)
+                else dict(coordinate_map.up_down_symmetry_audit)
+            )
+            product_node_psi, product_node_theta = np.meshgrid(
+                psigrid,
+                magnetic_theta,
+                indexing="ij",
+            )
+            product_node_tangent = coordinate_map.direct_differentials(
+                product_node_psi,
+                product_node_theta,
+            )
+            product_direct = product_node_tangent.direct
+            product_poloidal_determinant = (
+                product_direct[..., 0, 0] * product_direct[..., 2, 1]
+                - product_direct[..., 0, 1] * product_direct[..., 2, 0]
+            )
+            product_jacobian = (
+                -product_direct[..., 1, 2] * product_poloidal_determinant
+            )
+            product_target_scale = np.maximum(
+                np.max(np.abs(jacobian_magnetic), axis=1),
+                np.finfo(np.float64).tiny,
+            )
+            product_diagnostics["jacobian_relative_residual"] = np.max(
+                np.abs(product_jacobian - jacobian_magnetic),
+                axis=1,
+            ) / product_target_scale
+
+            def materializer(eager_metric_cache: bool) -> MagneticCoordinates:
+                return self._build_magnetic_coordinates_dataset(
+                    support_psi,
+                    support_theta_table,
+                    support_nu_table,
+                    support_jacobian_table,
+                    support_R,
+                    support_z,
+                    R_fine,
+                    z_fine,
+                    support_q,
+                    support_F,
+                    support_I,
+                    ntht_pad,
+                    coordinate_system,
+                    spectral_max_mode=spectral_max_mode,
+                    core_indices=core_selection,
+                    radial_support_metadata=radial_support_metadata,
+                    symmetry_projection_audit=symmetry_projection_audit,
+                    coordinate_psi_field=coordinate_psi_field,
+                    coordinate_accuracy=accuracy,
+                    construction_diagnostics=construction_diagnostics,
+                    materialize_rz=True,
+                    build_metric_cache=eager_metric_cache,
+                    prebuilt_coordinate_map=coordinate_map,
+                )
+
+            return MagneticCoordinateMapProduct(
+                coordinate_map=coordinate_map,
+                psi=psigrid,
+                theta=magnetic_theta,
+                R=Rtransform,
+                z=ztransform,
+                nu=nu_magnetic,
+                jacobian=product_jacobian,
+                target_jacobian=jacobian_magnetic,
+                q=qprof,
+                F=Fprof,
+                I=Iprof,
+                coordinate_system=coordinate_system,
+                accuracy=accuracy,
+                diagnostics=product_diagnostics,
+                _materializer=materializer,
+            )
+
+        # Build coordinate grids (using geometry for axis)
         grr, gzz = np.meshgrid(R_fine, z_fine, indexing='ij')
         thetageom = np.arctan2(gzz - z_axis_val,
                                grr - R_axis_val)
         thetageom = np.mod(thetageom + 2*np.pi, 2*np.pi)
-        psirz = self.flux.psi.interp(R=R_fine, z=z_fine, method='cubic')
+        if coordinate_psi_field is None:
+            psirz = self.flux.psi.interp(
+                R=R_fine,
+                z=z_fine,
+                method='cubic',
+            )
+        else:
+            coordinate_psi_values = np.asarray(
+                coordinate_psi_field,
+                dtype=np.float64,
+            )
+            expected_psi_shape = (R_fine.size, z_fine.size)
+            if coordinate_psi_values.shape != expected_psi_shape:
+                raise ValueError(
+                    "coordinate_psi_field has shape "
+                    f"{coordinate_psi_values.shape}; expected "
+                    f"{expected_psi_shape}."
+                )
+            psirz = xr.DataArray(
+                coordinate_psi_values,
+                dims=("R", "z"),
+                coords={"R": R_fine, "z": z_fine},
+            )
 
-        # Add padding to theta grid
+        # Add padding to theta grid.
         thetagrid = np.linspace(0, 2*np.pi, ltheta)
         dtheta = thetagrid[1] - thetagrid[0]
         thetagrid = np.linspace(-ntht_pad*dtheta,
                                 2*np.pi + ntht_pad*dtheta,
                                 ltheta + 2*ntht_pad)
-        spline_kx = min(3, len(psigrid) - 1)
-        spline_ky = min(3, len(thetagrid) - 1)
-
-        # Pad thtable
         thtable_padded = thtable.copy()
         thtable_padded[:, -1] = 2*np.pi
         thtable_padded[:, 0] = 0.0
-        leftside = thtable_padded[:, -ntht_pad:] - 2*np.pi
-        rightside = thtable_padded[:, :ntht_pad] + 2*np.pi
-        thtable_padded = np.concatenate((leftside, thtable_padded, rightside), axis=1)
-
+        leftside = thtable_padded[:, -(ntht_pad + 1):-1] - 2*np.pi
+        rightside = thtable_padded[:, 1:ntht_pad + 1] + 2*np.pi
+        thtable_padded = np.concatenate(
+            (leftside, thtable_padded, rightside),
+            axis=1,
+        )
         thtable_da = xr.DataArray(
             thtable_padded,
             coords={'psi0': psigrid, 'thetageom': thetagrid},
             dims=('psi0', 'thetageom'),
         )
 
-        # Build interpolator and project to R-z plane
-        thtintrp = RectBivariateSpline(
-            psigrid,
-            thetagrid,
-            thtable_padded,
-            kx=spline_kx,
-            ky=spline_ky,
+        leftside = nutable[:, -(ntht_pad + 1):-1]
+        rightside = nutable[:, 1:ntht_pad + 1]
+        nutable_padded = np.concatenate(
+            (leftside, nutable, rightside),
+            axis=1,
         )
-        thtable_Rz = thtintrp(psirz, thetageom, grid=False)
-        thtable_Rz = xr.DataArray(thtable_Rz, coords=(R_fine, z_fine),
-                                    dims=('R', 'z'))
-
-        # Same for nu
-        leftside = nutable[:, -ntht_pad:]
-        rightside = nutable[:, :ntht_pad]
-        nutable_padded = np.concatenate((leftside, nutable, rightside), axis=1)
         nutable_da = xr.DataArray(
             nutable_padded,
             coords={'psi0': psigrid, 'thetageom': thetagrid},
             dims=('psi0', 'thetageom'),
         )
-
-        nutintrp = RectBivariateSpline(
-            psigrid,
-            thetagrid,
-            nutable_padded,
-            kx=spline_kx,
-            ky=spline_ky,
+        leftside = Rtransform[:, -(ntht_pad + 1):-1]
+        rightside = Rtransform[:, 1:ntht_pad + 1]
+        Rtransform_padded = np.concatenate(
+            (leftside, Rtransform, rightside),
+            axis=1,
         )
-        nutable_Rz = nutintrp(psirz, thetageom, grid=False)
-        nutable_Rz = xr.DataArray(nutable_Rz, coords=(R_fine, z_fine),
-                                    dims=('R', 'z'))
-
-        # Project Jacobian
-        leftside = jac[:, -ntht_pad:]
-        rightside = jac[:, :ntht_pad]
-        jacobian_padded = np.concatenate((leftside, jac, rightside), axis=1)
-        jacinterp = RectBivariateSpline(
-            psigrid,
-            thetagrid,
-            jacobian_padded,
-            kx=spline_kx,
-            ky=spline_ky,
-        )
-        jac_Rz = jacinterp(psirz, thetageom, grid=False)
-
-        # Build padded inverse maps and differentiate them on (psi0, theta_star)
-        leftside = Rtransform[:, -ntht_pad:]
-        rightside = Rtransform[:, :ntht_pad]
-        Rtransform_padded = np.concatenate((leftside, Rtransform, rightside), axis=1)
-        leftside = ztransform[:, -ntht_pad:]
-        rightside = ztransform[:, :ntht_pad]
-        ztransform_padded = np.concatenate((leftside, ztransform, rightside), axis=1)
-
-        Rinv_intrp = RectBivariateSpline(
-            psigrid,
-            thetagrid,
-            Rtransform_padded,
-            kx=spline_kx,
-            ky=spline_ky,
-        )
-        zinv_intrp = RectBivariateSpline(
-            psigrid,
-            thetagrid,
-            ztransform_padded,
-            kx=spline_kx,
-            ky=spline_ky,
+        leftside = ztransform[:, -(ntht_pad + 1):-1]
+        rightside = ztransform[:, 1:ntht_pad + 1]
+        ztransform_padded = np.concatenate(
+            (leftside, ztransform, rightside),
+            axis=1,
         )
 
-        psirz_vals = np.asarray(psirz, dtype=float)
-        thtable_rz_vals = np.asarray(thtable_Rz, dtype=float)
+        # The equilibrium flux remains authoritative outside the fitted
+        # magnetic-coordinate annulus. Inside it, all coordinate derivatives
+        # and both metric tensors are obtained by algebraically inverting the
+        # one Fourier--spline map.
+        psirz_vals = np.asarray(psirz, dtype=np.float64)
+        # The spectral map is fitted on the full radial support grid, including
+        # the private guard surfaces.  Use that same support interval when
+        # constructing its R-Z differential fields.  Restricting this mask to
+        # the public core grid removes the interpolation stencil exactly where
+        # the guard surfaces are intended to protect the first/last core
+        # surfaces.
+        fit_min = float(np.min(support_psi))
+        fit_max = float(np.max(support_psi))
+        coordinate_domain = (
+            np.isfinite(psirz_vals)
+            & (psirz_vals >= fit_min)
+            & (psirz_vals <= fit_max)
+        )
+        shape_rz = psirz_vals.shape
+        theta_Rz = np.full(shape_rz, np.nan, dtype=np.float64)
+        nu_Rz = np.full(shape_rz, np.nan, dtype=np.float64)
+        jac_Rz = np.full(shape_rz, np.nan, dtype=np.float64)
 
-        # Compute derivatives
-        d_dr = FinDiff(0, R_fine[1] - R_fine[0], 1, acc=4)
-        d_dz = FinDiff(1, z_fine[1] - z_fine[0], 1, acc=4)
+        derivative_names = (
+            'dR_dpsi', 'dR_dtheta', 'dR_dzeta',
+            'dz_dpsi', 'dz_dtheta', 'dz_dzeta',
+            'dphi_dpsi', 'dphi_dtheta', 'dphi_dzeta',
+            'dPsi_dr', 'dPsi_dz', 'dPsi_dphi',
+            'dTheta_dr', 'dTheta_dz', 'dTheta_dphi',
+            'dzeta_dr', 'dzeta_dz', 'dzeta_dphi',
+            'direct_det_Rz',
+        )
+        map_derivatives = {
+            name: np.full(shape_rz, np.nan, dtype=np.float64)
+            for name in derivative_names
+        }
 
-        dPsi_dr = d_dr(psirz)
-        dPsi_dz = d_dz(psirz)
-        dPsi_dphi = np.zeros_like(psirz)
+        if projected_coordinate_field:
+            physical_psi_spline = RectBivariateSpline(
+                R_fine,
+                z_fine,
+                psirz_vals,
+                kx=min(3, R_fine.size - 1),
+                ky=min(3, z_fine.size - 1),
+                s=0.0,
+            )
+            equilibrium_dPsi_dr = np.asarray(
+                physical_psi_spline(R_fine, z_fine, dx=1, dy=0),
+                dtype=np.float64,
+            )
+            equilibrium_dPsi_dz = np.asarray(
+                physical_psi_spline(R_fine, z_fine, dx=0, dy=1),
+                dtype=np.float64,
+            )
+        else:
+            d_dr = FinDiff(0, R_fine[1] - R_fine[0], 1, acc=4)
+            d_dz = FinDiff(1, z_fine[1] - z_fine[0], 1, acc=4)
+            equilibrium_dPsi_dr = np.asarray(d_dr(psirz), dtype=np.float64)
+            equilibrium_dPsi_dz = np.asarray(d_dz(psirz), dtype=np.float64)
 
-        dTheta_dr = d_dr(thtable_Rz)
-        dTheta_dz = d_dz(thtable_Rz)
-        dTheta_dphi = np.zeros_like(thtable_Rz)
+        flat_indices = np.flatnonzero(coordinate_domain.ravel())
+        flat_R = grr.ravel()
+        flat_z = gzz.ravel()
+        flat_psi = psirz_vals.ravel()
+        initial_theta = thetageom.ravel()
+        chunk_size = 20_000
+        for chunk_start in range(0, flat_indices.size, chunk_size):
+            chunk_indices = flat_indices[chunk_start:chunk_start + chunk_size]
+            psi_chunk = flat_psi[chunk_indices]
+            R_chunk = flat_R[chunk_indices]
+            z_chunk = flat_z[chunk_indices]
+            theta_chunk = coordinate_map.solve_theta(
+                psi=psi_chunk,
+                R=R_chunk,
+                z=z_chunk,
+                initial_theta=initial_theta[chunk_indices],
+                tolerance=accuracy.theta_tolerance,
+                max_iterations=30,
+            )
+            tangent = coordinate_map.direct_differentials(
+                psi_chunk,
+                theta_chunk,
+            )
+            # This direct-only product is newly allocated and intentionally
+            # mutable.  The physical-flux correction below does not need the
+            # inverse basis or either metric tensor, avoiding those temporary
+            # arrays for every materialization chunk.
+            direct = tangent.direct
+            map_radius = np.asarray(
+                tangent.values['R'],
+                dtype=np.float64,
+            )
+            # ``solve_theta`` locates the closest point on the fitted surface;
+            # between radial knots that point can differ slightly from the
+            # physical R-Z grid point carrying the equilibrium psi value.
+            # Cylindrical orthonormal toroidal components must use the actual
+            # evaluation radius so the public tangent/gradient matrices and
+            # their determinant remain exactly reciprocal.
+            direct[:, 1, :] *= (R_chunk / map_radius)[:, None]
+            direct[:, 1, 2] = R_chunk
+            grad_R = equilibrium_dPsi_dr.ravel()[chunk_indices]
+            grad_z = equilibrium_dPsi_dz.ravel()[chunk_indices]
+            grad_squared = grad_R**2 + grad_z**2
+            if np.any(grad_squared <= np.finfo(np.float64).tiny):
+                raise ValueError(
+                    "Equilibrium poloidal-flux gradient vanishes in the "
+                    "retained magnetic-coordinate annulus."
+                )
+            # Enforce the exact physical-flux differential identities on the
+            # fitted map: grad(psi).x_psi=1 and grad(psi).x_theta=0.
+            for column, target_dot in ((0, 1.0), (1, 0.0)):
+                current_dot = (
+                    grad_R * direct[:, 0, column]
+                    + grad_z * direct[:, 2, column]
+                )
+                correction = (target_dot - current_dot) / grad_squared
+                direct[:, 0, column] += correction * grad_R
+                direct[:, 2, column] += correction * grad_z
 
-        dzeta_dr = d_dr(nutable_Rz)
-        dzeta_dz = d_dz(nutable_Rz)
-        dzeta_dphi = np.ones_like(nutable_Rz)
+            # The corrected axisymmetric tangent matrix retains the exact
+            # sparse form [[A,B,0],[C,D,R],[E,F,0]].  Use its closed-form
+            # determinant and reciprocal basis instead of invoking a dense
+            # 3x3 factorization for every R-z point.
+            A = direct[:, 0, 0]
+            B = direct[:, 0, 1]
+            C = direct[:, 1, 0]
+            D = direct[:, 1, 1]
+            E = direct[:, 2, 0]
+            F = direct[:, 2, 1]
+            poloidal_determinant = A * F - B * E
+            jacobian_chunk = -R_chunk * poloidal_determinant
+            if np.any(~np.isfinite(jacobian_chunk)) or np.any(
+                np.isclose(jacobian_chunk, 0.0)
+            ):
+                raise ValueError(
+                    "Flux-constrained coordinate differential is singular."
+                )
+            inverse = np.zeros_like(direct)
+            reciprocal_poloidal = 1.0 / poloidal_determinant
+            inverse[:, 0, 0] = F * reciprocal_poloidal
+            inverse[:, 0, 2] = -B * reciprocal_poloidal
+            inverse[:, 1, 0] = -E * reciprocal_poloidal
+            inverse[:, 1, 2] = A * reciprocal_poloidal
+            inverse[:, 2, 0] = (
+                (D * E - C * F) / R_chunk * reciprocal_poloidal
+            )
+            inverse[:, 2, 1] = 1.0 / R_chunk
+            inverse[:, 2, 2] = (
+                (C * B - D * A) / R_chunk * reciprocal_poloidal
+            )
 
-        # Inverse transformation derivatives from the fitted inverse maps.
-        dR_dpsi = Rinv_intrp(psirz_vals, thtable_rz_vals, dx=1, dy=0, grid=False)
-        dR_dtheta = Rinv_intrp(psirz_vals, thtable_rz_vals, dx=0, dy=1, grid=False)
-        dR_dzeta = np.zeros_like(dR_dpsi)
+            theta_Rz.ravel()[chunk_indices] = theta_chunk
+            nu_Rz.ravel()[chunk_indices] = tangent.values['nu']
+            jac_Rz.ravel()[chunk_indices] = jacobian_chunk
 
-        dz_dpsi = zinv_intrp(psirz_vals, thtable_rz_vals, dx=1, dy=0, grid=False)
-        dz_dtheta = zinv_intrp(psirz_vals, thtable_rz_vals, dx=0, dy=1, grid=False)
-        dz_dzeta = np.zeros_like(dz_dpsi)
+            map_derivatives['dR_dpsi'].ravel()[chunk_indices] = direct[:, 0, 0]
+            map_derivatives['dR_dtheta'].ravel()[chunk_indices] = direct[:, 0, 1]
+            map_derivatives['dR_dzeta'].ravel()[chunk_indices] = direct[:, 0, 2]
+            map_derivatives['dz_dpsi'].ravel()[chunk_indices] = direct[:, 2, 0]
+            map_derivatives['dz_dtheta'].ravel()[chunk_indices] = direct[:, 2, 1]
+            map_derivatives['dz_dzeta'].ravel()[chunk_indices] = direct[:, 2, 2]
+            map_derivatives['dphi_dpsi'].ravel()[chunk_indices] = (
+                direct[:, 1, 0] / R_chunk
+            )
+            map_derivatives['dphi_dtheta'].ravel()[chunk_indices] = (
+                direct[:, 1, 1] / R_chunk
+            )
+            map_derivatives['dphi_dzeta'].ravel()[chunk_indices] = (
+                direct[:, 1, 2] / R_chunk
+            )
+            map_derivatives['dPsi_dr'].ravel()[chunk_indices] = inverse[:, 0, 0]
+            map_derivatives['dPsi_dphi'].ravel()[chunk_indices] = (
+                R_chunk * inverse[:, 0, 1]
+            )
+            map_derivatives['dPsi_dz'].ravel()[chunk_indices] = inverse[:, 0, 2]
+            map_derivatives['dTheta_dr'].ravel()[chunk_indices] = inverse[:, 1, 0]
+            map_derivatives['dTheta_dphi'].ravel()[chunk_indices] = (
+                R_chunk * inverse[:, 1, 1]
+            )
+            map_derivatives['dTheta_dz'].ravel()[chunk_indices] = inverse[:, 1, 2]
+            map_derivatives['dzeta_dr'].ravel()[chunk_indices] = inverse[:, 2, 0]
+            map_derivatives['dzeta_dphi'].ravel()[chunk_indices] = (
+                R_chunk * inverse[:, 2, 1]
+            )
+            map_derivatives['dzeta_dz'].ravel()[chunk_indices] = inverse[:, 2, 2]
+            map_derivatives['direct_det_Rz'].ravel()[chunk_indices] = (
+                inverse[:, 0, 0] * inverse[:, 1, 2]
+                - inverse[:, 0, 2] * inverse[:, 1, 0]
+            )
 
-        dphi_dpsi = (dTheta_dr * dzeta_dz - dTheta_dz * dzeta_dr) / jac_Rz
-        dphi_dtheta = (dPsi_dz * dzeta_dr - dPsi_dr * dzeta_dz) / jac_Rz
-        dphi_dzeta = (dTheta_dz * dPsi_dr - dTheta_dr * dPsi_dz) / jac_Rz + 1.0
+        thtable_Rz = xr.DataArray(
+            theta_Rz,
+            coords=(R_fine, z_fine),
+            dims=('R', 'z'),
+        )
+        nutable_Rz = xr.DataArray(
+            nu_Rz,
+            coords=(R_fine, z_fine),
+            dims=('R', 'z'),
+        )
+
+        # Preserve finite equilibrium gradients on the complete R-Z grid, as
+        # required by the public EQDSK field interface. Within the coordinate
+        # annulus these are replaced by the reciprocal map derivatives.
+        map_derivatives['dPsi_dr'][~coordinate_domain] = (
+            equilibrium_dPsi_dr[~coordinate_domain]
+        )
+        map_derivatives['dPsi_dz'][~coordinate_domain] = (
+            equilibrium_dPsi_dz[~coordinate_domain]
+        )
+        map_derivatives['dPsi_dphi'][~coordinate_domain] = 0.0
+
+        dR_dpsi = map_derivatives['dR_dpsi']
+        dR_dtheta = map_derivatives['dR_dtheta']
+        dR_dzeta = map_derivatives['dR_dzeta']
+        dz_dpsi = map_derivatives['dz_dpsi']
+        dz_dtheta = map_derivatives['dz_dtheta']
+        dz_dzeta = map_derivatives['dz_dzeta']
+        dphi_dpsi = map_derivatives['dphi_dpsi']
+        dphi_dtheta = map_derivatives['dphi_dtheta']
+        dphi_dzeta = map_derivatives['dphi_dzeta']
+        dPsi_dr = map_derivatives['dPsi_dr']
+        dPsi_dz = map_derivatives['dPsi_dz']
+        dPsi_dphi = map_derivatives['dPsi_dphi']
+        dTheta_dr = map_derivatives['dTheta_dr']
+        dTheta_dz = map_derivatives['dTheta_dz']
+        dTheta_dphi = map_derivatives['dTheta_dphi']
+        dzeta_dr = map_derivatives['dzeta_dr']
+        dzeta_dz = map_derivatives['dzeta_dz']
+        dzeta_dphi = map_derivatives['dzeta_dphi']
+        direct_det_Rz = map_derivatives['direct_det_Rz']
+
+        if self.flux_normalization == "Wb/rad":
+            jacobian_units = "m**3/Wb"
+            position_per_flux_units = "m*rad/Wb"
+            angle_per_flux_units = "rad**2/Wb"
+            flux_per_length_units = "Wb/(rad*m)"
+            flux_per_angle_units = "Wb/rad**2"
+            direct_det_units = "Wb/m**2"
+        else:
+            jacobian_units = "m**3/(Wb*rad)"
+            position_per_flux_units = "m/Wb"
+            angle_per_flux_units = "rad/Wb"
+            flux_per_length_units = "Wb/m"
+            flux_per_angle_units = "Wb/rad"
+            direct_det_units = "Wb*rad/m**2"
+
+        support_metadata = dict(radial_support_metadata or {})
+        support_metadata.update({
+            "support_nsurface": int(support_nsurface),
+            "core_nsurface": int(core_selection.size),
+            "support_psi_min": float(support_psi[0]),
+            "support_psi_max": float(support_psi[-1]),
+            "core_psi_min": float(psigrid[0]),
+            "core_psi_max": float(psigrid[-1]),
+        })
+        map_symmetry_audit = coordinate_map.up_down_symmetry_audit
+        if symmetry_projection_audit is None:
+            symmetry_audit = map_symmetry_audit
+        else:
+            symmetry_audit = dict(symmetry_projection_audit)
+            symmetry_audit["coordinate_map_geometry_residual"] = np.asarray(
+                map_symmetry_audit["geometry_residual"],
+                dtype=np.float64,
+            )
+            symmetry_audit["coordinate_map_field_residuals"] = (
+                map_symmetry_audit["field_residuals"]
+            )
+            # The map has already been constructed from projected physical
+            # contours and fields. Preserve the source audit on the map so
+            # downstream bridge users see what was changed, not merely the
+            # round-off-level residual after projection.
+        symmetry_audit["flux_constraint"] = dict(
+            coordinate_map.flux_constraint_audit
+        )
+        coordinate_map.up_down_symmetry_audit = symmetry_audit
+        symmetry_geometry_max = float(
+            np.max(symmetry_audit["geometry_residual"])
+        )
 
         # Build coordinate dataset
-        magcoords = xr.Dataset()
-        magcoords['psi'] = xr.DataArray(psirz, dims=('R', 'z'),
-                                        coords={'R': R_fine, 'z': z_fine},
-                                        attrs={'name': 'psi', 'units': 'Wb',
-                                               'desc': 'Poloidal flux',
-                                               'short_name': '$\\Psi$'})
+        magcoords = xr.Dataset(attrs={
+            "coordinate_accuracy_profile": (
+                "strict"
+                if accuracy == CoordinateAccuracy.strict()
+                else "custom"
+                if accuracy != CoordinateAccuracy.standard()
+                else "standard"
+            ),
+            "coordinate_bridge_flux_tolerance": float(
+                accuracy.bridge_flux_tolerance
+            ),
+            "coordinate_surface_flux_tolerance": float(
+                accuracy.surface_flux_tolerance
+            ),
+            "coordinate_constraint_flux_tolerance": float(
+                accuracy.constraint_flux_tolerance
+            ),
+            "coordinate_theta_tolerance": float(
+                accuracy.theta_tolerance
+            ),
+            "radial_support_family": str(
+                support_metadata.get("family", "unspecified")
+            ),
+            "radial_guard_surfaces_requested": int(
+                support_metadata.get("requested_guard_surfaces", 0)
+            ),
+            "radial_support_nsurface": int(
+                support_metadata["support_nsurface"]
+            ),
+            "radial_core_nsurface": int(
+                support_metadata["core_nsurface"]
+            ),
+            "radial_inner_guard_surfaces": int(
+                support_metadata.get("inner_guard_surfaces", 0)
+            ),
+            "radial_outer_guard_surfaces": int(
+                support_metadata.get("outer_guard_surfaces", 0)
+            ),
+            "radial_support_psi_min": float(
+                support_metadata["support_psi_min"]
+            ),
+            "radial_support_psi_max": float(
+                support_metadata["support_psi_max"]
+            ),
+            "radial_core_psi_min": float(support_metadata["core_psi_min"]),
+            "radial_core_psi_max": float(support_metadata["core_psi_max"]),
+            "up_down_symmetry_projection_applied": int(
+                symmetry_audit["applied"]
+            ),
+            "up_down_symmetry_projected_equilibrium": int(
+                coordinate_psi_field is not None
+                and symmetry_audit["applied"]
+            ),
+            "up_down_symmetry_input_geometry_residual": (
+                symmetry_geometry_max
+            ),
+            "up_down_symmetry_projected_flux_residual": float(
+                np.max(
+                    np.asarray(
+                        symmetry_audit.get(
+                            "projected_flux_residual",
+                            np.asarray([0.0]),
+                        ),
+                        dtype=np.float64,
+                    )
+                )
+            ),
+            "up_down_symmetry_projected_bridge_flux_residual": float(
+                np.max(
+                    np.asarray(
+                        symmetry_audit.get(
+                            "projected_bridge_flux_residual",
+                            np.asarray([0.0]),
+                        ),
+                        dtype=np.float64,
+                    )
+                )
+            ),
+            "up_down_symmetry_flux_constraint_residual": float(
+                coordinate_map.flux_constraint_audit.get(
+                    "validation_normalized_residual",
+                    0.0,
+                )
+            ),
+            "up_down_symmetry_flux_constraint_iterations": int(
+                coordinate_map.flux_constraint_audit.get(
+                    "validation_iterations",
+                    0,
+                )
+            ),
+            "up_down_symmetry_flux_constraint_min_abs_F_sigma": float(
+                coordinate_map.flux_constraint_audit.get(
+                    "validation_minimum_abs_F_sigma",
+                    np.nan,
+                )
+            ),
+        })
+        psi_attrs = {
+            'name': 'psi',
+            'units': self.flux_normalization,
+            'desc': 'Poloidal flux',
+            'short_name': '$\\Psi$',
+        }
+        if projected_coordinate_field:
+            psi_attrs.update({
+                'interpolation_order_R': 3,
+                'interpolation_order_z': 3,
+                'projected_reflection_knot_union': 1,
+            })
+        magcoords['psi'] = xr.DataArray(
+            psirz,
+            dims=('R', 'z'),
+            coords={'R': R_fine, 'z': z_fine},
+            attrs=psi_attrs,
+        )
         magcoords['theta'] = thtable_da
         magcoords['theta'].attrs = {'name': 'theta', 'units': 'rad',
                                     'desc': 'Magnetic poloidal angle',
                                     'short_name': '$\\Theta*$'}
         magcoords['nu'] = nutable_da
-        magcoords['nu'].attrs = {'name': 'nu', 'units': 'rad',
-                                  'desc': 'Magnetic toroidal angle',
-                                  'short_name': '$\\nu$'}
+        magcoords['nu'].attrs = {
+            'name': 'nu',
+            'units': 'rad',
+            'desc': 'Toroidal gauge shift nu(psi, theta) in zeta = phi + nu',
+            'short_name': '$\\nu$',
+            'gauge_relation': 'zeta = phi + nu',
+        }
 
         magcoords.R.attrs = {'name': 'R', 'units': 'm', 'desc': 'Major radius',
                              'short_name': 'R'}
         magcoords.z.attrs = {'name': 'z', 'units': 'm', 'desc': 'Height',
                              'short_name': 'z'}
-        magcoords.psi0.attrs = {'name': 'psi0', 'units': 'Wb',
-                                'desc': 'Poloidal flux at the magnetic axis',
-                                'short_name': '$\\Psi_0$'}
         magcoords.thetageom.attrs = {'name': 'thetageom', 'units': 'rad',
                                      'desc': 'Geometrical poloidal angle',
                                      'short_name': '$\\Theta_{geom}$'}
@@ -1991,30 +4187,38 @@ class equilibrium:
         magdevs = xr.Dataset()
         magdevs['jacobian'] = xr.DataArray(jac_Rz, dims=('R', 'z'),
                                            coords={'R': R_fine, 'z': z_fine},
-                                           attrs={'name': 'jacobian', 'units': '',
-                                                  'desc': 'Jacobian of the transformation',
+                                           attrs={'name': 'jacobian', 'units': jacobian_units,
+                                                  'desc': ('Signed physical Jacobian '
+                                                           '[grad(psi) . (grad(theta) x grad(zeta))]**-1'),
                                                   'short_name': '$\\mathcal{J}$'})
         
         # Add all derivative arrays with proper attributes
+        full_grid_flux_derivatives = frozenset({
+            'dPsi_dr',
+            'dPsi_dz',
+            'dPsi_dphi',
+        })
         derivatives = {
-            'dR_dpsi': (dR_dpsi, 'm/Wb', 'Partial derivative of R with respect to poloidal flux'),
+            'dR_dpsi': (dR_dpsi, position_per_flux_units, 'Partial derivative of R with respect to poloidal flux'),
             'dR_dtheta': (dR_dtheta, 'm/rad', 'Partial derivative of R with respect to magnetic poloidal angle'),
             'dR_dzeta': (dR_dzeta, 'm/rad', 'Partial derivative of R with respect to magnetic toroidal angle'),
-            'dz_dpsi': (dz_dpsi, 'm/Wb', 'Partial derivative of z with respect to poloidal flux'),
+            'dz_dpsi': (dz_dpsi, position_per_flux_units, 'Partial derivative of z with respect to poloidal flux'),
             'dz_dtheta': (dz_dtheta, 'm/rad', 'Partial derivative of z with respect to magnetic poloidal angle'),
             'dz_dzeta': (dz_dzeta, 'm/rad', 'Partial derivative of z with respect to magnetic toroidal angle'),
-            'dphi_dpsi': (dphi_dpsi, 'rad/Wb', 'Partial derivative of phi with respect to poloidal flux'),
+            'dphi_dpsi': (dphi_dpsi, angle_per_flux_units, 'Partial derivative of phi with respect to poloidal flux'),
             'dphi_dtheta': (dphi_dtheta, 'rad/rad', 'Partial derivative of phi with respect to magnetic poloidal angle'),
             'dphi_dzeta': (dphi_dzeta, 'rad/rad', 'Partial derivative of phi with respect to magnetic toroidal angle'),
-            'dPsi_dr': (dPsi_dr, 'Wb/m', 'Partial derivative of poloidal flux with respect to R'),
-            'dPsi_dz': (dPsi_dz, 'Wb/m', 'Partial derivative of poloidal flux with respect to z'),
-            'dPsi_dphi': (dPsi_dphi, 'Wb/rad', 'Partial derivative of poloidal flux with respect to phi'),
+            'dPsi_dr': (dPsi_dr, flux_per_length_units, 'Partial derivative of poloidal flux with respect to R'),
+            'dPsi_dz': (dPsi_dz, flux_per_length_units, 'Partial derivative of poloidal flux with respect to z'),
+            'dPsi_dphi': (dPsi_dphi, flux_per_angle_units, 'Partial derivative of poloidal flux with respect to phi'),
             'dTheta_dr': (dTheta_dr, 'rad/m', 'Partial derivative of magnetic poloidal angle with respect to R'),
             'dTheta_dz': (dTheta_dz, 'rad/m', 'Partial derivative of magnetic poloidal angle with respect to z'),
             'dTheta_dphi': (dTheta_dphi, 'rad/rad', 'Partial derivative of magnetic poloidal angle with respect to phi'),
             'dzeta_dr': (dzeta_dr, 'rad/m', 'Partial derivative of magnetic toroidal angle with respect to R'),
             'dzeta_dz': (dzeta_dz, 'rad/m', 'Partial derivative of magnetic toroidal angle with respect to z'),
             'dzeta_dphi': (dzeta_dphi, 'rad/rad', 'Partial derivative of magnetic toroidal angle with respect to phi'),
+            'direct_det_Rz': (direct_det_Rz, direct_det_units,
+                              'Direct determinant det(partial(psi, theta)/partial(R, Z)); physical J = -R/direct_det_Rz'),
         }
         
         for name, (data, units, desc) in derivatives.items():
@@ -2025,22 +4229,18 @@ class equilibrium:
                                                'desc': desc,
                                                'short_name': f'$\\partial {short_name}$'})
 
+        for name in full_grid_flux_derivatives:
+            magdevs[name].attrs.update({
+                'validity_domain': 'finite_equilibrium_RZ_grid',
+            })
+
         magdevs.R.attrs = {'name': 'R', 'units': 'm', 'desc': 'Major radius',
                            'short_name': 'R'}
         magdevs.z.attrs = {'name': 'z', 'units': 'm', 'desc': 'Height',
                            'short_name': 'z'}
         
-        # Adding the profiles (I, q, F, h) to the magdevs dataset for easy access.
-        # Convention note:
-        #   The Boozer Jacobian relation is implemented in compute_coordinates as
-        #       J * B^2 = I_boozer + q*F
-        #   where I_boozer is the line-integrated profile returned by
-        #   compute_magnetic_coordinates (named Iprof in that function).
-        #   For historical compatibility we continue exposing magdevs['I'] as
-        #       I = 2*pi*I_boozer  (units T*m, short-name mu0*I),
-        #   and build h using I_boozer so that h remains consistent with J*B^2.
-        I_boozer = np.asarray(Iprof, dtype=float)
-        I_mu0 = 2.0 * np.pi * I_boozer
+        # Solver-facing Boozer convention: I=B_Theta and h=J*B^2=I+qF.
+        I_values = np.asarray(Iprof, dtype=float)
 
         magdevs['q'] = xr.DataArray(qprof, dims=('psi0',),
                                     coords={'psi0': psigrid},
@@ -2052,20 +4252,19 @@ class equilibrium:
                                     attrs={'name': 'F', 'units': 'T*m',
                                            'desc': 'F(psi) function in GS equation = RB_T', 
                                              'short_name': '$F$'})
-        magdevs['I_boozer'] = xr.DataArray(I_boozer, dims=('psi0',),
+        magdevs['I'] = xr.DataArray(I_values, dims=('psi0',),
                                     coords={'psi0': psigrid},
                                     attrs={'name': 'I', 'units': 'T*m',
-                                           'desc': 'Boozer current profile entering J*B^2 = I_boozer + qF',
-                                           'short_name': r'$I_\mathrm{boozer}$'})
-        # Legacy/public profile retained for compatibility with existing consumers.
-        magdevs['I'] = xr.DataArray(I_mu0, dims=('psi0',),
-                                    coords={'psi0': psigrid},
-                                    attrs={'name': 'I', 'units': 'T*m',
-                                           'desc': 'Legacy current profile I = 2*pi*I_boozer (short name mu0*I)',
-                                           'short_name': r'$\mu_0 I$'})
-        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I_boozer
-        magdevs.attrs = {'desc': 'h = Jacobian * B^2 = qF + I_boozer = qF + I/(2*pi)',
-                         'units': 'T*m', 'short_name': '$h$'}
+                                           'desc': ('Covariant Boozer magnetic-field '
+                                                    'coefficient I = B_Theta'),
+                                           'short_name': r'$I=B_\Theta$'})
+        magdevs['h'] = magdevs.q * magdevs.F + magdevs.I
+        magdevs['h'].attrs = {
+            'name': 'h',
+            'desc': 'Signed Boozer Jacobian factor h = J*B**2 = I + qF',
+            'units': 'T*m',
+            'short_name': '$h$',
+        }
 
         # Add inverse transformation
         magcoords['R_inv'] = xr.DataArray(Rtransform_padded,
@@ -2089,40 +4288,112 @@ class equilibrium:
         magcoords.theta_star.attrs = {'name': 'theta_star', 'units': 'rad',
                                       'desc': 'Magnetic poloidal angle',
                                       'short_name': '$\\Theta^*$'}
+        psi_axis = float(self.geometry.attrs.get('psi_ax', self._psi_ax_init))
+        psi_boundary = float(
+            self.geometry.attrs.get('psi_bdy', self._psi_edge_init)
+        )
+        magcoords.psi0.attrs = {
+            'name': 'psi0',
+            'units': self.flux_normalization,
+            'desc': 'Strictly increasing physical poloidal-flux spline coordinate',
+            'short_name': '$\\Psi_0$',
+            'psi_axis': psi_axis,
+            'psi_boundary': psi_boundary,
+            'normalization': (
+                'psi_N = (psi - psi_axis) / (psi_boundary - psi_axis)'
+            ),
+        }
+        magdevs.psi0.attrs = magcoords.psi0.attrs.copy()
 
-        # Save profiles
-        self.boozer_profs = xr.Dataset()
-        self.boozer_profs['q'] = xr.DataArray(qprof, dims=('psi0',),
-                                              coords=(psigrid,),
-                                              attrs={'name': 'q', 'units': '',
-                                                     'desc': 'Safety factor',
-                                                     'short_name': '$q$'})
-        self.boozer_profs['I_boozer'] = xr.DataArray(I_boozer, dims=('psi0',),
-                                              coords=(psigrid,),
-                                              attrs={'name': 'I_boozer', 'units': 'T*m',
-                                                     'desc': 'Current profile used in J*B^2 = I_boozer + qF',
-                                                     'short_name': '$I_{boozer}$'})
-        I_amp = I_boozer * 2*np.pi/(4.0*np.pi * 1e-7)
-        self.boozer_profs['I'] = xr.DataArray(I_amp, dims=('psi0',),
-                                              coords=(psigrid,),
-                                              attrs={'name': 'I', 'units': 'A',
-                                                     'desc': 'Toroidal current',
-                                                     'short_name': '$I$'})
-        self.boozer_profs['F'] = xr.DataArray(Fprof, dims=('psi0',),
-                                              coords=(psigrid,),
-                                              attrs={'name': 'F', 'units': 'T*m',
-                                                     'desc': 'F(psi) function in GS equation = RB_T',
-                                                     'short_name': '$F$'})
-
-        # Map regions outside LCFS to NaN
-        rhoprz = self.flux.rho.interp(R=R_fine, z=z_fine, method='cubic')
-        flags = rhoprz > 1.0
+        # Build the LCFS mask from finite physical psi rather than interpolating
+        # rho, whose source grid legitimately contains NaNs outside the LCFS.
+        psi_span = psi_boundary - psi_axis
+        if abs(psi_span) < 1.0e-14:
+            raise ValueError("Axis and boundary poloidal flux must be distinct.")
+        rho_squared = (np.asarray(psirz, dtype=float) - psi_axis) / psi_span
+        inside_lcfs = (
+            np.isfinite(rho_squared)
+            & (rho_squared >= -1.0e-12)
+            & (rho_squared <= 1.0 + 1.0e-12)
+        )
+        inside_lcfs_da = xr.DataArray(
+            inside_lcfs,
+            dims=('R', 'z'),
+            coords={'R': R_fine, 'z': z_fine},
+            attrs={
+                'name': 'inside_lcfs',
+                'units': '',
+                'desc': 'True where normalized physical poloidal flux is in [0, 1]',
+            },
+        )
+        magcoords['inside_lcfs'] = inside_lcfs_da
+        coordinate_domain_da = xr.DataArray(
+            coordinate_domain & inside_lcfs,
+            dims=('R', 'z'),
+            coords={'R': R_fine, 'z': z_fine},
+            attrs={
+                'name': 'inside_coordinate_domain',
+                'units': '',
+                'desc': (
+                    'True where the common magnetic-coordinate map is fitted'
+                ),
+            },
+        )
+        magcoords['inside_coordinate_domain'] = coordinate_domain_da
+        for name, field in list(magdevs.data_vars.items()):
+            if (
+                field.dims == ('R', 'z')
+                and name not in full_grid_flux_derivatives
+            ):
+                attrs = field.attrs.copy()
+                magdevs[name] = field.where(coordinate_domain_da)
+                magdevs[name].attrs = attrs
 
         # Store computed coordinates for easy access
         mag_coords_obj = MagneticCoordinates(magcoords, magdevs,
                                               Raxis=R_axis_val,
                                               zaxis=z_axis_val,
-                                              pad=ntht_pad)
+                                              pad=ntht_pad,
+                                              build_metric_cache=(
+                                                  build_metric_cache
+                                              ))
+        # Private numerical engine used by the unchanged public transform
+        # methods. It is intentionally not serialized as an xarray object.
+        mag_coords_obj._coordinate_map = coordinate_map
+        mag_coords_obj._theta_tolerance = float(accuracy.theta_tolerance)
+
+        node_psi, node_theta = np.meshgrid(
+            psigrid,
+            magnetic_theta,
+            indexing='ij',
+        )
+        node_differential = coordinate_map.differentials(
+            node_psi,
+            node_theta,
+        )
+        target_scale = np.maximum(
+            np.max(np.abs(jacobian_magnetic), axis=1),
+            np.finfo(np.float64).tiny,
+        )
+        jacobian_relative_residual = np.max(
+            np.abs(
+                node_differential.jacobian
+                - jacobian_magnetic
+            ),
+            axis=1,
+        ) / target_scale
+        mag_coords_obj._coordinate_diagnostics = {
+            'jacobian_relative_residual': jacobian_relative_residual,
+            'radial_support': support_metadata,
+            'up_down_symmetry': symmetry_audit,
+            **dict(construction_diagnostics or {}),
+        }
+        mag_coords_obj.deriv['jacobian'].attrs.update({
+            'construction': 'determinant of the common Fourier-spline map',
+            'target_jacobian_max_relative_residual': float(
+                np.max(jacobian_relative_residual)
+            ),
+        })
         
         # Cache the result for easy access
         if not hasattr(self, '_magnetic_coordinates_cache'):
@@ -2156,183 +4427,3 @@ class equilibrium:
         if not hasattr(self, '_magnetic_coordinates_cache'):
             self._magnetic_coordinates_cache = {}
         return self._magnetic_coordinates_cache
-
-    def to_geqdsk(
-        self,
-        filename: str,
-        cocos: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """
-        Save the equilibrium to a g-EQDSK file.
-
-        When the internal object has not a clearly defined COCOS
-        convention, this will try to change it to COCOS=1 by default.
-
-        Parameters
-        ----------
-        filename : str
-            Name of the output file
-        cocos : int, optional
-            COCOS convention to use. If None, uses COCOS=1. Default is None
-
-        Returns
-        -------
-        dict
-            Dictionary containing the g-EQDSK data that was written
-
-        Raises
-        ------
-        ValueError
-            If file already exists
-        """
-
-        if os.path.isfile(filename):
-            raise ValueError(f'File {filename} already exists.' + 
-                              'Please remove it before saving.')
-        
-        # Before saving the gdata.
-
-        # Creating the gdata dictionary.
-        gdata = dict()
-        gdata['nx'] = self.Rgrid.size
-        gdata['ny'] = self.zgrid.size
-        gdata['rmagx'] = float(self.geometry.R_axis.values)
-        gdata['zmagx'] = float(self.geometry.z_axis.values)
-        gdata['bcentr'] = float(self.Bdata.Baxis.values)
-        gdata['rleft'] = float(self.Rgrid[0].values)
-        gdata['zmid'] = float(np.nanmean(self.zgrid.values))
-        gdata['rdim'] = float(self.Rgrid[-1].values - self.Rgrid[0].values)
-        gdata['zdim'] = float(self.zgrid[-1].values - self.zgrid[0].values)
-
-        # Saving the Psi value.
-        psip = self.flux.psi.values
-        gdata['psi'] = psip
-        gdata['simagx'] = float(self.geometry.attrs.get('psi_ax'))
-        gdata['sibdry'] = float(self.geometry.attrs.get('psi_bdy'))
-        gdata['nbdry'] = 1
-        gdata['nlim'] = 1
-        gdata['rbdry'] = self.geometry.R_boundary.values
-        gdata['zbdry'] = self.geometry.z_boundary.values
-
-        # We need now to get the fpol, pressure and current.
-        # Getting the magnetic coordinates.
-        cache = getattr(self, '_magnetic_coordinates_cache', {})
-        if 'boozer' not in cache:
-            self.compute_coordinates(coordinate_system='boozer', lpsi=501) # We need to compute the Boozer transformation.
-
-        psi_ax = float(self.geometry.attrs.get('psi_ax'))
-        psi_bdy = float(self.geometry.attrs.get('psi_bdy'))
-        psiN = psi_bdy - psi_ax
-        dpsi_nominal = psiN / (gdata['nx'] - 1)
-        nx_2 = int((self.flux.rho.max().values**2 * psiN)/dpsi_nominal) + 1
-
-        rhopol_integral = np.linspace(0, float(self.flux.rho.max().values), nx_2)
-        psi_integral = rhopol_integral**2 * psiN + psi_ax
-        fpol_full = np.zeros_like(rhopol_integral)
-
-        flags_extrapolate = np.zeros_like(rhopol_integral, dtype=bool)
-
-        # We need to manually recompute the value of the function F:
-        for ii, irhop in enumerate(rhopol_integral):
-            R, z = self.rhopol2rz(irhop)
-            R = R[0]
-            z = z[0]
-
-            if R is None:
-                flags_extrapolate[ii] = True
-                continue
-
-            Bvalue = self.getB(R, z, grid=False)
-
-            # We need to interpolate the pressure gradient.
-            fpol_full[ii] = np.nanmean(R * Bvalue.Bphi.values)
-        
-        # We need to extrapolate to the values that the algorithm could not
-        # find.
-        fpol_full[flags_extrapolate] = np.interp(rhopol_integral[flags_extrapolate],
-                                                 rhopol_integral[~flags_extrapolate],
-                                                 fpol_full[~flags_extrapolate])
-        
-        
-
-        # From the Boozer transformation, we can get the fpol, pressure and current.
-        psi1d = np.linspace(psi_ax, psi_bdy, gdata['nx'])
-        psiN = psi_bdy - psi_ax
-        fpol = InterpolatedUnivariateSpline(psi_integral, fpol_full, k=3)(psi1d)
-        gdata['fpol'] = fpol
-
-        # Getting the derivative.
-        d_dpsi = FinDiff(0, 1, acc=4)
-        ffprime = d_dpsi(fpol_full, psi_integral) * fpol_full
-        idx = np.where(flags_extrapolate[:nx_2//2])[0][-1] + 3
-        gdata['ffprime'] = InterpolatedUnivariateSpline(psi_integral[idx:], 
-                                                        ffprime[idx:], k=1)(psi1d)
-
-        # From the Grad-Shafranov equation, one can get the pressure
-        # gradient in magnetic coordinates.
-        d_dR = FinDiff(0, self.Rgrid.values[1] - self.Rgrid.values[0], 1, acc=4)
-        d_dz = FinDiff(1, self.zgrid.values[1] - self.zgrid.values[0], 1, acc=4)
-
-        tmp1 = d_dR(self.Bdata.Bz.values) / self.Rgrid.values[:, None]
-        tmp2 = d_dz(self.Bdata.Br.values) / self.Rgrid.values[:, None]
-
-        # \\mu_0 pprime = - [ FF'/R^2 + dB_z/dR / R - dB_R/dz / R ]
-        ffprime_rz = InterpolatedUnivariateSpline(psi_integral[idx:], 
-                                                  ffprime[idx:], ext=3,
-                                                  k=3)(self.fluxdata.psipol.values)
-        pprime_rz = - (ffprime_rz / self.Rgrid.values[:, None]**2 - tmp1 + tmp2)
-
-        gdata['pprime_rz'] = pprime_rz
-        gdata['ffprime_rz'] = ffprime_rz
-
-        # We need now the average pressure gradient in the flux surface.
-        pprime = np.zeros_like(rhopol_integral)
-        ffprime_check = np.zeros_like(rhopol_integral)
-
-        pprime_intrp = RectBivariateSpline(self.Rgrid.values, self.zgrid.values,
-                                             pprime_rz)
-        ffprime_rz_intrp = RectBivariateSpline(self.Rgrid.values, self.zgrid.values,
-                                               ffprime_rz)
-        
-        for ii, irhop in enumerate(rhopol_integral):
-            R, z = self.rhopol2rz(irhop)
-            R = R[0]
-            z = z[0]
-
-            if R is None:
-                pprime[ii] = 0
-                ffprime_check[ii] = 0
-                continue
-
-            # We need to interpolate the pressure gradient.
-            tmp = pprime_intrp(R, z, grid=False)
-
-            thetaval = np.arctan2(z - float(self.geometry.z_axis.values), 
-                                  R - float(self.geometry.R_axis.values))
-            # plt.plot(thetaval, tmp)
-            pprime[ii] = np.nanmean(tmp)
-            ffprime_check[ii] = np.nanmean(ffprime_rz_intrp(R, z, grid=False))
-
-        
-        gdata['pprime'] = InterpolatedUnivariateSpline(psi_integral, pprime,
-                                                       k=3)(psi1d) / (4*np.pi * 1e-7)
-        gdata['ffprime_check'] = ffprime_check
-
-        # plt.plot(psi_integral, pprime, 'r-')
-        # plt.plot(self._gdata['psi_1d'], self._gdata['pprime'], 'b--')
-
-        # To get now the total pressure, we need to integrate the pprime
-        # along the magnetic flux. Since we don't have any indication on
-        # boundary condition, we will consider that for the largest value
-        # of rhopol, the pressure is zero.
-        ptotal = np.zeros_like(rhopol_integral)
-        psi_integral = rhopol_integral**2 * psiN + psi_ax
-        ptotal[-1] = 0.0
-
-        for ii in range(len(rhopol_integral) - 2, -1, -1):
-            ptotal[ii] = ptotal[ii+1] + pprime[ii] * (psi_integral[ii+1] - psi_integral[ii])
-
-        gdata['ptotal'] = InterpolatedUnivariateSpline(psi_integral, ptotal, k=3)(psi1d)
-
-
-        return gdata

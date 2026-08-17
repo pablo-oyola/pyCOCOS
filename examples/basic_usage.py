@@ -5,7 +5,7 @@ Basic usage example for pycocos.
 from pycocos import EQDSK
 
 # Load equilibrium from file
-eq = EQDSK("equilibrium.geqdsk")
+eq = EQDSK("equilibrium.geqdsk", cocos_in=1, cocos_internal=1)
 
 # Access magnetic field components
 Br = eq.Bdata.Br
@@ -21,4 +21,3 @@ R_axis = eq.fluxdata.Raxis
 z_axis = eq.fluxdata.zaxis
 
 print(f"Magnetic axis: R={R_axis:.3f} m, z={z_axis:.3f} m")
-

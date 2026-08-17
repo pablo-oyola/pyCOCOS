@@ -81,7 +81,7 @@ def get_field_line(
     # Defining the RK4 coefficients
     c0 = np.array([1.0/6.0, 1.0/3.0, 1.0/3.0, 1.0/6.0])
     c1 = np.array([0.50, 0.50, 1.0, 0.0])
-    ds = tol
+    ds = tol * integration_sign
 
     # Defining the temporal values
     Rnow = R
@@ -97,6 +97,13 @@ def get_field_line(
     bphiout = np.zeros(Nmax)
 
     done = False
+    # The integration starts on the outboard midplane.  Record which side of
+    # that plane the orbit enters first so closure is detected only when the
+    # trajectory returns to the same side after a full poloidal turn.  A
+    # hard-coded upward/downward crossing closes one orientation after only a
+    # half turn at the inboard midplane.
+    departure_sign = 0
+    npoints = 0
     for ii in range(Nmax):
         r1 = Rnow
         r2 = Rnow
@@ -129,8 +136,18 @@ def get_field_line(
                 znow = z1 + c0[irk] * dzval
                 phinow = phi1 + c0[irk] * dphival
 
-            # Checking whether we have crossed the axis
-            if ((znow - zaxis) * (z2 - zaxis) < 0.0) and (znow < zaxis):
+            zoffset = znow - zaxis
+            if departure_sign == 0 and np.abs(zoffset) > 1.0e-14:
+                departure_sign = 1 if zoffset > 0.0 else -1
+
+            # Close only on the crossing that returns to the initial side of
+            # the midplane.  The first crossing enters the opposite side and
+            # is the inboard half-turn; the second is the full-turn return to
+            # the outboard starting branch, independent of integration sign.
+            if (
+                zoffset * (z2 - zaxis) < 0.0
+                and departure_sign * zoffset > 0.0
+            ):
                 # Using linear interpolation, we get the R value at the axis
                 Rnow = (zaxis - z2) * (Rnow - r2) / (znow - z2) + r2
                 znow = zaxis
@@ -154,13 +171,14 @@ def get_field_line(
             bzout[ii] = binterp[1]
             bphiout[ii] = binterp[2]
 
+        npoints = ii + 1
         if done:
             break
     
     if not done:
-        print("WARNING: The field line did not reach the axis.")
+        print("WARNING: The field line did not complete a full poloidal turn.")
 
-    return Routput, zoutput, phiout, brout, bzout, bphiout, ii
+    return Routput, zoutput, phiout, brout, bzout, bphiout, npoints
 
 
 @njit(nogil=True, cache=True)
@@ -245,6 +263,10 @@ def integrate_pol_field_line(
     bphiout = np.zeros(Nmax)
 
     done = False
+    # See get_field_line: closure must be tied to the initial direction of
+    # departure from the outboard midplane, not to an absolute z direction.
+    departure_sign = 0
+    npoints = 0
     for ii in range(Nmax):
         r1 = Rnow
         r2 = Rnow
@@ -271,8 +293,14 @@ def integrate_pol_field_line(
                 Rnow = r1 + c0[irk] * dRval
                 znow = z1 + c0[irk] * dzval
 
-            # Checking whether we have crossed the axis
-            if ((znow - zaxis) * (z2 - zaxis) < 0.0) and (znow < zaxis):
+            zoffset = znow - zaxis
+            if departure_sign == 0 and np.abs(zoffset) > 1.0e-14:
+                departure_sign = 1 if zoffset > 0.0 else -1
+
+            if (
+                zoffset * (z2 - zaxis) < 0.0
+                and departure_sign * zoffset > 0.0
+            ):
                 # Using linear interpolation, we get the R value at the axis
                 Rnow = (zaxis - z2) * (Rnow - r2) / (znow - z2) + r2
                 znow = zaxis
@@ -294,10 +322,11 @@ def integrate_pol_field_line(
             bzout[ii] = binterp[1]
             bphiout[ii] = binterp[2]
 
+        npoints = ii + 1
         if done:
             break
     
     if not done:
-        print("WARNING: The field line did not reach the axis.")
+        print("WARNING: The field line did not complete a full poloidal turn.")
 
-    return Routput, zoutput, brout, bzout, bphiout, ii
+    return Routput, zoutput, brout, bzout, bphiout, npoints

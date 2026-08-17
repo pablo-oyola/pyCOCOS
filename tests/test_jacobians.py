@@ -1,8 +1,11 @@
 import numpy as np
+import pytest
 
 from pycocos.coordinates.jacobian_builders import (
     boozer_consistency_residual,
     make_jacobian_context,
+    normalize_jacobian_to_two_pi,
+    validate_jacobian,
 )
 from pycocos.coordinates.jacobians import (
     compute_boozer_jacobian,
@@ -12,6 +15,7 @@ from pycocos.coordinates.jacobians import (
 )
 from pycocos.coordinates.registry import (
     JACOBIAN_REGISTRY,
+    _get_jacobian_cache_identity,
     get_jacobian_function,
     register_coordinate_system,
 )
@@ -44,53 +48,137 @@ def test_boozer_uses_h_over_b2_context_api():
     assert boozer_consistency_residual(ctx, jac) < 1.0e-12
 
 
-def test_boozer_legacy_signature_kept():
+def test_boozer_rejects_removed_four_argument_signature():
     B = np.array([2.0, 2.5, 3.0], dtype=float)
-    jac = compute_boozer_jacobian(np.array([1.0]), np.array([2.0]), np.array([0.5]), B)
-    assert np.allclose(jac, (1.0 + 0.5 * 2.0) / (B**2))
+    with pytest.raises(TypeError):
+        compute_boozer_jacobian(
+            np.array([1.0]),
+            np.array([2.0]),
+            np.array([0.5]),
+            B,
+        )
 
 
 def test_hamada_is_theta_independent():
     ctx = _surface_context("hamada")
     jac = compute_hamada_jacobian(ctx)
-    assert np.all(np.isfinite(jac))
-    assert np.max(np.abs(jac - jac.mean())) < 1.0e-12
+    assert np.array_equal(jac, np.ones_like(jac))
 
 
-def test_pest_has_r2_shape_up_to_surface_scale():
+def test_pest_returns_raw_r2_shape():
     ctx = _surface_context("pest")
     jac = compute_pest_jacobian(ctx)
-    ratio = jac / (ctx["R"] ** 2)
-    ratio = ratio[np.isfinite(ratio)]
-    assert ratio.size > 0
-    assert np.std(ratio) < 1.0e-10
+    assert np.allclose(jac, ctx["R"] ** 2)
 
 
-def test_equal_arc_has_r_over_gradpsi_shape_up_to_surface_scale():
+def test_equal_arc_returns_raw_r_over_gradpsi_shape():
     ctx = _surface_context("equal_arc")
     jac = compute_equal_arc_jacobian(ctx)
     grad_psi = np.abs(ctx["R"] * ctx["Bpol"])
     target = ctx["R"] / grad_psi
-    ratio = jac / target
-    ratio = ratio[np.isfinite(ratio)]
-    assert ratio.size > 0
-    assert np.std(ratio) < 1.0e-10
+    assert np.allclose(jac, target)
 
 
-def test_registry_wraps_legacy_custom_callable():
-    name = "legacy_context_wrapper_test"
+@pytest.mark.parametrize(
+    "bad_callable",
+    [
+        lambda I, F, q, B: (I + q * F) / (B**2),
+        lambda *args: np.asarray(args),
+        lambda context, **kwargs: context["B"],
+    ],
+)
+def test_registry_rejects_non_context_only_callables(bad_callable):
+    with pytest.raises(TypeError, match="exactly one positional parameter"):
+        register_coordinate_system("invalid_signature_test", bad_callable)
 
-    def legacy_callable(I, F, q, B):
-        return (I[0] + q[0] * F[0]) / (B**2)
 
-    register_coordinate_system(name, legacy_callable)
+@pytest.mark.parametrize(
+    ("bad_jacobian", "message"),
+    [
+        (np.full(256, np.nan), "finite"),
+        (np.zeros(256), "nonzero"),
+        (np.r_[np.ones(128), -np.ones(128)], "one sign"),
+        (np.ones((16, 16)), "1D array"),
+        (np.ones(255), "matching"),
+    ],
+)
+def test_validate_jacobian_rejects_invalid_surface_arrays(bad_jacobian, message):
+    ctx = _surface_context("validation")
+    with pytest.raises(ValueError, match=message):
+        validate_jacobian(ctx, bad_jacobian)
+
+
+def test_custom_shape_normalization_closes_at_two_pi_and_is_scale_invariant():
+    name = "custom_shape_normalization_test"
+
+    def custom_shape(context):
+        theta = np.linspace(
+            0.0,
+            2.0 * np.pi,
+            context["B"].size,
+            endpoint=False,
+        )
+        return 0.8 + 0.2 * np.cos(theta) - 0.05 * np.sin(2.0 * theta)
+
+    register_coordinate_system(name, custom_shape)
     try:
         jacobian_func = get_jacobian_function(name)
         ctx = _surface_context(name)
-        out = jacobian_func(ctx)
-        expected = (ctx["I"] + ctx["q"] * ctx["F"]) / (ctx["B"] ** 2)
-        assert out.shape == ctx["B"].shape
-        assert np.allclose(out, expected)
+        raw = jacobian_func(ctx)
+        normalized = normalize_jacobian_to_two_pi(ctx, raw)
+        scaled_normalized = normalize_jacobian_to_two_pi(ctx, 17.0 * raw)
+
+        grad_psi = np.abs(ctx["R"] * ctx["Bpol"])
+        span = np.sum(
+            ctx["R"] / (np.abs(normalized) * grad_psi) * ctx["dlp"]
+        )
+
+        assert span == pytest.approx(2.0 * np.pi, rel=1.0e-13)
+        assert np.allclose(normalized, scaled_normalized, rtol=1.0e-13)
+        assert get_jacobian_function(name) is custom_shape
     finally:
         JACOBIAN_REGISTRY.pop(name, None)
 
+
+def test_custom_registration_requires_explicit_persistent_cache_version():
+    name = "custom_checkpoint_identity_test"
+
+    def custom_shape(context):
+        return np.ones_like(context["B"])
+
+    register_coordinate_system(name, custom_shape)
+    runtime_token, persistent_version = _get_jacobian_cache_identity(name)
+    assert runtime_token.startswith("registration-")
+    assert persistent_version is None
+
+    register_coordinate_system(name, custom_shape, cache_version="shape-v2")
+    replacement_token, persistent_version = _get_jacobian_cache_identity(name)
+    assert replacement_token != runtime_token
+    assert persistent_version == "shape-v2"
+    JACOBIAN_REGISTRY.pop(name, None)
+
+
+def test_direct_builtin_registry_override_cannot_inherit_checkpoint_identity():
+    original = JACOBIAN_REGISTRY["boozer"]
+
+    def replacement(context):
+        return np.ones_like(context["B"])
+
+    try:
+        JACOBIAN_REGISTRY["boozer"] = replacement
+        runtime_token, persistent_version = _get_jacobian_cache_identity(
+            "boozer"
+        )
+        assert runtime_token.startswith("direct-registry-entry-")
+        assert persistent_version is None
+    finally:
+        JACOBIAN_REGISTRY["boozer"] = original
+
+
+def test_normalization_preserves_negative_orientation():
+    ctx = _surface_context("negative_orientation")
+    normalized = normalize_jacobian_to_two_pi(
+        ctx,
+        -np.ones_like(ctx["B"]),
+    )
+    assert np.all(normalized < 0.0)

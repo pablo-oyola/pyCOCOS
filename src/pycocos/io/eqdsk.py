@@ -5,34 +5,21 @@ This library reads and parses the equilibrium file in the so-called EQDSK and
 parses the COCOS standard.
 """
 
-import numpy as np
+import copy
 import os
-import xarray as xr
-from scipy.interpolate import interp1d, InterpolatedUnivariateSpline, RectBivariateSpline
-from findiff import FinDiff
+from typing import Any, Dict, Optional
+
 import freeqdsk
-from typing import Dict, Any, Optional
+import numpy as np
+import xarray as xr
+from findiff import FinDiff
+from scipy.interpolate import InterpolatedUnivariateSpline, RectBivariateSpline, interp1d
 
 # Import from new structure
 from ..core.equilibrium import equilibrium
 
-from .cocos import fromCocosNtoCocosM
-from .cocos import assign as assign_cocos
+from .cocos import FluxNormalization, fromCocosNtoCocosM, identify_cocos
 from .cocos import cocos as get_cocos
-import logging
-
-fmt = logging.Formatter('%(asctime)s | %(name)s | %(levelname)s: %(message)s', '%H:%M:%S')
-
-
-logger = logging.getLogger('equ.eqdsk')
-
-if len(logger.handlers) == 0:
-    hnd = logging.StreamHandler()
-    hnd.setFormatter(fmt)
-    logger.addHandler(hnd)
-
-#logger.setLevel(logging.DEBUG)
-logger.setLevel(logging.INFO)
 
 __mapping = (('hdr', 'comment'),   ('Bcenter', 'bcentr'),  ('Ip', 'cpasma'),
              ('lr', 'nx'),         ('lz', 'ny'),           ('r_bdy', 'rbdry'),
@@ -45,186 +32,119 @@ __mapping = (('hdr', 'comment'),   ('Bcenter', 'bcentr'),  ('Ip', 'cpasma'),
 # -----------------------------------------------------------------------------
 # ROUTINES TO READ THE EQDSK.
 # -----------------------------------------------------------------------------
-# g-file reader from Giovanni.
-def ssplit(ll: str):
-    """
-    Read a formatted output from any FORTRAN code.
+def _representative_q(qpsi: Any) -> float:
+    """Return a finite, nonzero q value after checking sign consistency."""
+    try:
+        values = np.asarray(qpsi, dtype=float).ravel()
+    except (TypeError, ValueError) as exc:
+        raise TypeError("qpsi must contain real values") from exc
 
-    adapted from:
-    Giovanni Tardini - git@ipp.mpg.de
+    usable = values[np.isfinite(values) & (values != 0.0)]
+    if usable.size == 0:
+        raise ValueError("qpsi must contain a finite, nonzero value")
+    if np.any(np.sign(usable) != np.sign(usable[0])):
+        raise ValueError("qpsi contains mixed nonzero signs")
+    return float(usable[0])
 
-    :param ll: line to transform to a numeric list.
-    """
-    tmp = ll.replace('-', ' -')
-    tmp = tmp.replace('e -', 'e-')
-    tmp = tmp.replace('E -', 'E-')
-    slist = tmp.split()
-    a = [float(i) for i in slist]
 
-    return a
+def _resolve_loader_input_convention(
+    raw: Dict[str, Any],
+    cocos_in: Optional[int],
+    cocos_internal: int,
+    phiclockwise_in: Optional[bool],
+    flux_normalization: Optional[FluxNormalization],
+) -> Dict[str, Any]:
+    """Resolve the source and stored COCOS conventions exactly once."""
+    if phiclockwise_in is not None and not isinstance(
+        phiclockwise_in,
+        (bool, np.bool_),
+    ):
+        raise TypeError("phiclockwise_in must be a boolean or None")
+    if flux_normalization not in (None, "Wb", "Wb/rad"):
+        raise ValueError("flux_normalization must be either 'Wb' or 'Wb/rad'")
 
-def read_eqdsk_2(filename: str, cocos: int=2):
-    """
-    Read an EQDSK file and return a dictionary with the physical info.
+    internal_descriptor = get_cocos(cocos_internal)
 
-    :param filename: file to read.
-    :param cocos: COCOS standard.
-    """
-    if not os.path.isfile(filename):
-        raise FileNotFoundError(f'Cannot locate the file {filename}.')
+    if cocos_in is not None:
+        input_descriptor = get_cocos(cocos_in)
+        expected_phiclockwise = input_descriptor.phiclockwise
+        expected_flux_normalization = input_descriptor.flux_normalization
 
-    with open(filename, 'r') as f:
-        lines = f.readlines()
-
-    # Setting the constants according to the COCOS convention.
-    if cocos < 10:
-        pi_exp = 0
+        if (
+            phiclockwise_in is not None
+            and bool(phiclockwise_in) != expected_phiclockwise
+        ):
+            raise ValueError(
+                f"COCOS {cocos_in} requires phiclockwise_in="
+                f"{expected_phiclockwise}, got {phiclockwise_in}"
+            )
+        if (
+            flux_normalization is not None
+            and flux_normalization != expected_flux_normalization
+        ):
+            raise ValueError(
+                f"COCOS {cocos_in} requires flux_normalization="
+                f"'{expected_flux_normalization}', got '{flux_normalization}'"
+            )
     else:
-        pi_exp = 1
+        resolution = identify_cocos(
+            _representative_q(raw['qpsi']),
+            raw['cpasma'],
+            raw['bcentr'],
+            raw['simagx'],
+            raw['sibdry'],
+            phiclockwise=phiclockwise_in,
+            flux_normalization=flux_normalization,
+        )
+        if not resolution.is_unique:
+            raise ValueError(
+                "Cannot uniquely determine the input COCOS from this EQDSK; "
+                f"candidates are {resolution.candidates}. Pass cocos_in, or "
+                "supply phiclockwise_in and flux_normalization."
+            )
+        cocos_in = resolution.require_unique()
+        input_descriptor = get_cocos(cocos_in)
+        expected_phiclockwise = input_descriptor.phiclockwise
+        expected_flux_normalization = input_descriptor.flux_normalization
 
-    if cocos in (1, 11, 2, 12, 5, 15, 6, 16):
-        sigma_bp = +1
-    else:
-        sigma_bp = -1
-    
-    if cocos in (1, 11, 2, 12, 7, 17, 8, 18):
-        sigma_rho = +1
-    else:
-        sigma_rho = -1
+    return {
+        'cocos_input': cocos_in,
+        'cocos_internal': cocos_internal,
+        'phiclockwise_input': expected_phiclockwise,
+        'phiclockwise_internal': internal_descriptor.phiclockwise,
+        'flux_normalization_input': expected_flux_normalization,
+        'flux_normalization_internal': internal_descriptor.flux_normalization,
+    }
 
-    print('sigma_bp', sigma_bp, 'sigma_rho', sigma_rho)
-
-
-    header = lines[0].split()
-    nw = int(header[-2])
-    nh = int(header[-1])
-
-    rdim, zdim, rcentr, rleft, zmid      = ssplit(lines[1])
-    rdim, zdim, rcentr, rleft, zmid      = ssplit(lines[1])
-    rmaxis, zmaxis, simag, sibry, bcentr = ssplit(lines[2])
-    current, simag, xdum, rmaxis, xdum   = ssplit(lines[3])
-    zmaxis, xdum, sibry, xdum, xdum      = ssplit(lines[4])
-
-    jline = 5
-    len_d = {'fpol': nw, 'ffp': nw, 'prs': nw, 'pprim': nw, \
-             'psi': nw*nh, 'q':nw}
-
-    output = {}
-    n_lin  = 5
-    geq_sig = ('fpol', 'prs', 'ffp', 'pprim', 'psi', 'q')
-    for lbl in geq_sig:
-        nx = len_d[lbl]
-        output[lbl] = np.zeros(nx)
-        jl = 0
-        while jl < nx:
-            jr = min([jl+n_lin, nx+1])
-            output[lbl][jl: jr] = ssplit(lines[jline])
-            jline += 1
-            jl += n_lin
-    psi = output['psi'].reshape(nh, nw).T
-
-
-    nbbbs, limitr = lines[jline].split()
-    n_bdy = int(nbbbs)
-    n_lim = int(limitr)
-    jline += 1
-    len_d = {'bdy': n_bdy, 'lim': n_lim}
-    for lbl in ('bdy', 'lim'):
-        nx = 2*len_d[lbl]
-        output[lbl] = np.zeros(nx)
-        jl = 0
-        while jl < nx:
-            jr = min([jl+5, nx])
-            count = jr - jl
-            output[lbl][jl:jr] = ssplit(lines[jline])[:count]
-            jline += 1
-            jl += 5
-
-    # We check now whether there is consistency in the magnetic flux at the axis.
-    Rgrid = np.linspace(rleft, rleft + rdim, nw)
-    zgrid = np.linspace(zmid - 0.5*zdim, zmid + 0.5*zdim, nh)
-    intrp = RectBivariateSpline(Rgrid, zgrid, psi)
-
-    simag_intrp = intrp(rmaxis, zmaxis, grid=False).squeeze()
-
-
-    if abs(abs(simag_intrp) - abs(simag)) > 1e-4:
-        logger.warning('The magnetic flux at the axis seems ' +
-                       'not be consistent with the value on the file')
-        simag = simag_intrp
-
-
-    # Let's do the same with the boundary.
-    bdy = output['bdy'].reshape(n_bdy, 2)
-    Rbdy = bdy[:, 0]
-    zbdy = bdy[:, 1]
-    # sibdy_intrp = np.mean(intrp(Rbdy, zbdy, grid=False))
-    # plt.hist(intrp(Rbdy, zbdy, grid=False).flatten(), bins=100)
-
-    if simag > sibry:
-        psi_sign = -1.0
-    else:
-        psi_sign = +1.0
-
-    output['hdr']     = header
-    output['Bcenter'] = bcentr
-    output['Ip']      = current
-    output['lr']      = nw
-    output['lz']      = nh
-    output['r_bdy']   = bdy[:, 0]
-    output['z_bdy']   = bdy[:, 1]
-    output['Raxis']   = rmaxis
-    output['zaxis']   = zmaxis
-    output['Rgrid']   = np.linspace(rleft, rleft + rdim, nw)
-    output['zgrid']   = np.linspace(zmid - 0.5*zdim, zmid + 0.5*zdim, nh)
-    output['psi']     = psi_sign *psi   / (2.0*np.pi)**pi_exp
-    output['psi_ax']  = psi_sign * simag / (2.0*np.pi)**pi_exp
-    output['psi_bdy'] = psi_sign * sibry / (2.0*np.pi)**pi_exp
-    output['psimax']  = output['psi_bdy'] - output['psi_ax']
-    output['dpsi']    = np.abs(output['psimax'])/(output['lr']-1)
-    output['psirz']   = output['psi'] - output['psi_ax']
-    output['rhoprz']  = np.sqrt(output['psirz']/output['psimax'])
-    output['q']       = output['q'] * sigma_bp * sigma_rho
-
-    # --- Making the flux quantities to the grid.
-    psi_1d = np.linspace(0.0, output['psimax'], num=output['lr'])
-    output['psi_1d'] = psi_1d
-    output['rhop_1d']  = np.sqrt(psi_1d/output['psimax'])
-
-    flags = output['psirz'] < output['psimax']
-    output['fpolrz'] = np.zeros_like(output['psirz'])
-    intrp = interp1d(psi_1d, output['fpol'], kind='cubic',
-                                bounds_error=False, fill_value='extrapolate')
-    output['fpolrz'][flags] = intrp(output['psirz'][flags])
-    flags = np.logical_not(flags)
-    output['fpolrz'][flags] = output['fpol'][-1]
-
-    output['prsrz'] = interp1d(psi_1d, output['prs'], kind='linear',
-                                bounds_error=False, fill_value=0.0)
-    output['prsrz'] = output['prsrz'](output['psirz'])
-    output['cocos'] = 1
-
-    return output
 
 def read_eqdsk(
     filename: str,
-    cocos: int = 1,
-    phiclockwise: bool = True
+    cocos_in: Optional[int] = None,
+    cocos_internal: int = 1,
+    phiclockwise_in: Optional[bool] = None,
+    flux_normalization: Optional[FluxNormalization] = None,
 ) -> Dict[str, Any]:
     """
     Read an EQDSK file using the freeqdsk library.
 
-    This function reads g-EQDSK files and automatically handles COCOS
-    detection and conversion.
+    This function reads a g-EQDSK file, resolves its input convention exactly
+    once, and converts it exactly once to the requested internal convention.
 
     Parameters
     ----------
     filename : str
         Path to the EQDSK file
-    cocos : int, optional
-        Target COCOS convention. Default is 1
-    phiclockwise : bool, optional
-        Whether toroidal angle increases clockwise. Default is True
+    cocos_in : int, optional
+        Explicit COCOS convention of the input file. When supplied, detection
+        is skipped and orientation/normalization are derived from this value.
+    cocos_internal : int, optional
+        COCOS convention used by the returned arrays. Default is 1.
+    phiclockwise_in : bool, optional
+        Input toroidal-angle orientation, required for detection when
+        ``cocos_in`` is omitted.
+    flux_normalization : {"Wb", "Wb/rad"}, optional
+        Input poloidal-flux normalization, required for detection when
+        ``cocos_in`` is omitted.
 
     Returns
     -------
@@ -244,31 +164,25 @@ def read_eqdsk(
 
     Examples
     --------
-    >>> data = read_eqdsk('equilibrium.geqdsk', cocos=1)
+    >>> data = read_eqdsk('equilibrium.geqdsk', cocos_in=1, cocos_internal=1)
     """
     with open(filename, 'r') as f:
         d = freeqdsk.geqdsk.read(f)
 
-    # We check which is the input COCOS.
-    cocos_in = assign_cocos(d['qpsi'][0], d['cpasma'], d['bcentr'],
-                            d['simagx'], d['sibdry'], phiclockwise=phiclockwise)
+    convention = _resolve_loader_input_convention(
+        d,
+        cocos_in=cocos_in,
+        cocos_internal=cocos_internal,
+        phiclockwise_in=phiclockwise_in,
+        flux_normalization=flux_normalization,
+    )
+    cocos_input = convention['cocos_input']
 
-    if cocos_in != cocos:
-        logger.warning(f'The input COCOS is {cocos_in}. Transforming to COCOS: {cocos}')
-
-    # Transforming the equilibrium to the output COCOS.
-    d = fromCocosNtoCocosM(d, cocos)
-
-    # After the COCOS transform the toroidal-angle orientation is determined by
-    # the TARGET cocos number, not by the user-supplied input hint. Even-numbered
-    # COCOS conventions (2/4/6/8 and 12/14/16/18) put phi clockwise viewed from
-    # above; odd-numbered conventions put phi counterclockwise. We compute the
-    # post-transform hint from this rule so the verification call uses a
-    # convention-consistent default.
-    phiclockwise_out = (cocos % 10) % 2 == 0
-    cocos_out = assign_cocos(d['qpsi'][0], d['cpasma'], d['bcentr'],
-                             d['simagx'], d['sibdry'],
-                             phiclockwise=phiclockwise_out)
+    d = fromCocosNtoCocosM(
+        d,
+        cocos_m=cocos_internal,
+        cocos_n=cocos_input,
+    )
 
     # We need now to transform the generated dictionary and 
     # transform it to the standard that is used in this library.
@@ -314,9 +228,7 @@ def read_eqdsk(
     output['prsrz'] = interp1d(psi_1d, output['prs'], kind='linear',
                                 bounds_error=False, fill_value=0.0)
     output['prsrz'] = output['prsrz'](output['psirz'])
-    output['cocos'] = cocos
-    output['cocos_in'] = cocos_in
-    output['cocos_out'] = cocos_out
+    output.update(convention)
 
     return output
 
@@ -334,7 +246,7 @@ def eqdsk2magnetic(eqdata: Dict[str, Any]) -> Dict[str, np.ndarray]:
         - 'psi': Poloidal flux (2D array)
         - 'fpolrz': F(psi) function on R-z grid
         - 'Rgrid', 'zgrid': Grid coordinates
-        - 'cocos': COCOS convention
+        - 'cocos_internal': COCOS convention of the supplied arrays
 
     Returns
     -------
@@ -360,8 +272,13 @@ def eqdsk2magnetic(eqdata: Dict[str, Any]) -> Dict[str, np.ndarray]:
     if 'zgrid' not in eqdata:
         raise Exception('The grids must be in the input data')
 
-    if 'fpol' not in eqdata:
-        raise Exception('The fpol must be within the input data.')
+    if 'fpolrz' not in eqdata:
+        raise Exception('The fpolrz must be within the input data.')
+
+    if 'cocos_internal' not in eqdata:
+        raise Exception('The internal COCOS convention must be within the input data.')
+    cocos_id = eqdata['cocos_internal']
+    cocos_info = get_cocos(cocos_id)
 
 
     output = dict()
@@ -375,20 +292,17 @@ def eqdsk2magnetic(eqdata: Dict[str, Any]) -> Dict[str, np.ndarray]:
     d_dr = FinDiff(0, dr, 1, acc=4)
     d_dz = FinDiff(1, dz, 1, acc=4)
 
-    # Correcting the poloidal field sign.
-    if eqdata['cocos'] in (1, 11, 2, 12, 5, 15, 6, 16):
-        sign_bpol = +1
-    else:
-        sign_bpol = -1
+    # COCOS 11-18 store the full poloidal flux in Wb, whereas COCOS 1-8
+    # store Phi_pol/(2*pi). Convert the derivative normalization while applying
+    # the COCOS poloidal-field and toroidal-coordinate orientation signs.
+    bpol_prefactor = (
+        cocos_info.sigma_Bp
+        * cocos_info.sigma_RpZ
+        / (2.0 * np.pi) ** cocos_info.exp_Bp
+    )
 
-    # Correcting whether we have or not a direct triedron.
-    if eqdata['cocos'] in (1, 11, 3, 13, 5, 15, 7, 17):
-        sign_bpol *= 1.0
-    else:
-        sign_bpol *= -1.0
-
-    output['br'] = + d_dz(eqdata['psi'])/Rmesh.T * sign_bpol
-    output['bz'] = - d_dr(eqdata['psi'])/Rmesh.T * sign_bpol
+    output['br'] = + d_dz(eqdata['psi'])/Rmesh.T * bpol_prefactor
+    output['bz'] = - d_dr(eqdata['psi'])/Rmesh.T * bpol_prefactor
 
     output['btht'] = np.sqrt(output['br']**2.0 + output['bz']**2.0)
     # Now we provide the sign to the poloidal magnetic field.
@@ -412,17 +326,21 @@ class eqdsk(equilibrium):
     EQDSK file handler class.
 
     This class extends the equilibrium class to load equilibrium data
-    from g-EQDSK files with automatic COCOS detection and conversion.
+    from g-EQDSK files with explicit or one-time COCOS detection and a single
+    conversion to the requested internal convention.
 
     Parameters
     ----------
     fn : str
         Filename of the EQDSK file
-    cocos : int, optional
-        Target COCOS convention (default: 1). The file's COCOS will be
-        auto-detected and converted if necessary
-    phiclockwise : bool, optional
-        Whether toroidal angle increases clockwise. Default is True
+    cocos_in : int, optional
+        Explicit input COCOS convention.
+    cocos_internal : int, optional
+        COCOS convention used by the stored arrays. Default is 1.
+    phiclockwise_in : bool, optional
+        Input toroidal-angle orientation used only for detection.
+    flux_normalization : {"Wb", "Wb/rad"}, optional
+        Input poloidal-flux normalization used only for detection.
 
     Attributes
     ----------
@@ -434,15 +352,17 @@ class eqdsk(equilibrium):
     Examples
     --------
     >>> from pycocos import EQDSK
-    >>> eq = EQDSK('equilibrium.geqdsk')
+    >>> eq = EQDSK('equilibrium.geqdsk', cocos_in=1, cocos_internal=1)
     >>> print(eq.gs_profs.q)  # Access q-profile
     """
 
     def __init__(
         self,
         fn: str,
-        cocos: int = 1,
-        phiclockwise: bool = True
+        cocos_in: Optional[int] = None,
+        cocos_internal: int = 1,
+        phiclockwise_in: Optional[bool] = None,
+        flux_normalization: Optional[FluxNormalization] = None,
     ) -> None:
         """
         Create an Equilibrium object starting from an EQDSK file.
@@ -451,10 +371,14 @@ class eqdsk(equilibrium):
         ----------
         fn : str
             Filename of the EQDSK file
-        cocos : int, optional
-            Target COCOS convention. Default is 1
-        phiclockwise : bool, optional
-            Whether toroidal angle increases clockwise. Default is True
+        cocos_in : int, optional
+            Explicit COCOS convention of the input file.
+        cocos_internal : int, optional
+            COCOS convention used by the stored arrays. Default is 1.
+        phiclockwise_in : bool, optional
+            Input toroidal-angle orientation used for detection.
+        flux_normalization : {"Wb", "Wb/rad"}, optional
+            Input poloidal-flux normalization used for detection.
 
         Raises
         ------
@@ -466,30 +390,31 @@ class eqdsk(equilibrium):
         
         self.filename = fn
 
-        # Launching a Deprecation Warning.
-        if cocos != 1:
-            logger.warning('The COCOS input is deprecated. ' +
-                           'The code detects the original COCOS and ' +
-                           'transforms it to the standard COCOS: 1')
-
-        # Reading the EQDSK.
-        self._gdata = read_eqdsk(filename=fn, cocos=1, phiclockwise=phiclockwise)
-        self._bfield = eqdsk2magnetic(self._gdata)
-        
-        # Store COCOS information (detect from raw data before conversion)
-        # Read raw file again to get original COCOS
-        with open(fn, 'r') as f:
-            d_raw = freeqdsk.geqdsk.read(f)
-        
-        self._cocos_detected = assign_cocos(
-            d_raw.get('qpsi', [0])[0] if len(d_raw.get('qpsi', [])) > 0 else 0,
-            d_raw.get('cpasma', 0),
-            d_raw.get('bcentr', 0),
-            d_raw.get('simagx', 0),
-            d_raw.get('sibdry', 0),
-            phiclockwise=phiclockwise
+        self._gdata = read_eqdsk(
+            filename=fn,
+            cocos_in=cocos_in,
+            cocos_internal=cocos_internal,
+            phiclockwise_in=phiclockwise_in,
+            flux_normalization=flux_normalization,
         )
-        self._cocos_target = cocos
+        self._bfield = eqdsk2magnetic(self._gdata)
+
+        self._cocos_input = self._gdata['cocos_input']
+        self._cocos_internal = self._gdata['cocos_internal']
+        self._phiclockwise_input = self._gdata['phiclockwise_input']
+        self._phiclockwise_internal = self._gdata['phiclockwise_internal']
+        self._flux_normalization_input = self._gdata['flux_normalization_input']
+        self._flux_normalization_internal = self._gdata['flux_normalization_internal']
+
+        boundary_R = self._gdata.get('r_bdy')
+        boundary_z = self._gdata.get('z_bdy')
+        if boundary_R is not None and boundary_z is not None:
+            if (
+                np.asarray(boundary_R).size == 0
+                and np.asarray(boundary_z).size == 0
+            ):
+                boundary_R = None
+                boundary_z = None
 
         # Using the parent class to perform the hard initializing.
         super().__init__(self._gdata['Rgrid'],   self._gdata['zgrid'],
@@ -497,7 +422,10 @@ class eqdsk(equilibrium):
                          self._bfield['bphi'],   self._gdata['psi'],
                          self._gdata['Raxis'],   self._gdata['zaxis'],
                          self._gdata['psi_bdy'], self._gdata['psi_ax'],
-                         phiclockwise=phiclockwise)
+                         phiclockwise=self._phiclockwise_internal,
+                         flux_normalization=self._flux_normalization_internal,
+                         R_boundary=boundary_R,
+                         z_boundary=boundary_z)
 
         # Populate profiles in the structured data
         self._populate_profiles()
@@ -534,8 +462,15 @@ class eqdsk(equilibrium):
     def _populate_profiles(self) -> None:
         """Populate the profiles dataset from EQDSK data."""
         tmp = np.linspace(0.0, self._gdata['psimax'], num=self._gdata['lr'])
+        flux_units = self._flux_normalization_internal
+        if flux_units == "Wb/rad":
+            ffprime_units = "T^2*m^4*rad/Wb"
+            pprime_units = "Pa*rad/Wb"
+        else:
+            ffprime_units = "T^2*m^4/Wb"
+            pprime_units = "Pa/Wb"
         _psi1d = xr.DataArray(tmp, dims=('rhop',),
-                             attrs={'name': 'psi', 'units': 'Wb',
+                             attrs={'name': 'psi', 'units': flux_units,
                                     'desc': 'Magnetic flux',
                                     'short_name': '$\\Psi$'})
         _rho1d = xr.DataArray(np.sqrt(tmp/self._gdata['psimax']),
@@ -568,7 +503,7 @@ class eqdsk(equilibrium):
                                                     dims=('rhop',),
                                                     coords={'rhop': _rho1d},
                                                     attrs={'name': 'ffprime',
-                                                           'units': 'T^2*m^4/Wb',
+                                                           'units': ffprime_units,
                                                            'desc': 'd(F*F)/dPsi',
                                                            'short_name': '$FF\'$'})
         
@@ -577,7 +512,7 @@ class eqdsk(equilibrium):
                                                     dims=('rhop',),
                                                     coords={'rhop': _rho1d},
                                                     attrs={'name': 'pprime',
-                                                           'units': 'Pa/Wb',
+                                                           'units': pprime_units,
                                                            'desc': 'dp/dPsi',
                                                            'short_name': '$p\'$'})
         
@@ -595,16 +530,34 @@ class eqdsk(equilibrium):
         self._profiles['rho'] = _rho1d
     
     @property
-    def cocos(self) -> int:
-        """
-        Detected COCOS convention of the loaded file.
-        
-        Returns
-        -------
-        int
-            COCOS ID number (1-18)
-        """
-        return self._cocos_detected
+    def cocos_input(self) -> int:
+        """COCOS convention of the source EQDSK file."""
+        return self._cocos_input
+
+    @property
+    def cocos_internal(self) -> int:
+        """COCOS convention of the arrays stored by this object."""
+        return self._cocos_internal
+
+    @property
+    def phiclockwise_input(self) -> bool:
+        """Toroidal-angle orientation of the source EQDSK."""
+        return self._phiclockwise_input
+
+    @property
+    def phiclockwise_internal(self) -> bool:
+        """Toroidal-angle orientation of the stored arrays."""
+        return self._phiclockwise_internal
+
+    @property
+    def flux_normalization_input(self) -> FluxNormalization:
+        """Poloidal-flux normalization of the source EQDSK file."""
+        return self._flux_normalization_input
+
+    @property
+    def flux_normalization_internal(self) -> FluxNormalization:
+        """Poloidal-flux normalization of the stored arrays."""
+        return self._flux_normalization_internal
     
     @property
     def cocos_info(self) -> Dict[str, Any]:
@@ -614,84 +567,137 @@ class eqdsk(equilibrium):
         Returns
         -------
         dict
-            Dictionary containing COCOS information:
-            - 'detected': Detected COCOS ID
-            - 'target': Target COCOS ID (after conversion)
-            - 'cocos_obj': COCOS object with full metadata
+            Explicit input and internal COCOS descriptors and sign metadata.
         """
-        cocos_obj = get_cocos(self._cocos_detected)
+        cocos_input_obj = get_cocos(self._cocos_input)
+        cocos_internal_obj = get_cocos(self._cocos_internal)
         return {
-            'detected': self._cocos_detected,
-            'target': self._cocos_target,
-            'cocos_obj': cocos_obj,
-            'exp_Bp': cocos_obj.exp_Bp,
-            'sigma_Bp': cocos_obj.sigma_Bp,
-            'sigma_RpZ': cocos_obj.sigma_RpZ,
-            'sigma_rhotp': cocos_obj.sigma_rhotp,
-            'sign_q_pos': cocos_obj.sign_q_pos,
-            'sign_pprime_pos': cocos_obj.sign_pprime_pos,
+            'cocos_input': self._cocos_input,
+            'cocos_internal': self._cocos_internal,
+            'phiclockwise_input': self._phiclockwise_input,
+            'phiclockwise_internal': self._phiclockwise_internal,
+            'flux_normalization_input': self._flux_normalization_input,
+            'flux_normalization_internal': self._flux_normalization_internal,
+            'cocos_input_obj': cocos_input_obj,
+            'cocos_internal_obj': cocos_internal_obj,
+            'exp_Bp_input': cocos_input_obj.exp_Bp,
+            'sigma_Bp_input': cocos_input_obj.sigma_Bp,
+            'sigma_RpZ_input': cocos_input_obj.sigma_RpZ,
+            'sigma_rhotp_input': cocos_input_obj.sigma_rhotp,
+            'sign_q_pos_input': cocos_input_obj.sign_q_pos,
+            'sign_pprime_pos_input': cocos_input_obj.sign_pprime_pos,
+            'exp_Bp_internal': cocos_internal_obj.exp_Bp,
+            'sigma_Bp_internal': cocos_internal_obj.sigma_Bp,
+            'sigma_RpZ_internal': cocos_internal_obj.sigma_RpZ,
+            'sigma_rhotp_internal': cocos_internal_obj.sigma_rhotp,
+            'sign_q_pos_internal': cocos_internal_obj.sign_q_pos,
+            'sign_pprime_pos_internal': cocos_internal_obj.sign_pprime_pos,
         }
     
-    def save(self, filename: str, cocos: Optional[int] = None) -> None:
-        """
-        Save equilibrium to g-EQDSK file.
+    def _internal_geqdsk_data(self) -> Dict[str, Any]:
+        """Return an independent FreeQDSK-schema snapshot of stored data."""
+        rgrid = np.asarray(self._gdata['Rgrid'])
+        zgrid = np.asarray(self._gdata['zgrid'])
+        output = {
+            'nx': int(self._gdata['lr']),
+            'ny': int(self._gdata['lz']),
+            'rdim': float(rgrid[-1] - rgrid[0]),
+            'zdim': float(zgrid[-1] - zgrid[0]),
+            'rcentr': float(self._gdata['rcentr']),
+            'rleft': float(rgrid[0]),
+            'zmid': float(0.5 * (zgrid[0] + zgrid[-1])),
+            'rmagx': float(self._gdata['Raxis']),
+            'zmagx': float(self._gdata['zaxis']),
+            'simagx': float(self._gdata['psi_ax']),
+            'sibdry': float(self._gdata['psi_bdy']),
+            'bcentr': float(self._gdata['Bcenter']),
+            'cpasma': float(self._gdata['Ip']),
+            'fpol': np.array(self._gdata['fpol'], copy=True),
+            'pres': np.array(self._gdata['prs'], copy=True),
+            'psi': np.array(self._gdata['psi'], copy=True),
+            'qpsi': np.array(self._gdata['q'], copy=True),
+        }
+
+        for output_name, internal_name in (
+            ('ffprime', 'ffp'),
+            ('pprime', 'pprime'),
+            ('rbdry', 'r_bdy'),
+            ('zbdry', 'z_bdy'),
+            ('rlim', 'rlim'),
+            ('zlim', 'zlim'),
+        ):
+            if internal_name in self._gdata:
+                output[output_name] = np.array(
+                    self._gdata[internal_name],
+                    copy=True,
+                )
+        return output
+
+    def to_geqdsk(
+        self,
+        cocos_out: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Return a non-mutating g-EQDSK view in the requested COCOS.
 
         Parameters
         ----------
-        filename : str
-            Output filename
-        cocos : int, optional
-            COCOS convention to use. If None, uses current convention.
-            Default is None
-
-        Examples
-        --------
-        >>> eq.save('output.geqdsk')
-        >>> eq.save('output.geqdsk', cocos=3)
-        """
-        return self.to_geqdsk(filename, cocos=cocos)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Convert equilibrium to dictionary format.
+        cocos_out : int, optional
+            Output convention. The stored ``cocos_internal`` is used when
+            omitted.
 
         Returns
         -------
         dict
-            Dictionary containing equilibrium data suitable for
-            writing to EQDSK or other formats
+            Independent FreeQDSK-compatible data in ``cocos_out``.
         """
-        output = {}
-        
-        # Grid information
-        output['Rgrid'] = self.Rgrid.values
-        output['zgrid'] = self.zgrid.values
-        output['Raxis'] = self.R_axis
-        output['zaxis'] = self.z_axis
-        
-        # Flux surfaces
-        output['psi'] = self.psi.values
-        output['psi_ax'] = self.geometry.attrs.get('psi_ax')
-        output['psi_bdy'] = self.geometry.attrs.get('psi_bdy')
-        output['psimax'] = self.geometry.attrs.get('psimax')
-        
-        # Magnetic field
-        output['br'] = self.Br.values
-        output['bz'] = self.Bz.values
-        output['bphi'] = self.Bphi.values
-        
-        # Profiles if available
-        if len(self._profiles) > 0:
-            for var_name in self._profiles.data_vars:
-                output[var_name] = self._profiles[var_name].values
-        
-        # COCOS info
-        output['cocos'] = self._cocos_detected
-        
-        return output
+        if cocos_out is None:
+            cocos_out = self._cocos_internal
+        else:
+            cocos_out = get_cocos(cocos_out).cocos
+
+        return fromCocosNtoCocosM(
+            self._internal_geqdsk_data(),
+            cocos_m=cocos_out,
+            cocos_n=self._cocos_internal,
+        )
+
+    def save(
+        self,
+        filename: str,
+        cocos_out: Optional[int] = None,
+    ) -> None:
+        """Write a g-EQDSK file in the requested COCOS.
+
+        Parameters
+        ----------
+        filename : str
+            Output filename. Existing files are never overwritten.
+        cocos_out : int, optional
+            Output convention. The stored ``cocos_internal`` is used when
+            omitted.
+
+        Examples
+        --------
+        >>> eq.save('output.geqdsk')
+        >>> eq.save('output.geqdsk', cocos_out=3)
+        """
+        output = self.to_geqdsk(cocos_out=cocos_out)
+        with open(filename, 'x') as stream:
+            freeqdsk.geqdsk.write(output, stream)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return an independent snapshot in the internal pyCOCOS schema."""
+        return copy.deepcopy(self._gdata)
     
     @classmethod
-    def load(cls, filename: str, cocos: int = 1, phiclockwise: bool = True):
+    def load(
+        cls,
+        filename: str,
+        cocos_in: Optional[int] = None,
+        cocos_internal: int = 1,
+        phiclockwise_in: Optional[bool] = None,
+        flux_normalization: Optional[FluxNormalization] = None,
+    ):
         """
         Load equilibrium from g-EQDSK file (factory method).
 
@@ -699,10 +705,14 @@ class eqdsk(equilibrium):
         ----------
         filename : str
             Path to g-EQDSK file
-        cocos : int, optional
-            Target COCOS convention. Default is 1
-        phiclockwise : bool, optional
-            Whether toroidal angle increases clockwise. Default is True
+        cocos_in : int, optional
+            Explicit input COCOS convention.
+        cocos_internal : int, optional
+            COCOS convention used by the stored arrays. Default is 1.
+        phiclockwise_in : bool, optional
+            Input toroidal-angle orientation used for detection.
+        flux_normalization : {"Wb", "Wb/rad"}, optional
+            Input poloidal-flux normalization used for detection.
 
         Returns
         -------
@@ -711,6 +721,12 @@ class eqdsk(equilibrium):
 
         Examples
         --------
-        >>> eq = EQDSK.load('equilibrium.geqdsk')
+        >>> eq = EQDSK.load('equilibrium.geqdsk', cocos_in=1, cocos_internal=1)
         """
-        return cls(filename, cocos=cocos, phiclockwise=phiclockwise)
+        return cls(
+            filename,
+            cocos_in=cocos_in,
+            cocos_internal=cocos_internal,
+            phiclockwise_in=phiclockwise_in,
+            flux_normalization=flux_normalization,
+        )

@@ -59,6 +59,24 @@ def test_numba_jacobian_kernels_match_python_reference():
     assert kernels.compute_theta_span.signatures
 
 
+def test_theta_span_uses_centered_periodic_segment_quadrature():
+    theta = np.linspace(0.0, 2.0 * np.pi, 17, endpoint=False)
+    R = 1.8 + 0.3 * np.cos(theta)
+    Bpol = 0.7 + 0.11 * np.sin(theta)
+    grad = kernels.compute_grad_psi_abs(R, Bpol)
+    jacobian = 0.9 + 0.2 * np.cos(2.0 * theta)
+    dlp = (2.0 * np.pi / theta.size) * (
+        1.0 + 0.15 * np.sin(theta + 0.2)
+    )
+
+    integrand = R / (np.abs(jacobian) * grad)
+    expected = np.sum(
+        0.5 * (integrand + np.roll(integrand, -1)) * dlp
+    )
+    actual = kernels.compute_theta_span(R, jacobian, grad, dlp)
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-15, atol=2.0e-15)
+
+
 def test_numba_hot_path_regression_guard():
     """
     Coarse regression guard: repeated kernel calls should not become dramatically
@@ -80,4 +98,3 @@ def test_numba_hot_path_regression_guard():
     t2 = perf_counter() - t0
 
     assert t2 <= 2.0 * t1
-
