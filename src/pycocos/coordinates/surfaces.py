@@ -81,6 +81,25 @@ def _fourier_filter(values: np.ndarray, max_mode: int) -> np.ndarray:
     return np.fft.irfft(coefficients, n=values.size)
 
 
+def _pair_contour_about_midplane(
+    R: np.ndarray,
+    z: np.ndarray,
+    *,
+    reflection_z: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Project periodic contour samples onto exact up-down parity."""
+    radial = np.asarray(R, dtype=np.float64)
+    vertical_offset = np.asarray(z, dtype=np.float64) - float(reflection_z)
+    reflection = np.concatenate(
+        ([0], np.arange(radial.size - 1, 0, -1))
+    )
+    paired_R = 0.5 * (radial + radial[reflection])
+    paired_z_offset = 0.5 * (
+        vertical_offset - vertical_offset[reflection]
+    )
+    return paired_R, paired_z_offset + float(reflection_z)
+
+
 def canonicalize_contour_samples(
     R: np.ndarray,
     z: np.ndarray,
@@ -287,8 +306,16 @@ def build_flux_constrained_surfaces(
     projection_tolerance: float = 1.0e-10,
     validate_nesting: bool = True,
     gauge_z: float | None = None,
+    reflection_z: float | None = None,
 ) -> FluxSurfaceSet:
-    """Filter, project, and validate axis-to-boundary ordered surfaces."""
+    """Filter, project, and validate axis-to-boundary ordered surfaces.
+
+    When ``reflection_z`` is supplied, flux values and gradients are evaluated
+    as reflection pairs and every construction step ends in the corresponding
+    geometric parity sector.  This keeps the final contour both exactly
+    up-down paired and on its physical flux label; averaging two independently
+    projected contours after construction does not preserve that label.
+    """
     R_axis = np.asarray(Rgrid, dtype=np.float64)
     z_axis = np.asarray(zgrid, dtype=np.float64)
     psi_values = np.asarray(psi_field, dtype=np.float64)
@@ -313,14 +340,71 @@ def build_flux_constrained_surfaces(
         s=0.0,
     )
 
+    if reflection_z is not None:
+        reflection_z = float(reflection_z)
+        if not np.isfinite(reflection_z):
+            raise ValueError("reflection_z must be finite.")
+
     def psi_value(R: np.ndarray, z: np.ndarray) -> np.ndarray:
-        return spline.ev(R, z)
+        values = spline.ev(R, z)
+        if reflection_z is None:
+            return values
+        reflected_z = 2.0 * reflection_z - np.asarray(z, dtype=np.float64)
+        return 0.5 * (values + spline.ev(R, reflected_z))
 
     def psi_gradient(
         R: np.ndarray,
         z: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        return spline.ev(R, z, dx=1), spline.ev(R, z, dy=1)
+        dpsi_dR = spline.ev(R, z, dx=1)
+        dpsi_dz = spline.ev(R, z, dy=1)
+        if reflection_z is None:
+            return dpsi_dR, dpsi_dz
+        reflected_z = 2.0 * reflection_z - np.asarray(z, dtype=np.float64)
+        return (
+            0.5 * (dpsi_dR + spline.ev(R, reflected_z, dx=1)),
+            0.5 * (dpsi_dz - spline.ev(R, reflected_z, dy=1)),
+        )
+
+    def project_surface(
+        radial: np.ndarray,
+        vertical: np.ndarray,
+        *,
+        target: float,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        if reflection_z is not None:
+            radial, vertical = _pair_contour_about_midplane(
+                radial,
+                vertical,
+                reflection_z=reflection_z,
+            )
+        radial, vertical, residual = project_contour_to_flux(
+            R=radial,
+            z=vertical,
+            target_psi=target,
+            psi_value=psi_value,
+            psi_gradient=psi_gradient,
+            flux_scale=flux_scale,
+            tolerance=projection_tolerance,
+        )
+        if reflection_z is not None:
+            radial, vertical = _pair_contour_about_midplane(
+                radial,
+                vertical,
+                reflection_z=reflection_z,
+            )
+            residual = float(
+                np.max(np.abs(psi_value(radial, vertical) - target))
+                / max(abs(float(flux_scale)), np.finfo(np.float64).tiny)
+            )
+            if residual > projection_tolerance:
+                raise ValueError(
+                    "Reflection-paired flux-surface projection did not "
+                    "converge: "
+                    f"normalized residual={residual:.3e}, "
+                    f"tolerance={projection_tolerance:.3e}."
+                )
+        return radial, vertical, residual
 
     surfaces_R = np.empty((radial_flux.size, ntheta), dtype=np.float64)
     surfaces_z = np.empty_like(surfaces_R)
@@ -339,37 +423,25 @@ def build_flux_constrained_surfaces(
         for _ in range(2):
             radial = _fourier_filter(radial, spectral_max_mode)
             vertical = _fourier_filter(vertical, spectral_max_mode)
-            radial, vertical, _ = project_contour_to_flux(
-                R=radial,
-                z=vertical,
-                target_psi=float(target),
-                psi_value=psi_value,
-                psi_gradient=psi_gradient,
-                flux_scale=flux_scale,
-                tolerance=projection_tolerance,
+            radial, vertical, _ = project_surface(
+                radial,
+                vertical,
+                target=float(target),
             )
-        radial, vertical, residual = project_contour_to_flux(
-            R=radial,
-            z=vertical,
-            target_psi=float(target),
-            psi_value=psi_value,
-            psi_gradient=psi_gradient,
-            flux_scale=flux_scale,
-            tolerance=projection_tolerance,
+        radial, vertical, residual = project_surface(
+            radial,
+            vertical,
+            target=float(target),
         )
         radial, vertical = canonicalize_contour_origin(
             radial,
             vertical,
             gauge_z=gauge_z,
         )
-        radial, vertical, residual = project_contour_to_flux(
-            R=radial,
-            z=vertical,
-            target_psi=float(target),
-            psi_value=psi_value,
-            psi_gradient=psi_gradient,
-            flux_scale=flux_scale,
-            tolerance=projection_tolerance,
+        radial, vertical, residual = project_surface(
+            radial,
+            vertical,
+            target=float(target),
         )
         area = _signed_polygon_area(radial, vertical)
         scale = max(float(np.ptp(radial)), float(np.ptp(vertical)), 1.0)

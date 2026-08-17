@@ -580,10 +580,19 @@ class magnetic_coordinates:
             gzz = z
 
         # Interpolating the psi coordinate.
-        intrp = RectBivariateSpline(self.coords.R.values,
-                                    self.coords.z.values,
-                                    self.coords.psi.values, 
-                                    kx=1, ky=1)
+        interpolation_order_R = int(
+            self.coords.psi.attrs.get('interpolation_order_R', 1)
+        )
+        interpolation_order_z = int(
+            self.coords.psi.attrs.get('interpolation_order_z', 1)
+        )
+        intrp = RectBivariateSpline(
+            self.coords.R.values,
+            self.coords.z.values,
+            self.coords.psi.values,
+            kx=min(interpolation_order_R, self.coords.R.size - 1),
+            ky=min(interpolation_order_z, self.coords.z.size - 1),
+        )
         name = 'psi'
         tmp = xr.DataArray(intrp(R, z, grid=grid))
         if grid:

@@ -406,6 +406,16 @@ class eqdsk(equilibrium):
         self._flux_normalization_input = self._gdata['flux_normalization_input']
         self._flux_normalization_internal = self._gdata['flux_normalization_internal']
 
+        boundary_R = self._gdata.get('r_bdy')
+        boundary_z = self._gdata.get('z_bdy')
+        if boundary_R is not None and boundary_z is not None:
+            if (
+                np.asarray(boundary_R).size == 0
+                and np.asarray(boundary_z).size == 0
+            ):
+                boundary_R = None
+                boundary_z = None
+
         # Using the parent class to perform the hard initializing.
         super().__init__(self._gdata['Rgrid'],   self._gdata['zgrid'],
                          self._bfield['br'],     self._bfield['bz'],
@@ -413,7 +423,9 @@ class eqdsk(equilibrium):
                          self._gdata['Raxis'],   self._gdata['zaxis'],
                          self._gdata['psi_bdy'], self._gdata['psi_ax'],
                          phiclockwise=self._phiclockwise_internal,
-                         flux_normalization=self._flux_normalization_internal)
+                         flux_normalization=self._flux_normalization_internal,
+                         R_boundary=boundary_R,
+                         z_boundary=boundary_z)
 
         # Populate profiles in the structured data
         self._populate_profiles()

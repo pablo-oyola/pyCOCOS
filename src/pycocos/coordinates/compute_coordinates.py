@@ -36,6 +36,9 @@ from .surfaces import (
 _TWO_PI = 2.0 * np.pi
 _DEFAULT_SPECTRAL_MAX_FOURIER_MODE = 16
 _THETA_GEOM_POINTS = 7200
+_DEFAULT_TRACE_STEP = 1.0e-3
+_MAX_TRACE_REFINEMENTS = 8
+_ANGLE_CLOSURE_RTOL = 1.0e-5
 
 
 def _centered_segment_integrals(
@@ -50,6 +53,27 @@ def _centered_segment_integrals(
             "periodic segment quadrature requires matching one-dimensional arrays"
         )
     return 0.5 * (vertex_values + np.roll(vertex_values, -1)) * lengths
+
+
+def _normalize_magnetic_angle_closure(theta_closed: np.ndarray) -> np.ndarray:
+    """Remove small quadrature drift while rejecting a non-closing angle."""
+    values = np.asarray(theta_closed, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError("closed magnetic angle must be a finite vector.")
+    theta_span = float(values[-1])
+    if not np.isclose(
+        theta_span,
+        _TWO_PI,
+        rtol=_ANGLE_CLOSURE_RTOL,
+        atol=2.0e-10,
+    ):
+        raise ValueError(
+            "Jacobian does not close the poloidal angle at 2*pi: "
+            f"span={theta_span:.16g}."
+        )
+    normalized = values * (_TWO_PI / theta_span)
+    normalized[-1] = _TWO_PI
+    return normalized
 
 
 def _up_down_surface_projection(
@@ -259,28 +283,40 @@ def _trace_flux_surfaces(
     zaxis: float,
     ntheta: int,
     integration_sign: float,
+    minimum_points: int = 8,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Trace and arclength-resample full closed poloidal field lines."""
+    minimum_points = int(minimum_points)
+    if minimum_points < 8:
+        raise ValueError("minimum_points must be at least eight.")
     npsi = len(R_at_psi)
     outputs = [
         np.empty((npsi, ntheta), dtype=np.float64)
         for _ in range(5)
     ]
     for index, seed_R in enumerate(R_at_psi):
-        traced = integrate_pol_field_line(
-            Rgrid,
-            zgrid,
-            br,
-            bz,
-            bphi,
-            float(seed_R),
-            float(zaxis),
-            integration_sign=float(integration_sign),
-        )
-        Rline, zline, brline, bzline, bphiline, count = traced
-        if count < 8:
+        trace_step = _DEFAULT_TRACE_STEP
+        for refinement in range(_MAX_TRACE_REFINEMENTS + 1):
+            traced = integrate_pol_field_line(
+                Rgrid,
+                zgrid,
+                br,
+                bz,
+                bphi,
+                float(seed_R),
+                float(zaxis),
+                tol=trace_step,
+                integration_sign=float(integration_sign),
+            )
+            Rline, zline, brline, bzline, bphiline, count = traced
+            if count >= minimum_points:
+                break
+            trace_step *= 0.5
+        else:
             raise ValueError(
-                f"Flux-surface tracing returned only {count} points at index {index}."
+                "Flux-surface tracing remained under-resolved at index "
+                f"{index}: {count} points after {_MAX_TRACE_REFINEMENTS} "
+                f"refinements; required at least {minimum_points}."
             )
         Rline = np.asarray(Rline[:count], dtype=np.float64)
         zline = np.asarray(zline[:count], dtype=np.float64)
@@ -488,15 +524,8 @@ def _compute_surface_coordinate_row(
     if np.any(theta_increment <= 0.0):
         raise ValueError("Magnetic angle is not monotonic around the surface.")
     theta_closed = np.concatenate(([0.0], np.cumsum(theta_increment)))
-    theta_span = float(theta_closed[-1])
-    if not np.isclose(theta_span, _TWO_PI, rtol=2.0e-8, atol=2.0e-10):
-        raise ValueError(
-            "Jacobian does not close the poloidal angle at 2*pi: "
-            f"span={theta_span:.16g}."
-        )
     # Remove only accumulated floating-point closure error.
-    theta_closed *= _TWO_PI / theta_span
-    theta_closed[-1] = _TWO_PI
+    theta_closed = _normalize_magnetic_angle_closure(theta_closed)
 
     toroidal_primitive = np.concatenate(
         (
@@ -706,6 +735,7 @@ def compute_magnetic_coordinates(
             "outboard flux-surface seed."
         )
 
+    minimum_trace_points = max(64, 2 * spectral_max_mode + 4)
     raw = _trace_flux_surfaces(
         Rgrid=radial_grid,
         zgrid=vertical_grid,
@@ -716,6 +746,7 @@ def compute_magnetic_coordinates(
         zaxis=zaxis,
         ntheta=n_theta_geom,
         integration_sign=integration_sign,
+        minimum_points=minimum_trace_points,
     )
     raw_R, raw_z, raw_Br, raw_Bz, raw_Bphi = raw
 
@@ -849,6 +880,7 @@ def compute_magnetic_coordinates(
             zaxis=zaxis,
             ntheta=n_theta_geom,
             integration_sign=projected_integration_sign,
+            minimum_points=minimum_trace_points,
         )
         projected_raw_R, projected_raw_z, *_ = projected_raw
         if working_psi_field is not None:
@@ -864,6 +896,7 @@ def compute_magnetic_coordinates(
                 flux_scale=float(flux_scale),
                 validate_nesting=True,
                 gauge_z=zaxis,
+                reflection_z=zaxis,
             )
             projected_surface_R = projected_surfaces.R
             projected_surface_z = projected_surfaces.z
@@ -886,26 +919,9 @@ def compute_magnetic_coordinates(
             final_symmetry_audit["geometry_residual"]
         )
         if working_psi_field is not None:
-            projected_psi_spline = RectBivariateSpline(
-                radial_grid,
-                vertical_grid,
-                working_psi_field,
-                kx=min(3, radial_grid.size - 1),
-                ky=min(3, vertical_grid.size - 1),
-                s=0.0,
-            )
-            projected_flux_residual = np.max(
-                np.abs(
-                    projected_psi_spline.ev(
-                        surface_R.ravel(),
-                        surface_z.ravel(),
-                    ).reshape(surface_R.shape)
-                    - radial_flux[:, None]
-                ),
-                axis=1,
-            ) / max(
-                abs(float(flux_scale)),
-                np.finfo(np.float64).tiny,
+            projected_flux_residual = np.asarray(
+                projected_surfaces.normalized_flux_residual,
+                dtype=np.float64,
             )
             symmetry_audit["projected_flux_residual"] = (
                 projected_flux_residual
