@@ -8,3 +8,7 @@ dist/
 *.egg-info/
 docs/_build/
 .vscode/
+
+# outputs of the example scripts (the docs keep their own copy of the figure)
+examples/*.geqdsk
+examples/*.png

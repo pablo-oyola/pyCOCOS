@@ -1,159 +1,146 @@
 # pyCOCOS
 
-`pyCOCOS` is a standalone Python package for tokamak equilibrium handling and
-magnetic coordinate workflows extracted from `pynova`.
+<!-- docs-intro-start -->
+Tokamak equilibria and magnetic coordinates in Python: g-EQDSK input and
+output in any COCOS convention, the magnetic field on the (R, z) grid, and
+flux-surface coordinates (Boozer, PEST, equal-arc, Hamada) with their metric
+and Jacobian.  pyCOCOS is the equilibrium layer of
+[superNOVA](https://github.com/pablo-oyola/superNOVA), and works on its own.
 
-## Features
+- **COCOS handled once.**  A file is read in its own convention, detected or
+  given, and converted on load to one internal convention (COCOS 1 by
+  default).  Writing converts only the output copy.
+- **One coordinate map.**  Each coordinate system is a single Fourier ×
+  radial-spline representation of (R, z, ν)(ψ, θ).  The forward and inverse
+  transforms, the metric tensors and the signed Jacobian all come from that
+  one map.
+- **General shapes.**  The flux surfaces are traced without assuming up-down
+  symmetry, and nesting and orientation are checked.
+- **Registered Jacobians.**  The built-in systems are entries in a registry,
+  and your own Jacobian can be added the same way.
+<!-- docs-intro-end -->
 
-- g-EQDSK read/write and equilibrium construction
-- Magnetic field handling on R-z grids
-- Magnetic coordinates (Boozer, PEST, Equal-Arc, Hamada)
-- Flux-constrained surfaces for general up-down-asymmetric equilibria
-- One Fourier/radial-spline coordinate map for transforms, derivatives, metrics,
-  and the signed physical Jacobian
-- COCOS convention detection and transformations
+Documentation: <https://pablo-oyola.github.io/pyCOCOS/>
 
+<!-- docs-guide-start -->
 ## Installation
 
-```bash
-pip install -e .
-```
-
-Documentation build extras:
+pyCOCOS needs Python 3.10 or later.  Numba is a hard dependency: the
+Jacobian kernels have no pure-Python fallback.
 
 ```bash
-pip install -e ".[docs]"
-sphinx-build -b html docs/source docs/_build/html
+pip install git+https://github.com/pablo-oyola/pyCOCOS.git
 ```
 
-GUI launcher:
+From a clone, for development:
+
+```bash
+git clone git@github.com:pablo-oyola/pyCOCOS.git
+cd pyCOCOS
+pip install -e ".[dev]"        # tests; ".[docs]" for the documentation tools
+```
+
+## Quick start
+
+Any g-EQDSK file will do.  The repository ships a generator for an analytic
+Solov'ev equilibrium, so the examples need no experimental data:
+
+```bash
+python examples/solovev_equilibrium.py     # writes examples/solovev.geqdsk
+```
+
+```python
+from pycocos import EQDSK
+
+# A g-EQDSK file does not record its COCOS: give it, or let pyCOCOS detect it
+# from the signs in the file plus the toroidal orientation and flux units.
+eq = EQDSK("examples/solovev.geqdsk", cocos_in=1)
+eq.summary()                      # grid, axis, flux and field ranges
+
+# Boozer coordinates on 65 flux surfaces x 128 poloidal points.
+mag = eq.compute_coordinates("boozer", lpsi=65, ltheta=128)
+
+point = mag(R=3.5, z=0.3)                     # -> psi, theta, nu
+back = mag.transform_inverse(psi=0.5, thetamag=0.0, psi_is_norm=True)
+q = mag.deriv["q"]                            # q from the traced surfaces
+```
+
+The point (R, z) = (3.5, 0.3) m maps to ψ = 0.6210 Wb/rad and θ = 6.069 rad.
+The ψ_N = 0.5 surface crosses θ = 0 at R = 3.735 m.  The q profile matches the
+equilibrium's exact one to about 1 part in 10⁵.  The construction takes a few
+seconds.
+
+The [examples](https://github.com/pablo-oyola/pyCOCOS/tree/master/examples)
+cover the rest:
+
+| Script | What it shows |
+|---|---|
+| `solovev_equilibrium.py` | writing an analytic equilibrium with an exact q, as a g-EQDSK |
+| `basic_usage.py` | loading, COCOS detection, the field and the profiles |
+| `boozer_coordinates.py` | Boozer coordinates, q against the exact profile, both transforms, a plot of the grid |
+| `eqdsk_io.py` | converting a file to COCOS 11 and reading it back |
+
+## Coordinate systems
+
+`compute_coordinates(coordinate_system=...)` builds any registered system.
+They differ in the Jacobian J(ψ, θ):
+
+| Name | Jacobian |
+|---|---|
+| `boozer` | J = h/B², with h = I + qF |
+| `pest` | J ∝ R² |
+| `equal_arc` | J ∝ R/\|∇ψ\| |
+| `hamada` | J constant on each surface |
+
+`list_coordinate_systems()` lists them.  `register_coordinate_system(...)`
+adds a new one: a function `jacobian(context) -> J(theta)` on one surface.
+Give it a `cache_version` before enabling persistent checkpoints.  Large
+builds can be staged with `materialize_rz=False` and cached with
+`checkpoint_dir=...`.  The tolerance budget is chosen with
+`coordinate_accuracy="standard"` (the default) or `"strict"`.  The
+[numerics page](https://pablo-oyola.github.io/pyCOCOS/numerics_implementation.html)
+describes all three.
+
+## Converting COCOS
+
+```python
+gdata = eq.to_geqdsk(cocos_out=11)              # a converted copy, as a dict
+eq.save("solovev_cocos11.geqdsk", cocos_out=11) # refuses to overwrite a file
+EQDSK("solovev_cocos11.geqdsk", cocos_in=11)    # reads back to the same arrays
+```
+
+## GUI
 
 ```bash
 pycocos-gui
 ```
 
-The GUI supports:
+The GUI is a Tk window.  It loads a g-EQDSK, plots any 1-D profile or 2-D
+field, computes one or more coordinate systems, and draws their grids over
+the 2-D plots.  On Debian/Ubuntu, Tk comes from `sudo apt install
+python3-tk`.
 
-- loading an EQDSK equilibrium file
-- plotting selectable 1D and 2D variables
-- computing magnetic coordinates for one or more coordinate systems
-- overlaying computed magnetic-coordinate grids on top of a 2D plot
+## Package layout
 
-## CI/CD (GitHub Actions)
+| Module | Contents |
+|---|---|
+| `pycocos.io` | `EQDSK` reader/writer, COCOS tables, detection and transforms |
+| `pycocos.core` | `Equilibrium` (field, flux, profiles on the grid) and `MagneticCoordinates` |
+| `pycocos.coordinates` | surface tracing, the coordinate map, Jacobian registry and kernels, accuracy budgets, checkpoints |
+| `pycocos.utils` | Numba interpolation helpers |
+| `pycocos.gui` | the Tk viewer behind `pycocos-gui` |
 
-- `CI` workflow (`.github/workflows/ci.yml`)
-  - Runs test matrix on Python 3.10/3.11/3.12
-  - Verifies docs build with `sphinx-build -W`
-- `Deploy Docs` workflow (`.github/workflows/docs-deploy.yml`)
-  - Builds Sphinx docs on pushes to `main`/`master`
-  - Publishes docs to GitHub Pages
+## Tests
 
-To enable documentation publishing, set in GitHub repository settings:
-
-- `Settings -> Pages -> Source`: **GitHub Actions**
-
-## Quick Start
-
-```python
-from pycocos import EQDSK
-
-eq = EQDSK("equilibrium.geqdsk", cocos_in=1, cocos_internal=1)
-mag_coords = eq.compute_coordinates(coordinate_system="boozer")
-coords = mag_coords(R=2.0, z=0.0)
+```bash
+pytest
 ```
 
-See [CONVENTIONS.md](CONVENTIONS.md) for the canonical COCOS, Boozer-gauge,
-current-coefficient, and metric contracts.
+The `pytest-pyvista` plugin can crash numba/llvmlite on the first JIT
+compile, so `pyproject.toml` turns it off (`-p no:pyvista`).
+<!-- docs-guide-end -->
 
-## Jacobian Formula Mapping
+## Conventions
 
-`pycocos.coordinates.jacobian_builders` implements the PDF Jacobian family:
-
-- General family: `J = R^i / |grad(psi)|^j / B^k`
-- `boozer`: `J = h/B^2` with `h = I + qF`
-- `pest`: `J ~ R^2` (per-surface normalized)
-- `equal_arc`: `J ~ R/|grad(psi)|` (per-surface normalized)
-- `hamada`: `J ~ constant` on each flux surface (per-surface normalized)
-
-Implementation details:
-
-- `|grad(psi)|` is computed from axisymmetric identity `|grad(psi)| = R*Bpol`
-- Per-surface normalization follows the `theta`-span construction from Eq. 8.99/8.100 logic
-- Hot loops (power-law Jacobian assembly, Boozer `h/B^2`, normalization integrals) run in
-  `numba` kernels in `pycocos.coordinates.jacobian_numba_kernels`
-- Registry callables use the single interface `jacobian(context) -> J(theta)`
-- Custom non-Boozer Jacobian shapes are validated and normalized once to a
-  monotonic `0 -> 2*pi` poloidal coordinate
-
-## Coordinate Construction
-
-Each retained contour is Fourier-filtered without imposing parity, projected
-back to its requested physical poloidal flux, and checked for orientation and
-strict nesting. Up-down-asymmetric sine and cosine content is retained.
-
-The inverse map `(R, z, nu)(psi, theta)` is represented by one periodic Fourier
-expansion and one radial spline family. The radial fit uses signed
-sqrt-normalized flux for regularity near the magnetic axis, while all exported
-derivatives are transformed back to physical `psi`. Forward/inverse transforms,
-covariant and contravariant metrics, and the Jacobian are all evaluated from
-this same map. The fitted annulus is exposed as
-`coords.inside_coordinate_domain`; equilibrium `dPsi/dR` and `dPsi/dz` remain
-defined on the complete finite R-z grid, as does the pure flux metric
-`g^{psi psi}`. Magnetic-angle derivatives and mixed/angular metrics are masked
-outside the fitted annulus.
-
-Coordinate construction uses an explicit accuracy budget. The default
-``CoordinateAccuracy.standard()`` accepts interpolation-limited projected-flux
-bridge residuals up to ``1e-5`` while keeping surface and constrained-map
-flux residuals at ``1e-7`` and the angle solve at ``1e-8`` radians. Use
-``coordinate_accuracy="strict"`` for reference comparisons with the former
-stopping criteria. Topology, nesting, orientation, periodic closure, and
-algebraic reciprocal-basis identities are never relaxed by either profile.
-
-The surface quadrature now scales with the requested workload instead of
-always using 7,200 points. Pass ``n_theta_geom=7200`` for a legacy-resolution
-comparison. Expensive derived products can also be staged explicitly:
-
-```python
-product = eq.compute_coordinates(
-    "boozer",
-    materialize_rz=False,
-    checkpoint_dir="coordinate-checkpoints",
-)
-# R, z, nu and their exact differentials are already available spectrally.
-values = product.values(psi, theta)
-# product.jacobian is the fitted-map determinant; product.target_jacobian
-# retains the independently constructed target table for fit diagnostics.
-
-# Build the traditional R-z datasets later, without tracing surfaces again.
-mag_coords = product.materialize_rz(build_metric_cache=False)
-```
-
-``checkpoint_dir`` stores a content-addressed, integrity-checked construction
-checkpoint. Reuse requires exact matches of the equilibrium source arrays,
-coordinate configuration, accuracy budget, and algorithm version. On a full
-``MagneticCoordinates`` result, the default ``build_metric_cache=False``
-defers the Lamé and metric tensors until first access; repeated cylindrical-to-magnetic scalar
-transforms reuse their shared sampling map.
-
-Custom registered coordinate systems must supply an application-owned
-``cache_version`` to ``register_coordinate_system`` before persistent
-checkpoints are enabled. Bump that token whenever the Jacobian implementation
-or any closure/global state affecting it changes.
-
-## Numba Runtime Notes
-
-- `pycocos` treats Numba as mandatory for Jacobian hot paths; there is no silent
-  fallback to Python loops.
-- A runtime guard checks Numba availability and JIT readiness and fails fast with
-  a clear error if the environment is unsafe.
-- In this environment, `pytest` with the `pytest-pyvista` plugin can trigger a
-  low-level `numba/llvmlite` segmentation fault during first JIT compile.
-  Project tests disable this plugin by default (`-p no:pyvista`).
-
-## Package Layout
-
-- `pycocos.core`: equilibrium and magnetic coordinate classes
-- `pycocos.io`: EQDSK and COCOS utilities
-- `pycocos.coordinates`: Jacobians, registry, field-line and coordinate solvers
-- `pycocos.utils`: performance helpers (numba utilities)
+[CONVENTIONS.md](CONVENTIONS.md) gives the COCOS, Boozer-gauge,
+current-coefficient and metric conventions the code follows.
