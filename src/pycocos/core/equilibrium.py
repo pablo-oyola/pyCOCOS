@@ -50,7 +50,7 @@ _PROJECTED_FLUX_LABEL_TOLERANCE = (
 _PROJECTED_BRIDGE_MAX_COEFFICIENTS = 1_000_000
 _PROJECTED_BRIDGE_MAX_CONSTRAINT_ROWS = 500_000
 _PROJECTED_BRIDGE_MAX_DESIGN_NONZEROS = 8_000_000
-_COORDINATE_CHECKPOINT_ALGORITHM_VERSION = "spectral-coordinate-map-v1"
+_COORDINATE_CHECKPOINT_ALGORITHM_VERSION = "spectral-coordinate-map-v2"
 _COORDINATE_RESULT_CACHE_LIMIT = 1
 
 
@@ -696,6 +696,82 @@ def _normalized_resolvable_axis_flux(
             "the interpolated axis flux lies beyond the boundary flux."
         )
     return float(np.clip(normalized, 0.0, 1.0))
+
+
+def _toroidal_field_from_fpol(
+    *,
+    fpol: xr.DataArray,
+    psi_field: np.ndarray,
+    Rgrid: np.ndarray,
+    psi_axis: float,
+    psi_boundary: float,
+) -> np.ndarray:
+    """Evaluate the authoritative flux-function field ``Bphi=F(psi)/R``."""
+    profile = np.asarray(fpol, dtype=np.float64)
+    if (
+        profile.ndim != 1
+        or profile.size < 2
+        or not np.all(np.isfinite(profile))
+    ):
+        raise ValueError("fpol must be a finite one-dimensional profile.")
+    if len(fpol.dims) != 1:
+        raise ValueError("fpol must have exactly one radial dimension.")
+
+    radial_dim = fpol.dims[0]
+    if radial_dim in fpol.coords:
+        profile_grid = np.asarray(fpol.coords[radial_dim], dtype=np.float64)
+    else:
+        profile_grid = np.linspace(0.0, 1.0, profile.size)
+    if (
+        profile_grid.shape != profile.shape
+        or not np.all(np.isfinite(profile_grid))
+    ):
+        raise ValueError(
+            "fpol radial coordinates must be finite and match fpol."
+        )
+    order = np.argsort(profile_grid)
+    profile_grid = profile_grid[order]
+    profile = profile[order]
+    if np.any(np.diff(profile_grid) <= 0.0):
+        raise ValueError("fpol radial coordinates must be strictly monotonic.")
+
+    psi_values = np.asarray(psi_field, dtype=np.float64)
+    radial_grid = np.asarray(Rgrid, dtype=np.float64)
+    if psi_values.ndim != 2 or psi_values.shape[0] != radial_grid.size:
+        raise ValueError(
+            "psi_field must be two-dimensional with its first dimension "
+            "matching Rgrid."
+        )
+    if not np.all(np.isfinite(psi_values)):
+        raise ValueError("psi_field must contain only finite values.")
+    if (
+        radial_grid.ndim != 1
+        or not np.all(np.isfinite(radial_grid))
+        or np.any(radial_grid <= 0.0)
+    ):
+        raise ValueError(
+            "Rgrid must be a finite, positive one-dimensional grid."
+        )
+
+    flux_span = float(psi_boundary) - float(psi_axis)
+    if not np.isfinite(flux_span) or abs(flux_span) < 1.0e-14:
+        raise ValueError(
+            "psi_axis and psi_boundary must define a finite flux span."
+        )
+    normalized_flux = (psi_values - float(psi_axis)) / flux_span
+    radial_name = str(radial_dim).lower()
+    if "psi" in radial_name and "rho" not in radial_name:
+        profile_query = psi_values
+    else:
+        profile_query = np.sqrt(np.clip(normalized_flux, 0.0, 1.0))
+    F_field = np.interp(
+        profile_query.ravel(),
+        profile_grid,
+        profile,
+        left=float(profile[0]),
+        right=float(profile[-1]),
+    ).reshape(psi_values.shape)
+    return F_field / radial_grid[:, None]
 
 
 def _outboard_midplane_seeds(
@@ -2495,6 +2571,16 @@ class equilibrium:
                 dtype=np.float64,
             ),
         }
+        if self.fpol is not None:
+            if len(self.fpol.dims) != 1:
+                raise ValueError("fpol must have exactly one radial dimension.")
+            arrays["fpol"] = np.asarray(self.fpol, dtype=np.float64)
+            radial_dim = self.fpol.dims[0]
+            if radial_dim in self.fpol.coords:
+                arrays["fpol_coordinate"] = np.asarray(
+                    self.fpol.coords[radial_dim],
+                    dtype=np.float64,
+                )
         if "R_boundary" in self.geometry:
             arrays["R_boundary"] = np.asarray(
                 self.geometry.R_boundary,
@@ -2859,6 +2945,9 @@ class equilibrium:
             ),
             "phiclockwise": bool(self.phiclockwise),
             "flux_normalization": str(self.flux_normalization),
+            "toroidal_field_source": (
+                "fpol(psi)/R" if self.fpol is not None else "Bphi interpolation"
+            ),
             # Reconstructing a checkpoint refits its stored surface tables.
             # Library versions therefore belong to the durable numerical
             # identity alongside the explicit algorithm version.
@@ -2957,15 +3046,33 @@ class equilibrium:
         R_fine = np.linspace(rmin, rmax, nr_fine)
         z_fine = np.linspace(zmin, zmax, nz_fine)
 
-        # Evaluate on fine grid (using new structured access)
+        # Evaluate on the fine grid. When an authoritative F(psi)=R*Bphi
+        # profile exists, reconstruct Bphi from it after refining psi.
+        # Independently interpolating Bphi breaks its flux-function identity
+        # and therefore the Boozer-angle closure relation.
         psip = self.flux.psi.interp(R=R_fine, z=z_fine, method='cubic').values
         br_fine = self.field.Br.interp(R=R_fine, z=z_fine, method='cubic').values
         bz_fine = self.field.Bz.interp(R=R_fine, z=z_fine, method='cubic').values
-        bphi_fine = self.field.Bphi.interp(R=R_fine, z=z_fine, method='cubic').values
 
         # Generate psi grid (using geometry attributes)
         psi_axis = float(self.geometry.attrs.get('psi_ax', self._psi_ax_init))
         psi_edge = float(self.geometry.attrs.get('psi_bdy', self._psi_edge_init))
+        if self.fpol is not None:
+            bphi_fine = _toroidal_field_from_fpol(
+                fpol=self.fpol,
+                psi_field=psip,
+                Rgrid=R_fine,
+                psi_axis=psi_axis,
+                psi_boundary=psi_edge,
+            )
+            toroidal_field_source = "fpol(psi)/R"
+        else:
+            bphi_fine = self.field.Bphi.interp(
+                R=R_fine,
+                z=z_fine,
+                method='cubic',
+            ).values
+            toroidal_field_source = "Bphi interpolation"
         R_axis_val = float(self.geometry.R_axis.values)
         z_axis_val = float(self.geometry.z_axis.values)
         psi_at_axis = np.asarray(
@@ -3057,7 +3164,9 @@ class equilibrium:
 
         # Compute coordinates using generic function
         # Pass frr0 (radial positions at midplane) corresponding to psigrid
-        coordinate_construction_diagnostics: Dict[str, Any] = {}
+        coordinate_construction_diagnostics: Dict[str, Any] = {
+            "toroidal_field_source": toroidal_field_source,
+        }
         out = compute_magnetic_coordinates(
             Rgrid=R_fine, zgrid=z_fine,
             br=br_fine, bz=bz_fine, bphi=bphi_fine,
@@ -3299,7 +3408,10 @@ class equilibrium:
                 "surface_construction": coordinate_construction_diagnostics.get(
                     "surface_construction",
                     {},
-                )
+                ),
+                "toroidal_field_source": coordinate_construction_diagnostics[
+                    "toroidal_field_source"
+                ],
             },
             "accuracy": {
                 "bridge_flux_tolerance": accuracy.bridge_flux_tolerance,
