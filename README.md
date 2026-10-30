@@ -1,5 +1,7 @@
 # pyCOCOS
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23811057.svg)](https://doi.org/10.5281/zenodo.23811057)
+
 <!-- docs-intro-start -->
 Tokamak equilibria and magnetic coordinates in Python: g-EQDSK input and
 output in any COCOS convention, the magnetic field on the (R, z) grid, and
@@ -144,6 +146,25 @@ compile, so `pyproject.toml` turns it off (`-p no:pyvista`).
 
 [CONVENTIONS.md](CONVENTIONS.md) gives the COCOS, Boozer-gauge,
 current-coefficient and metric conventions the code follows.
+
+## Citing
+
+If you use pyCOCOS in published work, please cite it.  The DOI
+[10.5281/zenodo.23811057](https://doi.org/10.5281/zenodo.23811057) always
+resolves to the latest release, and each release also has its own DOI on
+Zenodo.  GitHub's "Cite this repository" button reads
+[CITATION.cff](CITATION.cff).
+
+```bibtex
+@software{oyola_pycocos,
+  author    = {Oyola, Pablo},
+  title     = {pyCOCOS},
+  publisher = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.23811057},
+  url       = {https://doi.org/10.5281/zenodo.23811057}
+}
+```
 
 ## License
 

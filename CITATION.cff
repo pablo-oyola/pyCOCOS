@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: >-
+  If you use pyCOCOS in your work, please cite it as below.  The DOI is the
+  Zenodo concept DOI: it resolves to the latest release, and every release
+  also has its own version DOI on Zenodo.
+type: software
+title: pyCOCOS
+abstract: >-
+  Tokamak equilibria and magnetic coordinates in Python: g-EQDSK input and
+  output in any COCOS convention, the magnetic field on the (R, z) grid, and
+  flux-surface coordinates (Boozer, PEST, equal-arc, Hamada) with their
+  metric and Jacobian.
+authors:
+  - given-names: Pablo
+    family-names: Oyola
+    affiliation: Princeton Plasma Physics Laboratory
+    orcid: "https://orcid.org/0000-0002-8455-1090"
+doi: 10.5281/zenodo.23811057
+repository-code: "https://github.com/pablo-oyola/pyCOCOS"
+url: "https://pablo-oyola.github.io/pyCOCOS/"
+license: MIT
+keywords:
+  - plasma physics
+  - tokamak
+  - MHD equilibrium
+  - COCOS
+  - magnetic coordinates
+  - Boozer coordinates
+  - g-EQDSK
