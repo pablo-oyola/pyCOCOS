@@ -144,3 +144,7 @@ compile, so `pyproject.toml` turns it off (`-p no:pyvista`).
 
 [CONVENTIONS.md](CONVENTIONS.md) gives the COCOS, Boozer-gauge,
 current-coefficient and metric conventions the code follows.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
